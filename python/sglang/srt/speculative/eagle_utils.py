@@ -693,7 +693,7 @@ def assign_draft_cache_locs(
             last_page_len + speculative_num_steps + page_size - 1
         ) // page_size
         kv_end = prefix_len // page_size * page_size + num_new_page * (page_size * topk)
-
+    #tl.device_print(f"kv_end: {kv_end}")
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
     num_loop = tl.cdiv(topk * speculative_num_steps, BLOCK_SIZE)

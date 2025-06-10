@@ -656,6 +656,8 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            from fpdb import ForkedPdb
+            ForkedPdb().set_trace()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch

@@ -195,6 +195,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        print("FlashInferAttnBackend.init_forward_metadata !!")
+        print(f"Is decode or idle: {forward_batch.forward_mode.is_decode_or_idle()}")
+        print(f"Is extend: {forward_batch.forward_mode.is_extend()}")
+        from fpdb import ForkedPdb
+        ForkedPdb().set_trace()
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -523,6 +528,11 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        if layer.layer_id == 0:
+            print("Getting into FlashInferBackend.forward_decode")
+            from fpdb import ForkedPdb
+            ForkedPdb().set_trace()
+
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -613,16 +623,37 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        from fpdb import ForkedPdb
+        ForkedPdb().set_trace()
         decode_wrappers = decode_wrappers or self.decode_wrappers
+
+        # NOTE(brian1009): Hacked here!!!!
+        paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
+            seq_lens,
+            torch.tensor(self.sliding_window_size + 1),
+        )
+        paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
+        kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
+        
         self.call_begin_forward(
             decode_wrappers[0],
             req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
+            paged_kernel_lens_tmp,
+            paged_kernel_lens_sum_tmp,
             self.kv_indptr[0],
-            None,
+            kv_start_idx_tmp,
             spec_info,
         )
+        
+        # self.call_begin_forward(
+        #     decode_wrappers[0],
+        #     req_pool_indices,
+        #     seq_lens,
+        #     seq_lens_sum,
+        #     self.kv_indptr[0],
+        #     None,
+        #     spec_info,
+        # )
 
     def update_sliding_window(
         self,

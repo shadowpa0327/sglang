@@ -1274,7 +1274,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Write to req_to_token_pool
         if support_triton(global_server_args_dict.get("attention_backend")):
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
-
             write_req_to_token_pool_triton[(bs,)](
                 self.req_to_token_pool.req_to_token,
                 req_pool_indices_tensor,
@@ -1526,7 +1525,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
                 self.seq_lens, last_loc
             )
-
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
