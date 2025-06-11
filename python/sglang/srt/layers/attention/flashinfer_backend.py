@@ -198,8 +198,10 @@ class FlashInferAttnBackend(AttentionBackend):
         print("FlashInferAttnBackend.init_forward_metadata !!")
         print(f"Is decode or idle: {forward_batch.forward_mode.is_decode_or_idle()}")
         print(f"Is extend: {forward_batch.forward_mode.is_extend()}")
-        from fpdb import ForkedPdb
-        ForkedPdb().set_trace()
+        print(f"Is draft extend: {forward_batch.forward_mode.is_draft_extend()}")
+        print(f"Is target verify: {forward_batch.forward_mode.is_target_verify()}")
+        # from fpdb import ForkedPdb
+        # ForkedPdb().set_trace()
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -528,11 +530,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        if layer.layer_id == 0:
-            print("Getting into FlashInferBackend.forward_decode")
-            from fpdb import ForkedPdb
-            ForkedPdb().set_trace()
-
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -623,37 +620,19 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        from fpdb import ForkedPdb
-        ForkedPdb().set_trace()
+        #from fpdb import ForkedPdb
+        #ForkedPdb().set_trace()
         decode_wrappers = decode_wrappers or self.decode_wrappers
-
-        # NOTE(brian1009): Hacked here!!!!
-        paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
-            seq_lens,
-            torch.tensor(self.sliding_window_size + 1),
-        )
-        paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
-        kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
         
         self.call_begin_forward(
             decode_wrappers[0],
             req_pool_indices,
-            paged_kernel_lens_tmp,
-            paged_kernel_lens_sum_tmp,
+            seq_lens,
+            seq_lens_sum,
             self.kv_indptr[0],
-            kv_start_idx_tmp,
+            None,
             spec_info,
         )
-        
-        # self.call_begin_forward(
-        #     decode_wrappers[0],
-        #     req_pool_indices,
-        #     seq_lens,
-        #     seq_lens_sum,
-        #     self.kv_indptr[0],
-        #     None,
-        #     spec_info,
-        # )
 
     def update_sliding_window(
         self,
@@ -751,6 +730,9 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            print("FlashInferIndicesUpdaterDecode: call_begin_forward")
+            from fpdb import ForkedPdb
+            ForkedPdb().set_trace()
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
@@ -968,6 +950,10 @@ class FlashInferIndicesUpdaterPrefill:
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
                 spec_info, EagleVerifyInput
             )
+            if isinstance(spec_info, EagleVerifyInput):
+                print("Eagle Verifying!!!")
+                from fpdb import ForkedPdb
+                ForkedPdb().set_trace()
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
@@ -1057,6 +1043,7 @@ class FlashInferMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
 
+    #NOTE(brian1009): kv_indptr is set here for eagle drafting
     def common_template(
         self,
         forward_batch: ForwardBatch,
@@ -1066,7 +1053,9 @@ class FlashInferMultiStepDraftBackend:
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
-
+        # from fpdb import ForkedPdb
+        # ForkedPdb().set_trace()
+        # print("EAGLE:common_template()!!!")
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](

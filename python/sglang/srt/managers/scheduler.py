@@ -300,6 +300,17 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+        elif self.spec_algorithm.is_sspec():
+            from sglang.srt.speculative.sspec_worker import SSPECWorker
+
+            self.draft_worker = SSPECWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
         else:
             self.draft_worker = None
 
@@ -661,7 +672,9 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-
+            print("event_loop_normal: batch", batch)
+            from fpdb import ForkedPdb
+            ForkedPdb().set_trace()
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)

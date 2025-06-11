@@ -293,12 +293,16 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        from fpdb import ForkedPdb
-        ForkedPdb().set_trace()
         
         if batch.forward_mode.is_decode():
+            print("Eagle Drafting!!!")
+            from fpdb import ForkedPdb
+            ForkedPdb().set_trace()
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
+            print("Eagle Verifying!!!")
+            from fpdb import ForkedPdb
+            ForkedPdb().set_trace()
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
@@ -322,6 +326,9 @@ class EAGLEWorker(TpModelWorker):
 
             return logits_output, next_token_ids, model_worker_batch.bid, 0, False
         else:
+            from fpdb import ForkedPdb
+            ForkedPdb().set_trace()
+            print("Eagle Extending!!!")
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
@@ -352,6 +359,9 @@ class EAGLEWorker(TpModelWorker):
         return logits_output, next_token_ids, model_worker_batch.bid
 
     def draft(self, batch: ScheduleBatch):
+        from fpdb import ForkedPdb
+        ForkedPdb().set_trace()
+        print("EAGLE:draft()!!!")
         # Parse args
         num_seqs = batch.batch_size()
         spec_info = batch.spec_info

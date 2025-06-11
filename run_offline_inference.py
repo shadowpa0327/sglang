@@ -33,11 +33,12 @@ if __name__ == '__main__':
     llm = sgl.Engine(
         model_path="meta-llama/Meta-Llama-3.1-8B-Instruct",  
         watchdog_timeout=1000000,
-        # speculative_algorithm="EAGLE3",
-        # speculative_draft_model_path="jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",  
-        # speculative_num_steps=5,  
-        # speculative_eagle_topk=8,  
-        # speculative_num_draft_tokens=32,  
+        #speculative_algorithm="SSPEC",
+        speculative_algorithm="EAGLE3",
+        speculative_draft_model_path="jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",  
+        speculative_num_steps=5,  
+        speculative_eagle_topk=1,  
+        speculative_num_draft_tokens=5,  
         mem_fraction_static=0.6,  # Note: use mem_fraction_static instead of mem_fraction  
         disable_cuda_graph=True,
         disable_overlap_schedule=True,
