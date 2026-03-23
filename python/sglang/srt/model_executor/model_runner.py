@@ -1967,6 +1967,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_smc()
             or self.spec_algorithm.is_ngram()
         ):
             return not self.is_draft_worker
@@ -2002,6 +2003,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or (self.spec_algorithm.is_smc() and not self.is_draft_worker)
         ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -2115,12 +2117,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
-                from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
+            if (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+                or (self.spec_algorithm.is_smc() and not self.is_draft_worker)
+            ):
                 if self.is_draft_worker:
                     raise RuntimeError("This should not happen.")
+                elif self.spec_algorithm.is_smc():
+                    from sglang.srt.speculative.smc_info import SMCScoreInput
+
+                    spec_info = SMCScoreInput(
+                        draft_token=torch.zeros(
+                            (num_tokens,), dtype=torch.int64, device=self.device
+                        ),
+                        draft_lengths=torch.zeros(
+                            (batch_size,), dtype=torch.int32, device=self.device
+                        ),
+                        draft_logprobs=torch.zeros(
+                            (batch_size,), dtype=torch.float32, device=self.device
+                        ),
+                        draft_finished=torch.zeros(
+                            (batch_size,), dtype=torch.bool, device=self.device
+                        ),
+                        custom_mask=buffers.custom_mask,
+                        positions=None,
+                        draft_token_num=num_tokens_per_bs,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                    )
                 else:
+                    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
                     spec_info = EagleVerifyInput(
                         draft_token=None,
                         custom_mask=buffers.custom_mask,

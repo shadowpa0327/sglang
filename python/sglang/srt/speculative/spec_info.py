@@ -18,6 +18,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    SMC = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -43,11 +44,14 @@ class SpeculativeAlgorithm(Enum):
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_smc(self) -> bool:
+        return self == SpeculativeAlgorithm.SMC
+
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_smc()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -92,6 +96,10 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_smc():
+            from sglang.srt.speculative.smc_worker_v2 import SMCWorkerV2
+
+            return SMCWorkerV2
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
@@ -110,6 +118,8 @@ class SpecInputType(IntEnum):
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
+    SMC_DRAFT = auto()
+    SMC_SCORE = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -120,11 +130,15 @@ class SpecInput(ABC):
     def is_draft_input(self) -> bool:
         # FIXME: remove this function which is only used for assertion
         # or use another variable name like `draft_input` to substitute `spec_info`
-        return self.spec_input_type == SpecInputType.EAGLE_DRAFT
+        return self.spec_input_type in {
+            SpecInputType.EAGLE_DRAFT,
+            SpecInputType.SMC_DRAFT,
+        }
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
+            SpecInputType.SMC_SCORE,
             SpecInputType.NGRAM_VERIFY,
         }
 

@@ -113,6 +113,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
 
+    def inc_ref(self, indices: torch.Tensor):
+        raise NotImplementedError()
+
+    def dec_ref_and_free(self, indices: torch.Tensor):
+        raise NotImplementedError()
+
 
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """An allocator managing the indices to kv cache data."""
@@ -133,6 +139,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        self.slot_ref_count = torch.zeros(
+            self.size + 1, dtype=torch.int32, device=self.device
+        )
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -150,11 +159,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        self.slot_ref_count[select_index] = 1
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        self.slot_ref_count[free_index] = 0
 
         if self.is_not_in_free_group:
             if self.need_sort:
@@ -169,6 +181,19 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def inc_ref(self, indices: torch.Tensor):
+        if indices.numel() == 0:
+            return
+        self.slot_ref_count[indices] += 1
+
+    def dec_ref_and_free(self, indices: torch.Tensor):
+        if indices.numel() == 0:
+            return
+        self.slot_ref_count[indices] -= 1
+        to_free = indices[self.slot_ref_count[indices] == 0]
+        if to_free.numel() > 0:
+            self.free(to_free)
 
 
 def alloc_extend_naive(
@@ -392,6 +417,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        self.slot_ref_count[out_pages] = 1
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -445,6 +471,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        self.slot_ref_count[self.free_pages[:num_new_pages]] = 1
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -484,6 +511,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        self.slot_ref_count[self.free_pages[:num_new_pages]] = 1
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -493,6 +521,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+            self.slot_ref_count[free_page_indices] = 0
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
@@ -508,6 +537,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
         )
+        self.slot_ref_count = torch.zeros(
+            self.num_pages + 1, dtype=torch.int32, device=self.device
+        )
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -517,3 +549,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def inc_ref(self, indices: torch.Tensor):
+        if indices.numel() == 0:
+            return
+        self.slot_ref_count[torch.unique(indices // self.page_size)] += 1
+
+    def dec_ref_and_free(self, indices: torch.Tensor):
+        if indices.numel() == 0:
+            return
+        page_indices = torch.unique(indices // self.page_size)
+        self.slot_ref_count[page_indices] -= 1
+        to_free = page_indices[self.slot_ref_count[page_indices] == 0]
+        if to_free.numel() > 0:
+            self.free(to_free * self.page_size)

@@ -787,6 +787,17 @@ def _launch_server_process(
     return proc
 
 
+def _get_test_python_executable() -> str:
+    return sys.executable or "python3"
+
+
+def _get_test_sglang_executable() -> str:
+    sibling = Path(_get_test_python_executable()).with_name("sglang")
+    if sibling.exists():
+        return str(sibling)
+    return "sglang"
+
+
 def _wait_for_server_health(
     proc: subprocess.Popen,
     base_url: str,
@@ -899,7 +910,7 @@ def popen_launch_server(
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:
         command = [
-            "python3",
+            _get_test_python_executable(),
             "-m",
             "sglang.launch_pd_server",
             "--model-path",
@@ -908,7 +919,7 @@ def popen_launch_server(
         ]
     else:
         command = [
-            "sglang",
+            _get_test_sglang_executable(),
             "serve",
             "--model-path",
             model,

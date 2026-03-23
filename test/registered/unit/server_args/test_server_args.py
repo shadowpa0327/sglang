@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -32,6 +33,82 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_prepare_server_args_smc_parses_new_options(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-algorithm",
+                "SMC",
+                "--speculative-draft-model-path",
+                "draft",
+                "--smc-n-particles",
+                "4",
+                "--smc-gamma",
+                "3",
+                "--smc-draft-temperature",
+                "0.55",
+                "--smc-target-temperature",
+                "0.9",
+            ]
+        )
+        self.assertEqual(server_args.smc_n_particles, 4)
+        self.assertEqual(server_args.smc_gamma, 3)
+        self.assertEqual(server_args.smc_draft_temperature, 0.55)
+        self.assertEqual(server_args.smc_target_temperature, 0.9)
+        self.assertTrue(server_args.disable_overlap_schedule)
+
+
+class TestSMCServerArgs(unittest.TestCase):
+    def test_smc_defaults_disable_overlap_and_size_running_batch(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="SMC",
+            speculative_draft_model_path="draft",
+        )
+        self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertEqual(server_args.max_running_requests, 48)
+        self.assertEqual(server_args.speculative_eagle_topk, 1)
+        self.assertEqual(server_args.speculative_num_steps, server_args.smc_gamma + 1)
+        self.assertEqual(
+            server_args.speculative_num_draft_tokens, server_args.smc_gamma + 1
+        )
+
+    def test_smc_enables_overlap_when_spec_v2_is_enabled(self):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            server_args = ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="SMC",
+                speculative_draft_model_path="draft",
+            )
+        self.assertFalse(server_args.disable_overlap_schedule)
+
+    def test_smc_rejects_disaggregation(self):
+        with self.assertRaisesRegex(ValueError, "does not support disaggregation"):
+            ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="SMC",
+                speculative_draft_model_path="draft",
+                disaggregation_mode="decode",
+            )
+
+    def test_smc_rejects_non_positive_temperatures(self):
+        with self.assertRaisesRegex(ValueError, "--smc-draft-temperature"):
+            ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="SMC",
+                speculative_draft_model_path="draft",
+                smc_draft_temperature=0.0,
+            )
+
+        with self.assertRaisesRegex(ValueError, "--smc-target-temperature"):
+            ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="SMC",
+                speculative_draft_model_path="draft",
+                smc_target_temperature=0.0,
+            )
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

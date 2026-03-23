@@ -499,6 +499,12 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    smc_n_particles: int = 4
+    smc_gamma: int = 4
+    smc_draft_temperature: float = 0.7
+    smc_target_temperature: float = 1.0
+    smc_resample_threshold: float = 0.5
+    smc_resample_method: Literal["systematic", "multinomial"] = "systematic"
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -748,7 +754,12 @@ class ServerArgs:
         self._handle_ssl_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
-            # Skip for dummy models
+            # Keep the dummy-model fast path, but still run lightweight defaulting and
+            # speculative validation that unit tests rely on.
+            self._handle_missing_default_values()
+            self._handle_page_size()
+            if self.speculative_algorithm in ("SMC", "NGRAM"):
+                self._handle_speculative_decoding()
             return
 
         # Handle deprecated arguments.
@@ -1288,7 +1299,7 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
+                if self.speculative_algorithm in ("STANDALONE", "SMC"):
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
@@ -2925,6 +2936,54 @@ class ServerArgs:
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_algorithm == "SMC":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently SMC speculative decoding does not support dp attention."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "Currently SMC speculative decoding does not support disaggregation."
+                )
+            if self.page_size != 1:
+                raise ValueError(
+                    "SMC speculative decoding currently requires --page-size 1."
+                )
+            if self.smc_n_particles < 1:
+                raise ValueError("--smc-n-particles must be >= 1.")
+            if self.smc_gamma < 1:
+                raise ValueError("--smc-gamma must be >= 1.")
+            if self.smc_draft_temperature <= 0:
+                raise ValueError("--smc-draft-temperature must be > 0.")
+            if self.smc_target_temperature <= 0:
+                raise ValueError("--smc-target-temperature must be > 0.")
+            if not 0 < self.smc_resample_threshold <= 1:
+                raise ValueError("--smc-resample-threshold must be in (0, 1].")
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.enable_mixed_chunk = False
+            self.speculative_eagle_topk = 1
+            self.speculative_num_steps = self.smc_gamma + 1
+            self.speculative_num_draft_tokens = self.smc_gamma + 1
+            if envs.SGLANG_ENABLE_SPEC_V2.get():
+                self.disable_overlap_schedule = False
+                logger.warning(
+                    "Spec v2 overlap scheduling is enabled for SMC speculative decoding."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled for SMC speculative decoding unless SGLANG_ENABLE_SPEC_V2=True."
+                )
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "SMC speculative decoding requires --speculative-draft-model-path."
+                )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
@@ -4635,7 +4694,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "SMC", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4730,6 +4789,43 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--smc-n-particles",
+            type=int,
+            default=ServerArgs.smc_n_particles,
+            help="Number of SMC particles per request.",
+        )
+        parser.add_argument(
+            "--smc-gamma",
+            type=int,
+            default=ServerArgs.smc_gamma,
+            help="Maximum drafted tokens per SMC step.",
+        )
+        parser.add_argument(
+            "--smc-draft-temperature",
+            type=float,
+            default=ServerArgs.smc_draft_temperature,
+            help="Sampling temperature used by the SMC draft model.",
+        )
+        parser.add_argument(
+            "--smc-target-temperature",
+            type=float,
+            default=ServerArgs.smc_target_temperature,
+            help="Temperature divisor applied to target logprobs during SMC weight updates.",
+        )
+        parser.add_argument(
+            "--smc-resample-threshold",
+            type=float,
+            default=ServerArgs.smc_resample_threshold,
+            help="Trigger resampling when ESS drops below n_particles * threshold.",
+        )
+        parser.add_argument(
+            "--smc-resample-method",
+            type=str,
+            choices=["systematic", "multinomial"],
+            default=ServerArgs.smc_resample_method,
+            help="Resampling method for SMC speculative decoding.",
         )
 
         # Speculative decoding (ngram)
@@ -6561,7 +6657,7 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_model_config().hf_config
     arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
+    if self.speculative_algorithm in ("STANDALONE", "SMC"):
         # The default value for standalone speculative decoding
         return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:

@@ -16,6 +16,7 @@ from sglang.srt.server_args import ServerArgs
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.smc_info import SMCParentUpdate
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+    smc_parent_updates: Optional[List["SMCParentUpdate"]] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -54,7 +56,7 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
+        if return_logprob and self.logits_output is not None:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = (
                     self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
@@ -78,7 +80,7 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if self.logits_output.hidden_states is not None:
+        if self.logits_output is not None and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )

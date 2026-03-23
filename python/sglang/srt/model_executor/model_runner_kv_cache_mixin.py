@@ -372,6 +372,10 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        if self.server_args.speculative_algorithm == "SMC":
+            # SMC keeps one outward-facing parent Req plus draft/target internal
+            # particle Reqs for each particle.
+            max_num_reqs *= 2 * self.server_args.smc_n_particles + 1
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:

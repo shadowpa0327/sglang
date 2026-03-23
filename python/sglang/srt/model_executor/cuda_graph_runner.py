@@ -549,6 +549,10 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or (
+                model_runner.spec_algorithm.is_smc()
+                and not self.model_runner.is_draft_worker
+            )
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -661,6 +665,7 @@ class CudaGraphRunner:
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_smc()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1067,6 +1072,7 @@ class CudaGraphRunner:
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_smc()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1169,12 +1175,38 @@ class CudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or (
+                self.model_runner.spec_algorithm.is_smc()
+                and not self.model_runner.is_draft_worker
+            )
         ):
-            from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
+            elif self.model_runner.spec_algorithm.is_smc():
+                from sglang.srt.speculative.smc_info import SMCScoreInput
+
+                batch_size = num_tokens // self.num_tokens_per_bs
+                spec_info = SMCScoreInput(
+                    draft_token=torch.zeros(
+                        (num_tokens,), dtype=torch.int64, device=self.device
+                    ),
+                    draft_lengths=torch.zeros(
+                        (batch_size,), dtype=torch.int32, device=self.device
+                    ),
+                    draft_logprobs=torch.zeros(
+                        (batch_size,), dtype=torch.float32, device=self.device
+                    ),
+                    draft_finished=torch.zeros(
+                        (batch_size,), dtype=torch.bool, device=self.device
+                    ),
+                    custom_mask=self.buffers.custom_mask,
+                    positions=None,
+                    draft_token_num=self.num_tokens_per_bs,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                )
             else:
+                from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
                 spec_info = EagleVerifyInput(
                     draft_token=None,
                     custom_mask=self.buffers.custom_mask,

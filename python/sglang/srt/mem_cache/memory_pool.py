@@ -153,6 +153,19 @@ class ReqToTokenPool:
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
+    def copy_block_table(
+        self,
+        src_req_pool_idx: int,
+        dst_req_pool_idx: int,
+        seq_len: int,
+        token_to_kv_pool_allocator,
+    ):
+        if seq_len <= 0:
+            return
+        copied = self.req_to_token[src_req_pool_idx, :seq_len].clone()
+        token_to_kv_pool_allocator.inc_ref(copied.to(torch.int64))
+        self.write((dst_req_pool_idx, slice(0, seq_len)), copied)
+
     def available_size(self):
         return len(self.free_slots)
 

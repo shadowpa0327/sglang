@@ -757,6 +757,11 @@ class Req(ReqDllmMixin):
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
         self.spec_acceptance_histogram: List[int] = []
 
+        # SMC lifecycle state.
+        self.smc_state = None
+        self.smc_parent = None
+        self.smc_particle_idx: Optional[int] = None
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
@@ -1847,6 +1852,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return new_pages * page_size
 
         server_args = get_global_server_args()
+        if self.spec_algorithm.is_smc():
+            per_particle = server_args.smc_gamma
+            if page_size > 1:
+                per_particle = ceil_align(per_particle, page_size)
+            return 2 * per_particle * server_args.smc_n_particles * len(requests)
+
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
         spec_tokens = server_args.speculative_num_draft_tokens
@@ -1951,6 +1962,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
+        if req.smc_state is not None:
+            from sglang.srt.speculative.smc_info import cleanup_smc_request_state
+
+            cleanup_smc_request_state(
+                req.smc_state,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+            req.smc_state = None
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
