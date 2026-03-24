@@ -760,7 +760,11 @@ class Req(ReqDllmMixin):
         # SMC lifecycle state.
         self.smc_state = None
         self.smc_parent = None
+        self.smc_group_id: Optional[str] = None
         self.smc_particle_idx: Optional[int] = None
+        self.smc_logprob_diff: Optional[float] = None
+        self.smc_target_temperature: Optional[float] = None
+        self.draft_prefix_materialized: bool = True
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
@@ -1853,10 +1857,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         server_args = get_global_server_args()
         if self.spec_algorithm.is_smc():
-            per_particle = server_args.smc_gamma
+            per_particle = server_args.speculative_num_draft_tokens
             if page_size > 1:
                 per_particle = ceil_align(per_particle, page_size)
-            return 2 * per_particle * server_args.smc_n_particles * len(requests)
+            return per_particle * len(requests)
 
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
@@ -2118,7 +2122,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
+            if draft_input is not None and draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
     def filter_batch(

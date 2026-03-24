@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=default_model_path())
     parser.add_argument("--output-dir", default="/tmp/sglang-smc-profile")
     parser.add_argument("--profile-steps", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument(
         "--profile-v2",
         action=argparse.BooleanOptionalAction,

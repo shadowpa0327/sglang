@@ -22,7 +22,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.smc_info import cleanup_smc_request_state
+from sglang.srt.speculative.smc_info import (
+    _release_internal_req,
+    cleanup_smc_request_state,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -204,6 +207,7 @@ class SchedulerOutputProcessorMixin:
     ):
         skip_stream_req = None
         is_smc = batch.spec_algorithm.is_smc()
+        smc_req_indices_to_remove = set()
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -261,8 +265,20 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    elif is_smc:
-                        self._maybe_init_smc_state_after_prefill(req)
+                    elif is_smc and req.smc_particle_idx is None:
+                        error = self.smc_manager.create_group(req, self)
+                        if error is not None:
+                            req.finished_reason = FINISH_ABORT(error)
+                            req.finished_len = len(req.output_ids)
+                            self.maybe_collect_routed_experts(req)
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
+                        else:
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
+                            smc_req_indices_to_remove.add(i)
+                    elif is_smc and req.smc_particle_idx is not None:
+                        if not batch.decoding_reqs or req not in batch.decoding_reqs:
+                            self.tree_cache.cache_unfinished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
@@ -408,6 +424,11 @@ class SchedulerOutputProcessorMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+        if smc_req_indices_to_remove:
+            keep_indices = [
+                i for i in range(len(batch.reqs)) if i not in smc_req_indices_to_remove
+            ]
+            batch.filter_batch(keep_indices=keep_indices)
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -454,10 +475,6 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if batch.spec_algorithm.is_smc():
-            self._process_batch_result_decode_smc(batch, result)
-            return
-
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
@@ -466,12 +483,19 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        smc_logprob_diffs = None
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
             else:
                 next_token_ids = next_token_ids.tolist()
+            if batch.spec_algorithm.is_smc():
+                assert result.smc_logprob_diffs is not None
+                if torch.is_tensor(result.smc_logprob_diffs):
+                    smc_logprob_diffs = result.smc_logprob_diffs.tolist()
+                else:
+                    smc_logprob_diffs = list(result.smc_logprob_diffs)
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -498,6 +522,7 @@ class SchedulerOutputProcessorMixin:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        smc_finalized_reqs: List[Req] = []
 
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
@@ -527,6 +552,20 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
 
+            if batch.spec_algorithm.is_smc() and self.smc_manager is not None:
+                if req.finished():
+                    self.smc_manager.on_particle_finished(req)
+                if smc_logprob_diffs is None:
+                    raise RuntimeError(
+                        "SMC decode result is missing batched smc_logprob_diffs."
+                    )
+                finalized_req = self.smc_manager.on_particle_step(
+                    req,
+                    float(smc_logprob_diffs[i]),
+                )
+                if finalized_req is not None:
+                    smc_finalized_reqs.append(finalized_req)
+
             if (
                 self.server_args.disaggregation_decode_enable_offload_kvcache
                 and not req.finished()
@@ -541,16 +580,27 @@ class SchedulerOutputProcessorMixin:
                         if isinstance(pixel_values, torch.Tensor):
                             mm_item.feature = None
                             del pixel_values
-                self.maybe_collect_routed_experts(req)
+                if not batch.spec_algorithm.is_smc():
+                    self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    if batch.spec_algorithm.is_smc():
+                        _release_internal_req(
+                            req,
+                            req_to_token_pool=self.req_to_token_pool,
+                            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        )
+                    else:
+                        release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()
+
+            if batch.spec_algorithm.is_smc():
+                continue
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -613,6 +663,10 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)
+        if smc_finalized_reqs:
+            for req in smc_finalized_reqs:
+                req.time_stats.set_completion_time()
+            self.stream_output(smc_finalized_reqs, False)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -1039,6 +1093,8 @@ class SchedulerOutputProcessorMixin:
 
         for req in reqs:
             if req is skip_req:
+                continue
+            if req.smc_particle_idx is not None:
                 continue
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.

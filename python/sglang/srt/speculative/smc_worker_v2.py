@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Dict, List, Optional, Sequence, Union
+from typing import List, Sequence, Union
 
 import torch
 
@@ -11,30 +11,17 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    ModelWorkerBatch,
-    Req,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
-    SMCParentUpdate,
-    SMCParticleState,
+    SMC_MIN_TEMPERATURE,
     SMCScoreInput,
-    SMCRequestState,
-    build_smc_causal_mask,
     build_smc_positions,
-    effective_sample_size,
-    initialize_smc_request_state,
-    multinomial_resample,
-    normalize_log_weights,
+    resolve_smc_proposal_batch,
     resolve_smc_proposal_length,
-    resolve_smc_seed_output_ids,
-    systematic_resample,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
@@ -86,11 +73,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
         self, batch: Union[ScheduleBatch, ModelWorkerBatch]
     ) -> GenerationBatchResult:
         is_overlap_batch = isinstance(batch, ModelWorkerBatch)
-        overlap_draft_input = (
-            batch.spec_info
-            if is_overlap_batch and isinstance(batch.spec_info, SMCDraftInput)
-            else None
-        )
+        draft_input = batch.spec_info if isinstance(batch.spec_info, SMCDraftInput) else None
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             model_worker_batch = batch if is_overlap_batch else batch.get_model_worker_batch()
@@ -104,100 +87,108 @@ class SMCWorkerV2(StandaloneWorkerV2):
         if not batch.reqs:
             return self._build_empty_decode_result(is_overlap_batch)
 
-        parent_updates: List[SMCParentUpdate] = []
-        any_cuda_graph = False
-        for req_idx, parent_req in enumerate(batch.reqs):
-            if parent_req.finished():
-                parent_updates.append(
-                    SMCParentUpdate(
-                        done=True,
-                        best_particle_idx=0,
-                        best_output_ids=list(parent_req.output_ids),
-                        finish_reason=copy.copy(parent_req.finished_reason),
-                        finished_len=parent_req.finished_len,
-                    )
-                )
-                continue
-
-            if parent_req.smc_state is None:
-                seed_output_ids = None
-                if overlap_draft_input is not None:
-                    try:
-                        seed_output_ids = resolve_smc_seed_output_ids(
-                            parent_req,
-                            overlap_last_token_id=int(
-                                overlap_draft_input.last_token_ids[req_idx].item()
-                            ),
-                            overlap_new_seq_len=int(
-                                overlap_draft_input.new_seq_lens[req_idx].item()
-                            ),
-                        )
-                    except ValueError as exc:
-                        error = str(exc)
-                        parent_req.finished_reason = FINISH_ABORT(error)
-                        parent_updates.append(
-                            SMCParentUpdate(
-                                done=True,
-                                best_particle_idx=0,
-                                best_output_ids=list(parent_req.output_ids),
-                                finish_reason=copy.copy(parent_req.finished_reason),
-                                finished_len=parent_req.finished_len,
-                            )
-                        )
-                        continue
-                error = initialize_smc_request_state(
-                    parent_req,
-                    server_args=self.server_args,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    seed_output_ids=seed_output_ids,
-                )
-                if error is not None:
-                    parent_req.finished_reason = FINISH_ABORT(error)
-                    parent_updates.append(
-                        SMCParentUpdate(
-                            done=True,
-                            best_particle_idx=0,
-                            best_output_ids=list(parent_req.output_ids),
-                            finish_reason=copy.copy(parent_req.finished_reason),
-                            finished_len=parent_req.finished_len,
-                        )
-                    )
-                    continue
-
-            try:
-                self._ensure_draft_prefix_filled(parent_req)
-                any_cuda_graph |= self._run_parent_step(parent_req)
-            except Exception as exc:
-                logger.exception("SMC parent step failed for request %s", parent_req.rid)
-                parent_req.finished_reason = FINISH_ABORT(str(exc))
-                parent_req.finished_len = len(parent_req.output_ids)
-                for particle in parent_req.smc_state.particles:
-                    particle.target_req.finished_reason = copy.copy(
-                        parent_req.finished_reason
-                    )
-                    particle.target_req.finished_len = parent_req.finished_len
-                    particle.draft_req.finished_reason = copy.copy(
-                        parent_req.finished_reason
-                    )
-                    particle.draft_req.finished_len = parent_req.finished_len
-
-            parent_updates.append(self._build_parent_update(parent_req))
-
-        if is_overlap_batch:
-            next_draft_input = self._build_overlap_draft_input(batch.reqs, parent_updates)
-            return GenerationBatchResult(
-                logits_output=self._empty_logits_output(),
-                next_token_ids=next_draft_input.last_token_ids.to(dtype=torch.int32),
-                can_run_cuda_graph=any_cuda_graph,
-                next_draft_input=next_draft_input,
-                smc_parent_updates=parent_updates,
+        reqs = list(batch.reqs)
+        visible_seq_lens = batch.seq_lens.to(dtype=torch.int64)
+        if draft_input is None:
+            last_token_ids = torch.tensor(
+                [
+                    req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+                    for req in reqs
+                ],
+                dtype=torch.int64,
+                device=self.device,
             )
+        else:
+            last_token_ids = draft_input.last_token_ids.to(dtype=torch.int64)
+        draft_committed_lens = visible_seq_lens - 1
 
+        self._ensure_draft_prefix_filled(reqs, draft_committed_lens.tolist())
+
+        draft_sampling_info = self._make_sampling_info(
+            reqs,
+            self.draft_worker.draft_worker.model_config.vocab_size,
+        )
+        if self._can_use_fused_draft_cuda_graph(reqs, draft_sampling_info):
+            with self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                (
+                    draft_tokens,
+                    draft_logprobs,
+                    draft_lengths,
+                ) = self._run_fused_draft_reqs(
+                    reqs,
+                    batch.req_pool_indices,
+                    (
+                        draft_input.proposal_out_cache_loc
+                        if draft_input is not None
+                        else None
+                    ),
+                    visible_seq_lens,
+                    draft_committed_lens,
+                    last_token_ids,
+                    draft_sampling_info,
+                )
+            draft_can_run_cuda_graph = True
+        else:
+            with self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                (
+                    draft_tokens,
+                    draft_logprobs,
+                    draft_lengths,
+                    draft_can_run_cuda_graph,
+                ) = self._run_stepwise_draft_reqs(
+                    reqs,
+                    visible_seq_lens,
+                    draft_committed_lens,
+                    last_token_ids,
+                )
+
+        (
+            accept_lens,
+            committed_seq_lens,
+            next_last_token_ids,
+            smc_logprob_diffs,
+            score_can_run_cuda_graph,
+        ) = self._run_score_batch(
+            reqs=reqs,
+            draft_committed_lens=draft_committed_lens,
+            anchor_token_ids=last_token_ids,
+            draft_tokens=draft_tokens,
+            draft_logprobs=draft_logprobs,
+            draft_lengths=draft_lengths,
+            verify_out_cache_loc=(
+                draft_input.verify_out_cache_loc if draft_input is not None else None
+            ),
+        )
+
+        stride = self.server_args.speculative_num_draft_tokens
+        flat_predict = torch.zeros(
+            (len(reqs), stride),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        flat_predict[:, : draft_tokens.shape[1]] = draft_tokens.to(dtype=torch.int32)
+
+        verify_done = None
+        if is_overlap_batch:
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
+        next_draft_input = SMCDraftInput(
+            last_token_ids=next_last_token_ids.to(dtype=torch.int64),
+            new_seq_lens=committed_seq_lens.to(dtype=torch.int32),
+            verify_done=verify_done,
+        )
         return GenerationBatchResult(
-            next_token_ids=torch.empty((0,), dtype=torch.int32, device=self.device),
-            can_run_cuda_graph=any_cuda_graph,
-            smc_parent_updates=parent_updates,
+            logits_output=self._empty_logits_output() if is_overlap_batch else None,
+            next_token_ids=flat_predict.reshape(-1),
+            accept_lens=accept_lens.to(dtype=torch.int32),
+            smc_logprob_diffs=smc_logprob_diffs.to(dtype=torch.float32),
+            can_run_cuda_graph=draft_can_run_cuda_graph or score_can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
 
     def _build_empty_decode_result(self, is_overlap_batch: bool) -> GenerationBatchResult:
@@ -207,9 +198,10 @@ class SMCWorkerV2(StandaloneWorkerV2):
         return GenerationBatchResult(
             logits_output=self._empty_logits_output() if is_overlap_batch else None,
             next_token_ids=torch.empty((0,), dtype=torch.int32, device=self.device),
+            accept_lens=torch.empty((0,), dtype=torch.int32, device=self.device),
+            smc_logprob_diffs=torch.empty((0,), dtype=torch.float32, device=self.device),
             can_run_cuda_graph=False,
             next_draft_input=next_draft_input,
-            smc_parent_updates=[],
         )
 
     def _empty_logits_output(self) -> LogitsProcessorOutput:
@@ -224,60 +216,34 @@ class SMCWorkerV2(StandaloneWorkerV2):
             new_seq_lens=(batch.seq_lens + 1).to(dtype=torch.int32),
         )
 
-    def _build_overlap_draft_input(
-        self, parent_reqs: Sequence[Req], parent_updates: Sequence[SMCParentUpdate]
-    ) -> SMCDraftInput:
-        last_token_ids: List[int] = []
-        new_seq_lens: List[int] = []
-        for req, update in zip(parent_reqs, parent_updates, strict=True):
-            best_output_ids = (
-                update.best_output_ids if update.best_output_ids is not None else req.output_ids
-            )
-            if best_output_ids:
-                last_token_ids.append(best_output_ids[-1])
-            else:
-                last_token_ids.append(req.origin_input_ids[-1])
-            new_seq_lens.append(len(req.origin_input_ids) + len(best_output_ids))
+    def _ensure_draft_prefix_filled(
+        self,
+        reqs: Sequence[Req],
+        draft_committed_lens: Sequence[int],
+    ) -> None:
+        fill_reqs: List[Req] = []
+        fill_lens: List[int] = []
+        for req, committed_seq_len in zip(reqs, draft_committed_lens, strict=True):
+            if req.draft_prefix_materialized or committed_seq_len <= 0:
+                req.draft_prefix_materialized = True
+                continue
+            fill_reqs.append(req)
+            fill_lens.append(int(committed_seq_len))
 
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
-        return SMCDraftInput(
-            last_token_ids=torch.tensor(
-                last_token_ids, dtype=torch.int64, device=self.device
-            ),
-            new_seq_lens=torch.tensor(
-                new_seq_lens, dtype=torch.int32, device=self.device
-            ),
-            verify_done=verify_done,
-        )
-
-    def _ensure_draft_prefix_filled(self, parent_req: Req) -> None:
-        state = parent_req.smc_state
-        if state is None or state.draft_prefix_materialized:
+        if not fill_reqs:
             return
 
-        reqs: List[Req] = []
-        committed_seq_lens: List[int] = []
-        for particle in state.particles:
-            draft_req = particle.draft_req
-            if draft_req.kv_committed_len <= 0:
-                continue
-            reqs.append(draft_req)
-            committed_seq_lens.append(draft_req.kv_committed_len)
+        with self.draft_worker.draft_tp_context(
+            self.draft_worker.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self._run_draft_prefix_fill_batch(
+                fill_reqs,
+                fill_lens,
+                worker=self.draft_worker.draft_worker,
+            )
 
-        if reqs:
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self._run_draft_prefix_fill_batch(
-                    # This is a one-time draft-prefix KV fill, not an EAGLE-style
-                    # recurring draft-extend stage with accepted bonus tokens.
-                    reqs,
-                    committed_seq_lens,
-                    worker=self.draft_worker.draft_worker,
-                )
-
-        state.draft_prefix_materialized = True
+        for req in fill_reqs:
+            req.draft_prefix_materialized = True
 
     def _run_draft_prefix_fill_batch(
         self,
@@ -318,12 +284,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
                 )
 
             fill_ids = req.origin_input_ids + req.output_ids[:committed_output_len]
-            if len(fill_ids) != committed_seq_len:
-                raise AssertionError(
-                    "SMC draft prefix fill built an unexpected fill length: "
-                    f"rid={req.rid}, expected={committed_seq_len}, actual={len(fill_ids)}"
-                )
-
             input_ids.extend(fill_ids)
             out_cache_loc.append(
                 self.req_to_token_pool.req_to_token[
@@ -359,94 +319,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
 
         worker.forward_batch_generation(batch.get_model_worker_batch(), is_verify=True)
 
-    def _run_parent_step(self, parent_req: Req) -> bool:
-        state = parent_req.smc_state
-        assert state is not None
-
-        active_particles = state.active_particles()
-        if not active_particles:
-            return False
-
-        draft_tokens: Dict[int, List[int]] = {
-            particle.target_req.smc_particle_idx: [] for particle in active_particles
-        }
-        draft_logprobs: Dict[int, float] = {
-            particle.target_req.smc_particle_idx: 0.0 for particle in active_particles
-        }
-        draft_finished: Dict[int, bool] = {
-            particle.target_req.smc_particle_idx: False for particle in active_particles
-        }
-        target_had_pending_token: Dict[int, bool] = {
-            particle.target_req.smc_particle_idx: self._req_has_uncommitted_token(
-                particle.target_req
-            )
-            for particle in active_particles
-        }
-
-        draft_sampling_info = self._make_sampling_info(
-            [particle.draft_req for particle in active_particles],
-            self.draft_worker.draft_worker.model_config.vocab_size,
-        )
-        can_run_cuda_graph = False
-        if self._can_use_fused_draft_cuda_graph(active_particles, draft_sampling_info):
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                draft_can_run_cuda_graph = self._run_fused_draft_particles(
-                    active_particles,
-                    draft_tokens,
-                    draft_logprobs,
-                    draft_finished,
-                    draft_sampling_info,
-                )
-            can_run_cuda_graph = can_run_cuda_graph or draft_can_run_cuda_graph
-        else:
-            for _ in range(self.smc_gamma):
-                step_particles = [
-                    particle for particle in active_particles if not particle.is_finished
-                ]
-                if not step_particles:
-                    break
-
-                with self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                    (
-                        next_token_ids,
-                        next_token_logprobs,
-                        draft_can_run_cuda_graph,
-                    ) = self._run_draft_step_particles(step_particles)
-                can_run_cuda_graph = can_run_cuda_graph or draft_can_run_cuda_graph
-
-                for particle, token_id, token_logprob in zip(
-                    step_particles, next_token_ids, next_token_logprobs, strict=True
-                ):
-                    particle_idx = particle.target_req.smc_particle_idx
-                    draft_tokens[particle_idx].append(token_id)
-                    draft_logprobs[particle_idx] += float(token_logprob)
-                    self._append_particle_token(particle, token_id)
-                    draft_finished[particle_idx] = particle.is_finished
-
-        particles_to_score = [
-            particle
-            for particle in active_particles
-            if draft_tokens[particle.target_req.smc_particle_idx]
-        ]
-        if particles_to_score:
-            target_result = self._run_score_batch(
-                particles_to_score=particles_to_score,
-                draft_tokens=draft_tokens,
-                draft_logprobs=draft_logprobs,
-                draft_finished=draft_finished,
-                target_had_pending_token=target_had_pending_token,
-            )
-            can_run_cuda_graph = (
-                can_run_cuda_graph or target_result.can_run_cuda_graph
-            )
-
-        state.step_index += 1
-        return can_run_cuda_graph
-
     def _make_sampling_info(
         self,
         reqs: Sequence[Req],
@@ -465,82 +337,168 @@ class SMCWorkerV2(StandaloneWorkerV2):
 
     def _can_use_fused_draft_cuda_graph(
         self,
-        particles: Sequence[SMCParticleState],
+        reqs: Sequence[Req],
         sampling_info: SamplingBatchInfo,
     ) -> bool:
         runner = getattr(self.draft_worker, "smc_draft_cuda_graph_runner", None)
         return bool(
             runner
-            and runner.supports_replay(
-                [particle.draft_req for particle in particles], sampling_info
-            )
+            and runner.supports_replay(reqs, sampling_info)
+            and runner.can_run(len(reqs), sampling_info)
         )
 
-    def _run_fused_draft_particles(
+    def _run_fused_draft_reqs(
         self,
-        particles: Sequence[SMCParticleState],
-        draft_tokens: Dict[int, List[int]],
-        draft_logprobs: Dict[int, float],
-        draft_finished: Dict[int, bool],
+        reqs: Sequence[Req],
+        req_pool_indices: torch.Tensor,
+        proposal_out_cache_loc: torch.Tensor | None,
+        visible_seq_lens: torch.Tensor,
+        draft_committed_lens: torch.Tensor,
+        last_token_ids: torch.Tensor,
         sampling_info: SamplingBatchInfo,
-    ) -> bool:
+    ):
         runner = self.draft_worker.smc_draft_cuda_graph_runner
-        draft_reqs = [particle.draft_req for particle in particles]
-        base_committed_lens = [req.kv_committed_len for req in draft_reqs]
-        token_matrix, logprob_matrix = runner.replay(draft_reqs, sampling_info)
+        if proposal_out_cache_loc is None:
+            raise RuntimeError(
+                "SMC fused draft replay requires proposal_out_cache_loc prepared "
+                "during SMCDraftInput.prepare_for_decode()."
+            )
+        token_matrix, logprob_matrix = runner.replay(
+            req_pool_indices=req_pool_indices,
+            proposal_out_cache_loc=proposal_out_cache_loc,
+            sampling_info=sampling_info,
+            draft_committed_lens=draft_committed_lens.to(dtype=torch.int32),
+            last_token_ids=last_token_ids,
+        )
+        current_output_lens = visible_seq_lens.to(torch.int64) - torch.tensor(
+            [len(req.origin_input_ids) for req in reqs],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        draft_lengths, _draft_finished, draft_logprobs = resolve_smc_proposal_batch(
+            reqs,
+            token_matrix.to(torch.int64),
+            logprob_matrix.to(torch.float32),
+            current_output_lens,
+        )
 
-        for particle, token_row, logprob_row, base_committed_len in zip(
-            particles,
-            token_matrix.tolist(),
-            logprob_matrix.tolist(),
-            base_committed_lens,
+        return token_matrix.to(torch.int32), draft_logprobs, draft_lengths
+
+    def _run_stepwise_draft_reqs(
+        self,
+        reqs: Sequence[Req],
+        visible_seq_lens: torch.Tensor,
+        draft_committed_lens: torch.Tensor,
+        last_token_ids: torch.Tensor,
+    ):
+        batch_size = len(reqs)
+        draft_tokens = torch.zeros(
+            (batch_size, self.smc_gamma), dtype=torch.int32, device=self.device
+        )
+        draft_logprobs = torch.zeros((batch_size,), dtype=torch.float32, device=self.device)
+        draft_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=self.device)
+        draft_finished = torch.zeros((batch_size,), dtype=torch.bool, device=self.device)
+        current_output_lens = [
+            int(visible_seq_len) - len(req.origin_input_ids)
+            for req, visible_seq_len in zip(reqs, visible_seq_lens.tolist(), strict=True)
+        ]
+
+        snapshots = []
+        for req, draft_committed_len, last_token_id in zip(
+            reqs,
+            draft_committed_lens.tolist(),
+            last_token_ids.tolist(),
             strict=True,
         ):
-            particle_idx = particle.target_req.smc_particle_idx
-            committed_steps, proposal_finished = resolve_smc_proposal_length(
-                particle.target_req, token_row
+            snapshots.append(
+                {
+                    "output_ids": list(req.output_ids),
+                    "kv_committed_len": req.kv_committed_len,
+                    "kv_allocated_len": req.kv_allocated_len,
+                    "finished_reason": copy.copy(req.finished_reason),
+                    "finished_len": req.finished_len,
+                    "finished_output": req.finished_output,
+                    "to_finish": copy.copy(req.to_finish),
+                    "decode_batch_idx": req.decode_batch_idx,
+                }
             )
-            for token_id, token_logprob in zip(
-                token_row[:committed_steps],
-                logprob_row[:committed_steps],
-                strict=True,
-            ):
-                draft_tokens[particle_idx].append(int(token_id))
-                draft_logprobs[particle_idx] += float(token_logprob)
-                self._append_particle_token(particle, int(token_id))
+            req.output_ids = [int(last_token_id)]
+            req.kv_committed_len = int(draft_committed_len)
+            req.finished_reason = None
+            req.finished_len = None
+            req.finished_output = None
+            req.to_finish = None
 
-            particle.draft_req.kv_committed_len = base_committed_len + committed_steps
-            particle.draft_req.decode_batch_idx += committed_steps
-            particle.draft_req.prefix_indices = self.req_to_token_pool.req_to_token[
-                particle.draft_req.req_pool_idx, : particle.draft_req.kv_committed_len
-            ].to(dtype=torch.int64, copy=True)
-            draft_finished[particle_idx] = proposal_finished
+        can_run_cuda_graph = False
+        for step in range(self.smc_gamma):
+            step_indices = [
+                idx for idx in range(batch_size) if not bool(draft_finished[idx].item())
+            ]
+            if not step_indices:
+                break
 
-        return True
+            step_reqs = [reqs[idx] for idx in step_indices]
+            decode_result = self._run_decode_batch(
+                step_reqs,
+                worker=self.draft_worker.draft_worker,
+            )
+            step_token_ids, step_token_logprobs = self._fill_draft_step_outputs(
+                decode_result
+            )
+            can_run_cuda_graph = can_run_cuda_graph or decode_result.can_run_cuda_graph
 
-    def _append_particle_token(self, particle: SMCParticleState, token_id: int) -> None:
-        particle.target_req.output_ids.append(token_id)
-        particle.draft_req.output_ids.append(token_id)
-        particle.target_req.check_finished(1)
-        particle.draft_req.finished_reason = copy.copy(particle.target_req.finished_reason)
-        particle.draft_req.finished_len = particle.target_req.finished_len
-        particle.draft_req.finished_output = particle.target_req.finished_output
-        particle.draft_req.to_finish = copy.copy(particle.target_req.to_finish)
+            for local_idx, row_idx in enumerate(step_indices):
+                token_id = int(step_token_ids[local_idx])
+                token_logprob = float(step_token_logprobs[local_idx])
+                current_output_len = current_output_lens[row_idx]
+                committed_steps, proposal_finished = resolve_smc_proposal_length(
+                    reqs[row_idx],
+                    [token_id],
+                    current_output_len=current_output_len,
+                )
+                if committed_steps > 0:
+                    draft_tokens[row_idx, step] = token_id
+                    draft_logprobs[row_idx] += token_logprob
+                    draft_lengths[row_idx] += 1
+                    current_output_lens[row_idx] += 1
+                    reqs[row_idx].output_ids.append(token_id)
+                draft_finished[row_idx] = proposal_finished
+
+        for req, snapshot in zip(reqs, snapshots, strict=True):
+            req.output_ids = snapshot["output_ids"]
+            req.kv_committed_len = snapshot["kv_committed_len"]
+            req.kv_allocated_len = snapshot["kv_allocated_len"]
+            req.finished_reason = snapshot["finished_reason"]
+            req.finished_len = snapshot["finished_len"]
+            req.finished_output = snapshot["finished_output"]
+            req.to_finish = snapshot["to_finish"]
+            req.decode_batch_idx = snapshot["decode_batch_idx"]
+
+        return (
+            draft_tokens,
+            draft_logprobs,
+            draft_lengths,
+            can_run_cuda_graph,
+        )
 
     def _run_score_batch(
         self,
-        particles_to_score: Sequence[SMCParticleState],
-        draft_tokens: Dict[int, List[int]],
-        draft_logprobs: Dict[int, float],
-        draft_finished: Dict[int, bool],
-        target_had_pending_token: Dict[int, bool],
-    ) -> GenerationBatchResult:
+        reqs: Sequence[Req],
+        draft_committed_lens: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_logprobs: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        verify_out_cache_loc: torch.Tensor | None,
+    ):
         model_worker_batch = self._make_score_model_worker_batch(
-            particles_to_score=particles_to_score,
+            reqs=reqs,
+            draft_committed_lens=draft_committed_lens,
+            anchor_token_ids=anchor_token_ids,
             draft_tokens=draft_tokens,
             draft_logprobs=draft_logprobs,
-            draft_finished=draft_finished,
-            target_had_pending_token=target_had_pending_token,
+            draft_lengths=draft_lengths,
+            verify_out_cache_loc=verify_out_cache_loc,
         )
         score_input: SMCScoreInput = model_worker_batch.spec_info
         verify_forward_batch, can_run_cuda_graph = score_input.prepare_for_v2_verify(
@@ -555,73 +513,56 @@ class SMCWorkerV2(StandaloneWorkerV2):
             skip_attn_backend_init=True,
         )
         assert forward_output.logits_output is not None
-        score_input.sample(
+        (
+            accept_lens,
+            committed_seq_lens,
+            next_last_token_ids,
+            smc_logprob_diffs,
+        ) = score_input.sample(
             model_worker_batch,
             forward_output.logits_output,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
         )
-        forward_output.can_run_cuda_graph = can_run_cuda_graph
-        return forward_output
-
-    def _run_draft_step_particles(
-        self, step_particles: Sequence[SMCParticleState]
-    ) -> tuple[List[int], List[float], bool]:
-        next_token_ids: List[Optional[int]] = [None] * len(step_particles)
-        next_token_logprobs: List[Optional[float]] = [None] * len(step_particles)
-
-        decode_result = self._run_decode_batch(
-            [particle.draft_req for particle in step_particles],
-            worker=self.draft_worker.draft_worker,
+        return (
+            accept_lens,
+            committed_seq_lens,
+            next_last_token_ids,
+            smc_logprob_diffs,
+            can_run_cuda_graph,
         )
-        self._fill_draft_step_outputs(
-            range(len(step_particles)),
-            decode_result,
-            next_token_ids,
-            next_token_logprobs,
-        )
-
-        assert all(token_id is not None for token_id in next_token_ids)
-        assert all(logprob is not None for logprob in next_token_logprobs)
-        return next_token_ids, next_token_logprobs, decode_result.can_run_cuda_graph
-
-    def _fill_draft_step_outputs(
-        self,
-        indices: Sequence[int],
-        result: GenerationBatchResult,
-        next_token_ids: List[Optional[int]],
-        next_token_logprobs: List[Optional[float]],
-    ) -> None:
-        assert result.next_token_ids is not None
-        assert result.logits_output is not None
-        assert result.logits_output.next_token_logprobs is not None
-
-        token_ids = result.next_token_ids.tolist()
-        token_logprobs = result.logits_output.next_token_logprobs.tolist()
-        for batch_idx, token_id, token_logprob in zip(
-            indices, token_ids, token_logprobs, strict=True
-        ):
-            next_token_ids[batch_idx] = int(token_id)
-            next_token_logprobs[batch_idx] = float(token_logprob)
-
-    def _req_has_uncommitted_token(self, req: Req) -> bool:
-        return len(req.origin_input_ids) + len(req.output_ids) > req.kv_committed_len
 
     def _run_decode_batch(self, reqs: List[Req], worker) -> GenerationBatchResult:
         batch = self._make_decode_batch(reqs, worker.model_config)
         return worker.forward_batch_generation(batch.get_model_worker_batch())
 
+    def _fill_draft_step_outputs(
+        self,
+        result: GenerationBatchResult,
+    ) -> tuple[List[int], List[float]]:
+        assert result.next_token_ids is not None
+        assert result.logits_output is not None
+        assert result.logits_output.next_token_logprobs is not None
+        return (
+            [int(token_id) for token_id in result.next_token_ids.tolist()],
+            [float(x) for x in result.logits_output.next_token_logprobs.tolist()],
+        )
+
     def _make_score_model_worker_batch(
         self,
-        particles_to_score: Sequence[SMCParticleState],
-        draft_tokens: Dict[int, List[int]],
-        draft_logprobs: Dict[int, float],
-        draft_finished: Dict[int, bool],
-        target_had_pending_token: Dict[int, bool],
+        reqs: Sequence[Req],
+        draft_committed_lens: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_logprobs: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        verify_out_cache_loc: torch.Tensor | None,
     ) -> ModelWorkerBatch:
-        reqs = [particle.target_req for particle in particles_to_score]
+        if verify_out_cache_loc is None:
+            raise RuntimeError(
+                "SMC target scoring requires verify_out_cache_loc prepared "
+                "during SMCDraftInput.prepare_for_decode()."
+            )
         batch = ScheduleBatch.init_new(
-            reqs=reqs,
+            reqs=list(reqs),
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self._internal_tree_cache,
@@ -630,59 +571,23 @@ class SMCWorkerV2(StandaloneWorkerV2):
             spec_algorithm=SpeculativeAlgorithm.SMC,
         )
         score_token_num = self.server_args.speculative_num_draft_tokens
-        score_start_lens: List[int] = []
-        flat_score_tokens: List[int] = []
-        draft_lengths: List[int] = []
-        draft_logprob_values: List[float] = []
-        draft_finished_flags: List[bool] = []
-
-        for particle in particles_to_score:
-            req = particle.target_req
-            particle_idx = req.smc_particle_idx
-            proposal_tokens = draft_tokens[particle_idx]
-            if not proposal_tokens:
-                raise AssertionError(
-                    f"SMC score batch received an empty proposal for particle {particle_idx}"
-                )
-
-            had_pending_token = target_had_pending_token[particle_idx]
-            score_start_len = req.kv_committed_len if had_pending_token else req.kv_committed_len - 1
-            if score_start_len < 0:
-                raise AssertionError(
-                    "SMC target scoring requires a non-empty anchor prefix: "
-                    f"rid={req.rid}, kv_committed_len={req.kv_committed_len}, "
-                    f"had_pending={had_pending_token}"
-                )
-
-            anchor_offset = len(req.output_ids) - len(proposal_tokens) - 1
-            anchor_token = (
-                req.output_ids[anchor_offset]
-                if anchor_offset >= 0
-                else req.origin_input_ids[-1]
-            )
-            row_tokens = [anchor_token] + proposal_tokens
-            if len(row_tokens) > score_token_num:
-                raise AssertionError(
-                    "SMC score batch exceeded the fixed verify width: "
-                    f"rid={req.rid}, width={score_token_num}, actual={len(row_tokens)}"
-                )
-            row_tokens.extend([row_tokens[-1]] * (score_token_num - len(row_tokens)))
-
-            score_start_lens.append(score_start_len)
-            flat_score_tokens.extend(row_tokens)
-            draft_lengths.append(len(proposal_tokens))
-            draft_logprob_values.append(draft_logprobs[particle_idx])
-            draft_finished_flags.append(draft_finished[particle_idx])
+        score_tokens = torch.cat(
+            [
+                anchor_token_ids.to(dtype=torch.int64).unsqueeze(1),
+                draft_tokens.to(dtype=torch.int64),
+            ],
+            dim=1,
+        )
+        score_tokens = score_tokens[:, :score_token_num]
+        if score_tokens.shape[1] < score_token_num:
+            pad = score_tokens[:, -1:].expand(-1, score_token_num - score_tokens.shape[1])
+            score_tokens = torch.cat([score_tokens, pad], dim=1)
 
         batch.forward_mode = ForwardMode.DECODE
         batch.req_pool_indices = torch.tensor(
             [req.req_pool_idx for req in reqs], dtype=torch.int64, device=self.device
         )
-        batch.seq_lens = torch.tensor(
-            score_start_lens,
-            dtype=torch.int64,
-            device=self.device,
-        )
+        batch.seq_lens = draft_committed_lens.to(dtype=torch.int64)
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
         batch.orig_seq_lens = torch.tensor(
@@ -696,22 +601,22 @@ class SMCWorkerV2(StandaloneWorkerV2):
             batch,
             self.target_worker.model_config.vocab_size,
         )
+        custom_mask = None
+        if self.server_args.attention_backend != "flashinfer":
+            from sglang.srt.speculative.smc_info import build_smc_causal_mask
+
+            custom_mask = build_smc_causal_mask(batch.seq_lens, score_token_num)
         batch.spec_info = SMCScoreInput(
-            draft_token=torch.tensor(
-                flat_score_tokens, dtype=torch.int64, device=self.device
-            ),
-            draft_lengths=torch.tensor(
-                draft_lengths, dtype=torch.int32, device=self.device
-            ),
-            draft_logprobs=torch.tensor(
-                draft_logprob_values, dtype=torch.float32, device=self.device
-            ),
-            draft_finished=torch.tensor(
-                draft_finished_flags, dtype=torch.bool, device=self.device
-            ),
+            draft_token=score_tokens.reshape(-1).contiguous(),
+            draft_lengths=draft_lengths.to(dtype=torch.int32),
+            draft_logprobs=draft_logprobs.to(dtype=torch.float32),
+            verify_out_cache_loc=verify_out_cache_loc.to(dtype=torch.int64),
             positions=build_smc_positions(batch.seq_lens, score_token_num),
-            custom_mask=build_smc_causal_mask(batch.seq_lens, score_token_num),
+            custom_mask=custom_mask,
             draft_token_num=score_token_num,
+            target_temperature=max(
+                float(self.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
+            ),
         )
         return batch.get_model_worker_batch()
 
@@ -741,149 +646,16 @@ class SMCWorkerV2(StandaloneWorkerV2):
             device=self.device,
         )
         batch.output_ids = torch.tensor(
-            [
-                req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
-                for req in reqs
-            ],
+            [req.output_ids[-1] for req in reqs],
             dtype=torch.int64,
             device=self.device,
         )
         batch.top_logprobs_nums = [0] * len(reqs)
         batch.token_ids_logprobs = [None] * len(reqs)
+        batch.return_logprob = True
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch,
             model_config.vocab_size,
         )
         batch.prepare_for_decode()
         return batch
-
-    def _maybe_resample(self, state: SMCRequestState) -> None:
-        if state is None:
-            return
-
-        active_particles = state.active_particles()
-        if len(active_particles) <= 1:
-            return
-
-        normalized_weights = normalize_log_weights(
-            [particle.log_weight for particle in active_particles]
-        )
-        ess = effective_sample_size(normalized_weights)
-        if ess >= len(active_particles) * state.resample_threshold:
-            return
-
-        if state.resample_method == "multinomial":
-            ancestors = multinomial_resample(normalized_weights)
-        else:
-            ancestors = systematic_resample(normalized_weights)
-
-        source_snapshots = [
-            self._snapshot_particle(active_particles[ancestor_idx])
-            for ancestor_idx in ancestors
-        ]
-
-        for dst_particle, snapshot in zip(active_particles, source_snapshots, strict=True):
-            self._restore_particle_from_snapshot(dst_particle, snapshot)
-            dst_particle.log_weight = 0.0
-
-        for snapshot in source_snapshots:
-            self._release_snapshot(snapshot)
-
-    def _snapshot_particle(self, particle: SMCParticleState) -> dict:
-        return {
-            "target_req": self._snapshot_req(particle.target_req),
-            "draft_req": self._snapshot_req(particle.draft_req),
-            "log_weight": particle.log_weight,
-        }
-
-    def _snapshot_req(self, req: Req) -> dict:
-        seq_len = req.kv_committed_len
-        if seq_len > 0:
-            indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :seq_len
-            ].to(dtype=torch.int64, copy=True)
-            self.token_to_kv_pool_allocator.inc_ref(indices)
-        else:
-            indices = torch.empty((0,), dtype=torch.int64)
-
-        return {
-            "indices": indices,
-            "output_ids": list(req.output_ids),
-            "finished_reason": copy.copy(req.finished_reason),
-            "finished_len": req.finished_len,
-            "finished_output": req.finished_output,
-            "to_finish": copy.copy(req.to_finish),
-            "kv_committed_len": req.kv_committed_len,
-            "decoded_text": req.decoded_text,
-            "surr_offset": req.surr_offset,
-            "read_offset": req.read_offset,
-            "cache_protected_len": req.cache_protected_len,
-            "logprob_start_len": req.logprob_start_len,
-        }
-
-    def _restore_particle_from_snapshot(
-        self, particle: SMCParticleState, snapshot: dict
-    ) -> None:
-        self._restore_req_from_snapshot(particle.target_req, snapshot["target_req"])
-        self._restore_req_from_snapshot(particle.draft_req, snapshot["draft_req"])
-        particle.log_weight = snapshot["log_weight"]
-
-    def _restore_req_from_snapshot(self, req: Req, snapshot: dict) -> None:
-        if req.kv_allocated_len > 0:
-            old_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_allocated_len
-            ].to(dtype=torch.int64, copy=True)
-            self.token_to_kv_pool_allocator.dec_ref_and_free(old_indices)
-
-        indices = snapshot["indices"]
-        if indices.numel() > 0:
-            self.token_to_kv_pool_allocator.inc_ref(indices)
-            self.req_to_token_pool.write(
-                (req.req_pool_idx, slice(0, indices.shape[0])),
-                indices.to(torch.int32),
-            )
-            req.prefix_indices = indices.to(dtype=torch.int64, copy=True)
-        else:
-            req.prefix_indices = torch.empty((0,), dtype=torch.int64)
-
-        req.output_ids = list(snapshot["output_ids"])
-        req.finished_reason = copy.copy(snapshot["finished_reason"])
-        req.finished_len = snapshot["finished_len"]
-        req.finished_output = snapshot["finished_output"]
-        req.to_finish = copy.copy(snapshot["to_finish"])
-        req.kv_committed_len = snapshot["kv_committed_len"]
-        req.kv_allocated_len = snapshot["kv_committed_len"]
-        req.decoded_text = snapshot["decoded_text"]
-        req.surr_offset = snapshot["surr_offset"]
-        req.read_offset = snapshot["read_offset"]
-        req.cache_protected_len = snapshot["cache_protected_len"]
-        req.logprob_start_len = snapshot["logprob_start_len"]
-
-    def _release_snapshot(self, snapshot: dict) -> None:
-        self._release_req_snapshot(snapshot["target_req"])
-        self._release_req_snapshot(snapshot["draft_req"])
-
-    def _release_req_snapshot(self, snapshot: dict) -> None:
-        indices = snapshot["indices"]
-        if indices.numel() > 0:
-            self.token_to_kv_pool_allocator.dec_ref_and_free(indices)
-
-    def _build_parent_update(self, parent_req: Req) -> SMCParentUpdate:
-        state = parent_req.smc_state
-        if state is None:
-            return SMCParentUpdate(
-                done=parent_req.finished(),
-                best_particle_idx=0,
-                best_output_ids=list(parent_req.output_ids),
-                finish_reason=copy.copy(parent_req.finished_reason),
-                finished_len=parent_req.finished_len,
-            )
-
-        best_particle = state.get_best_particle()
-        return SMCParentUpdate(
-            done=state.is_terminal(),
-            best_particle_idx=state.best_particle_idx,
-            best_output_ids=list(best_particle.output_ids),
-            finish_reason=copy.copy(best_particle.target_req.finished_reason),
-            finished_len=best_particle.target_req.finished_len,
-        )

@@ -329,6 +329,11 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.smc_manager = None
+        if self.spec_algorithm.is_smc():
+            from sglang.srt.speculative.smc_manager import SMCManager
+
+            self.smc_manager = SMCManager(server_args)
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -1295,6 +1300,11 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            process_smc_prefill_immediately = (
+                batch is not None
+                and batch.spec_algorithm.is_smc()
+                and batch.forward_mode.is_extend()
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1304,7 +1314,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                if not process_smc_prefill_immediately:
+                    self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
@@ -1313,9 +1324,15 @@ class Scheduler(
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
-            elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                elif batch is None:
+                    # When the server is idle, do self-check and re-init some states
+                    self.self_check_during_idle()
+
+            if process_smc_prefill_immediately:
+                assert batch is not None and batch_result is not None
+                self.process_batch_result(batch, batch_result)
+                batch_result = None
+                batch = None
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2535,14 +2552,8 @@ class Scheduler(
                 if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
-
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
 
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
@@ -2701,6 +2712,7 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        idle &= not (self.smc_manager and self.smc_manager.has_active_groups())
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -2864,6 +2876,8 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.reset_metrics()
+            if self.smc_manager is not None:
+                self.smc_manager.clear()
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()

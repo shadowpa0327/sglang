@@ -155,3 +155,6 @@ class SpecInput(ABC):
             x * c2 for x in forward_batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+    def use_linear_target_verify(self) -> bool:
+        return False

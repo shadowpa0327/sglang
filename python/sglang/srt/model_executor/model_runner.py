@@ -2125,7 +2125,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if self.is_draft_worker:
                     raise RuntimeError("This should not happen.")
                 elif self.spec_algorithm.is_smc():
-                    from sglang.srt.speculative.smc_info import SMCScoreInput
+                    from sglang.srt.speculative.smc_info import (
+                        SMC_MIN_TEMPERATURE,
+                        SMCScoreInput,
+                    )
 
                     spec_info = SMCScoreInput(
                         draft_token=torch.zeros(
@@ -2137,12 +2140,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         draft_logprobs=torch.zeros(
                             (batch_size,), dtype=torch.float32, device=self.device
                         ),
-                        draft_finished=torch.zeros(
-                            (batch_size,), dtype=torch.bool, device=self.device
-                        ),
+                        verify_out_cache_loc=None,
                         custom_mask=buffers.custom_mask,
                         positions=None,
                         draft_token_num=num_tokens_per_bs,
+                        target_temperature=max(
+                            float(self.server_args.smc_target_temperature),
+                            SMC_MIN_TEMPERATURE,
+                        ),
                         capture_hidden_mode=CaptureHiddenMode.NULL,
                     )
                 else:

@@ -404,44 +404,15 @@ class SMCDraftCudaGraphRunner:
             raw_bs in self.graphs if self.disable_padding else raw_bs <= self.max_bs
         )
 
-    def _ensure_reserved_slots(self, reqs: Sequence[Req]) -> torch.Tensor:
-        out_cache_loc = torch.empty(
-            (len(reqs), self.gamma), dtype=torch.int64, device=self.device
-        )
-        allocator = self.model_runner.token_to_kv_pool_allocator
-        req_to_token = self.model_runner.req_to_token_pool.req_to_token
-        for row, req in enumerate(reqs):
-            required_len = req.kv_committed_len + self.gamma
-            if req.kv_allocated_len < required_len:
-                missing = required_len - req.kv_allocated_len
-                new_slots = allocator.alloc(missing)
-                if new_slots is None:
-                    raise RuntimeError(
-                        "SMC draft replay could not allocate proposal slots: "
-                        f"rid={req.rid}, required_len={required_len}, "
-                        f"allocated_len={req.kv_allocated_len}, missing={missing}"
-                    )
-                self.model_runner.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(req.kv_allocated_len, required_len)),
-                    new_slots.to(torch.int32),
-                )
-                req.kv_allocated_len = required_len
-            out_cache_loc[row].copy_(
-                req_to_token[
-                    req.req_pool_idx, req.kv_committed_len : req.kv_committed_len + self.gamma
-                ].to(dtype=torch.int64, copy=True)
-            )
-        return out_cache_loc
-
     def replay(
         self,
-        reqs: Sequence[Req],
+        req_pool_indices: torch.Tensor,
+        proposal_out_cache_loc: torch.Tensor,
         sampling_info: SamplingBatchInfo,
+        draft_committed_lens: torch.Tensor,
+        last_token_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.supports_replay(reqs, sampling_info):
-            raise RuntimeError("SMC fused draft cuda graph replay is not supported.")
-
-        raw_bs = len(reqs)
+        raw_bs = int(req_pool_indices.shape[0])
         if not self.can_run(raw_bs, sampling_info):
             raise RuntimeError("SMC fused draft cuda graph replay cannot run for this batch.")
 
@@ -454,12 +425,15 @@ class SMCDraftCudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        base_seq_lens = torch.tensor(
-            [req.kv_committed_len for req in reqs], dtype=torch.int32, device=self.device
-        )
+        base_seq_lens = draft_committed_lens.to(dtype=torch.int32, device=self.device)
         base_positions = clamp_position(base_seq_lens.to(torch.int64))
         seq_lens_cpu = base_seq_lens.cpu()
-        out_cache_loc = self._ensure_reserved_slots(reqs).transpose(0, 1).contiguous()
+        out_cache_loc = proposal_out_cache_loc.to(dtype=torch.int64, device=self.device)
+        if out_cache_loc.shape != (self.gamma, raw_bs):
+            raise RuntimeError(
+                "SMC fused draft replay received malformed proposal_out_cache_loc: "
+                f"expected={(self.gamma, raw_bs)}, got={tuple(out_cache_loc.shape)}"
+            )
 
         if bs != raw_bs:
             buffers.input_ids.zero_()
@@ -474,18 +448,9 @@ class SMCDraftCudaGraphRunner:
             buffers.min_ps.zero_()
             buffers.sampling_seed.zero_()
 
-        buffers.input_ids[:raw_bs].copy_(
-            torch.tensor(
-                [
-                    req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
-                    for req in reqs
-                ],
-                dtype=torch.int64,
-                device=self.device,
-            )
-        )
+        buffers.input_ids[:raw_bs].copy_(last_token_ids[:raw_bs].to(dtype=torch.int64))
         buffers.req_pool_indices[:raw_bs].copy_(
-            torch.tensor([req.req_pool_idx for req in reqs], dtype=torch.int64, device=self.device)
+            req_pool_indices[:raw_bs].to(dtype=torch.int64, device=self.device)
         )
         buffers.positions[:raw_bs].copy_(base_positions)
         buffers.out_cache_loc[:, :raw_bs].copy_(out_cache_loc)
@@ -496,10 +461,16 @@ class SMCDraftCudaGraphRunner:
         if self.enable_deterministic and sampling_info.sampling_seed is not None:
             buffers.sampling_seed[:raw_bs].copy_(sampling_info.sampling_seed)
 
-        for step in range(self.gamma):
-            step_seq_lens = base_seq_lens + step
-            buffers.seq_lens_steps[step, :raw_bs].copy_(step_seq_lens)
-            buffers.seq_lens_cpu_steps[step, :raw_bs].copy_(seq_lens_cpu + step)
+        step_offsets = torch.arange(
+            self.gamma, dtype=torch.int32, device=self.device
+        ).unsqueeze(1)
+        buffers.seq_lens_steps[:, :raw_bs].copy_(
+            base_seq_lens.unsqueeze(0) + step_offsets
+        )
+        buffers.seq_lens_cpu_steps[:, :raw_bs].copy_(
+            seq_lens_cpu.unsqueeze(0)
+            + torch.arange(self.gamma, dtype=torch.int32).unsqueeze(1)
+        )
 
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs)
