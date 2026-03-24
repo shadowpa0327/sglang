@@ -297,6 +297,24 @@ class TestSMCDraftInput(TestCase):
                 ),
             )
         )
+        self.assertTrue(
+            torch.equal(
+                draft_input.proposal_seq_lens_steps,
+                torch.tensor([[5, 7], [6, 8], [7, 9]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.proposal_seq_lens_cpu_steps,
+                torch.tensor([[5, 7], [6, 8], [7, 9]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.proposal_seq_lens_sum_steps,
+                torch.tensor([12, 14, 16], dtype=torch.int64),
+            )
+        )
 
 
 class TestSMCRequestState(TestCase):

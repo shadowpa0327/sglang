@@ -39,7 +39,8 @@ class SMCGroupState:
     parent_req: Req
     particle_reqs: Dict[int, Req]
     log_weights: Dict[int, float]
-    stepped_this_round: set[int] = field(default_factory=set)
+    step_counts: Dict[int, int] = field(default_factory=dict)
+    resampled_at_step: int = 0
     finished_particles: Dict[int, SMCFinishedParticleSnapshot] = field(
         default_factory=dict
     )
@@ -51,11 +52,15 @@ class SMCGroupState:
             if idx not in self.finished_particles and not req.finished()
         ]
 
-    def all_active_stepped_this_round(self) -> bool:
+    def all_active_aligned(self) -> bool:
+        """Check that all active particles have taken the same number of steps
+        and have advanced past the last resampling point."""
         active = self.active_particle_indices()
         if not active:
             return True
-        return all(idx in self.stepped_this_round for idx in active)
+        counts = [self.step_counts.get(idx, 0) for idx in active]
+        # All must be at the same step and ahead of last resample point
+        return len(set(counts)) == 1 and counts[0] > self.resampled_at_step
 
 
 class SMCManager:
@@ -123,6 +128,7 @@ class SMCManager:
             parent_req=parent_req,
             particle_reqs={req.smc_particle_idx: req for req in particle_reqs},
             log_weights={req.smc_particle_idx: 0.0 for req in particle_reqs},
+            step_counts={req.smc_particle_idx: 0 for req in particle_reqs},
         )
         self.groups[parent_req.rid] = group
 
@@ -211,15 +217,18 @@ class SMCManager:
 
         particle_idx = req.smc_particle_idx
         group.log_weights[particle_idx] += float(logprob_diff)
-        group.stepped_this_round.add(particle_idx)
+        group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
 
-        if not group.all_active_stepped_this_round():
+        if not group.all_active_aligned():
             return None
 
         self._maybe_resample(group)
-        group.stepped_this_round.clear()
+        # Record the step at which we resampled so we can detect the next round
+        active = group.active_particle_indices()
+        if active:
+            group.resampled_at_step = group.step_counts[active[0]]
 
-        if not group.active_particle_indices():
+        if not active:
             return self._finalize_group(group.group_id)
         return None
 

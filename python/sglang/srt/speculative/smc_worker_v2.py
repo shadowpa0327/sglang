@@ -124,8 +124,22 @@ class SMCWorkerV2(StandaloneWorkerV2):
                         if draft_input is not None
                         else None
                     ),
+                    (
+                        draft_input.proposal_seq_lens_steps
+                        if draft_input is not None
+                        else None
+                    ),
+                    (
+                        draft_input.proposal_seq_lens_cpu_steps
+                        if draft_input is not None
+                        else None
+                    ),
+                    (
+                        draft_input.proposal_seq_lens_sum_steps
+                        if draft_input is not None
+                        else None
+                    ),
                     visible_seq_lens,
-                    draft_committed_lens,
                     last_token_ids,
                     draft_sampling_info,
                 )
@@ -352,8 +366,10 @@ class SMCWorkerV2(StandaloneWorkerV2):
         reqs: Sequence[Req],
         req_pool_indices: torch.Tensor,
         proposal_out_cache_loc: torch.Tensor | None,
+        proposal_seq_lens_steps: torch.Tensor | None,
+        proposal_seq_lens_cpu_steps: torch.Tensor | None,
+        proposal_seq_lens_sum_steps: torch.Tensor | None,
         visible_seq_lens: torch.Tensor,
-        draft_committed_lens: torch.Tensor,
         last_token_ids: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ):
@@ -363,11 +379,22 @@ class SMCWorkerV2(StandaloneWorkerV2):
                 "SMC fused draft replay requires proposal_out_cache_loc prepared "
                 "during SMCDraftInput.prepare_for_decode()."
             )
+        if (
+            proposal_seq_lens_steps is None
+            or proposal_seq_lens_cpu_steps is None
+            or proposal_seq_lens_sum_steps is None
+        ):
+            raise RuntimeError(
+                "SMC fused draft replay requires prepared proposal seq-lens metadata "
+                "from SMCDraftInput.prepare_for_decode()."
+            )
         token_matrix, logprob_matrix = runner.replay(
             req_pool_indices=req_pool_indices,
             proposal_out_cache_loc=proposal_out_cache_loc,
+            proposal_seq_lens_steps=proposal_seq_lens_steps,
+            proposal_seq_lens_cpu_steps=proposal_seq_lens_cpu_steps,
+            proposal_seq_lens_sum_steps=proposal_seq_lens_sum_steps,
             sampling_info=sampling_info,
-            draft_committed_lens=draft_committed_lens.to(dtype=torch.int32),
             last_token_ids=last_token_ids,
         )
         current_output_lens = visible_seq_lens.to(torch.int64) - torch.tensor(

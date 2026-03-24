@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
@@ -1552,12 +1553,17 @@ class FlashInferMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import (
+            generate_draft_decode_kv_indices,
+            generate_smc_draft_decode_kv_indices,
+        )
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
+        self.generate_smc_draft_decode_kv_indices = generate_smc_draft_decode_kv_indices
         self.page_size = model_runner.page_size
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
@@ -1695,6 +1701,52 @@ class FlashInferMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def init_smc_forward_metadata_replay_cuda_graph(
+        self,
+        *,
+        bs: int,
+        raw_bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens_steps: torch.Tensor,
+        seq_lens_cpu_steps: torch.Tensor,
+        seq_lens_sum_steps: torch.Tensor,
+    ) -> None:
+        base_seq_lens = seq_lens_steps[0]
+        self.generate_smc_draft_decode_kv_indices[(self.speculative_num_steps - 1, bs)](
+            req_pool_indices,
+            self.req_to_token,
+            base_seq_lens,
+            self.cuda_graph_kv_indices,
+            self.kv_indptr,
+            raw_bs,
+            self.pool_len,
+            self.cuda_graph_kv_indices.shape[1],
+            self.kv_indptr.shape[1],
+            next_power_of_2(bs),
+            next_power_of_2(self.speculative_num_steps - 1),
+        )
+
+        indptr_cpu_whole = self.kv_indptr[: self.speculative_num_steps - 1, : bs + 1].cpu()
+        global global_override_indptr_cpu
+
+        for i in range(self.speculative_num_steps - 1):
+            spec_info = SimpleNamespace(
+                kv_indptr=self.kv_indptr[i, : bs + 1],
+                kv_indices=self.cuda_graph_kv_indices[i][: int(seq_lens_sum_steps[i].item())],
+            )
+            global_override_indptr_cpu = indptr_cpu_whole[i]
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                req_pool_indices,
+                base_seq_lens,
+                seq_lens_sum=int(seq_lens_sum_steps[i].item()),
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=spec_info,
+                seq_lens_cpu=None,
+            )
+        global_override_indptr_cpu = None
 
 
 def should_use_tensor_core(

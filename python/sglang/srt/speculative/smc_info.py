@@ -595,6 +595,9 @@ class SMCDraftInput(SpecInput):
     verify_done: Optional[torch.cuda.Event] = None
     proposal_out_cache_loc: Optional[torch.Tensor] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+    proposal_seq_lens_steps: Optional[torch.Tensor] = None
+    proposal_seq_lens_cpu_steps: Optional[torch.Tensor] = None
+    proposal_seq_lens_sum_steps: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.SMC_DRAFT)
@@ -656,6 +659,14 @@ class SMCDraftInput(SpecInput):
         draft_committed_lens = draft_committed_lens_cpu.to(
             dtype=torch.int64, device=batch.device
         )
+        proposal_seq_lens_cpu_steps = draft_committed_lens_cpu.unsqueeze(0) + torch.arange(
+            gamma, dtype=torch.int32
+        ).unsqueeze(1)
+        self.proposal_seq_lens_cpu_steps = proposal_seq_lens_cpu_steps.contiguous()
+        self.proposal_seq_lens_steps = self.proposal_seq_lens_cpu_steps.to(
+            dtype=torch.int32, device=batch.device
+        )
+        self._refresh_proposal_seq_lens_sum_steps()
         verify_positions = draft_committed_lens.unsqueeze(1) + torch.arange(
             score_token_num, dtype=torch.int64, device=batch.device
         )
@@ -675,6 +686,13 @@ class SMCDraftInput(SpecInput):
             self.proposal_out_cache_loc = self.proposal_out_cache_loc[:, new_indices]
         if self.verify_out_cache_loc is not None:
             self.verify_out_cache_loc = self.verify_out_cache_loc[:, new_indices]
+        if self.proposal_seq_lens_steps is not None:
+            self.proposal_seq_lens_steps = self.proposal_seq_lens_steps[:, new_indices]
+        if self.proposal_seq_lens_cpu_steps is not None:
+            self.proposal_seq_lens_cpu_steps = self.proposal_seq_lens_cpu_steps[
+                :, new_indices
+            ]
+            self._refresh_proposal_seq_lens_sum_steps()
 
     def merge_batch(self, spec_info: "SMCDraftInput"):
         if self.future_indices is not None:
@@ -700,6 +718,26 @@ class SMCDraftInput(SpecInput):
                     [self.verify_out_cache_loc, spec_info.verify_out_cache_loc],
                     dim=1,
                 )
+            if (
+                self.proposal_seq_lens_steps is not None
+                and spec_info.proposal_seq_lens_steps is not None
+            ):
+                self.proposal_seq_lens_steps = torch.cat(
+                    [self.proposal_seq_lens_steps, spec_info.proposal_seq_lens_steps],
+                    dim=1,
+                )
+            if (
+                self.proposal_seq_lens_cpu_steps is not None
+                and spec_info.proposal_seq_lens_cpu_steps is not None
+            ):
+                self.proposal_seq_lens_cpu_steps = torch.cat(
+                    [
+                        self.proposal_seq_lens_cpu_steps,
+                        spec_info.proposal_seq_lens_cpu_steps,
+                    ],
+                    dim=1,
+                )
+                self._refresh_proposal_seq_lens_sum_steps()
             return
         self.last_token_ids = torch.cat([self.last_token_ids, spec_info.last_token_ids])
         self.new_seq_lens = torch.cat([self.new_seq_lens, spec_info.new_seq_lens])
@@ -717,6 +755,33 @@ class SMCDraftInput(SpecInput):
             self.verify_out_cache_loc = torch.cat(
                 [self.verify_out_cache_loc, spec_info.verify_out_cache_loc], dim=1
             )
+        if (
+            self.proposal_seq_lens_steps is not None
+            and spec_info.proposal_seq_lens_steps is not None
+        ):
+            self.proposal_seq_lens_steps = torch.cat(
+                [self.proposal_seq_lens_steps, spec_info.proposal_seq_lens_steps], dim=1
+            )
+        if (
+            self.proposal_seq_lens_cpu_steps is not None
+            and spec_info.proposal_seq_lens_cpu_steps is not None
+        ):
+            self.proposal_seq_lens_cpu_steps = torch.cat(
+                [
+                    self.proposal_seq_lens_cpu_steps,
+                    spec_info.proposal_seq_lens_cpu_steps,
+                ],
+                dim=1,
+            )
+            self._refresh_proposal_seq_lens_sum_steps()
+
+    def _refresh_proposal_seq_lens_sum_steps(self):
+        if self.proposal_seq_lens_cpu_steps is None:
+            self.proposal_seq_lens_sum_steps = None
+            return
+        self.proposal_seq_lens_sum_steps = self.proposal_seq_lens_cpu_steps.sum(
+            dim=1, dtype=torch.int64
+        ).cpu()
 
 
 @dataclass

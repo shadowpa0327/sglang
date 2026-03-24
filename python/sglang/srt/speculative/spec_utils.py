@@ -328,6 +328,67 @@ def generate_draft_decode_kv_indices(
 
 
 @triton.jit
+def generate_smc_draft_decode_kv_indices(
+    req_pool_indices,
+    req_to_token,
+    base_seq_lens,
+    kv_indices,
+    kv_indptr,
+    num_live_seqs,
+    pool_len: tl.constexpr,
+    kv_indices_stride: tl.constexpr,
+    kv_indptr_stride: tl.constexpr,
+    bs_upper: tl.constexpr,
+    num_steps_upper: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 128
+    step = tl.program_id(axis=0)
+    bid = tl.program_id(axis=1)
+    num_seqs = tl.num_programs(axis=1)
+
+    kv_indices += kv_indices_stride * step
+    kv_indptr += kv_indptr_stride * step
+
+    load_offset = tl.arange(0, bs_upper)
+    prev_seq_lens = tl.load(base_seq_lens + load_offset, mask=load_offset < bid, other=0)
+    prev_extra = tl.where(load_offset < num_live_seqs, step, 0)
+    seq_len = tl.load(base_seq_lens + bid)
+    extend_len = tl.where(bid < num_live_seqs, step, 0)
+    cum_seq_len = tl.sum(prev_seq_lens + tl.where(load_offset < bid, prev_extra, 0))
+
+    kv_ptr = kv_indices + cum_seq_len
+    token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
+
+    kv_offset = tl.arange(0, BLOCK_SIZE)
+    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+    for _ in range(num_loop):
+        mask = kv_offset < seq_len
+        data = tl.load(token_pool_ptr + kv_offset, mask=mask)
+        tl.store(kv_ptr + kv_offset, data, mask=mask)
+        kv_offset += BLOCK_SIZE
+
+    extend_offset = tl.arange(0, num_steps_upper)
+    extend_data = tl.load(
+        token_pool_ptr + seq_len + extend_offset,
+        mask=extend_offset < extend_len,
+        other=0,
+    )
+    tl.store(
+        kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < extend_len
+    )
+
+    if bid == 0:
+        total_lens = tl.load(
+            base_seq_lens + load_offset, mask=load_offset < num_seqs, other=0
+        )
+        total_extra = tl.where(load_offset < num_live_seqs, step, 0)
+        tl.store(kv_indptr, 0)
+        tl.store(kv_indptr + num_seqs, tl.sum(total_lens + total_extra))
+    else:
+        tl.store(kv_indptr + bid, cum_seq_len)
+
+
+@triton.jit
 def align_evict_mask_to_page_size(
     seq_lens,
     evict_mask,
