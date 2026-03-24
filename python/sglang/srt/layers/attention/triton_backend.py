@@ -13,7 +13,10 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+from sglang.srt.speculative.spec_utils import (
+    generate_draft_decode_kv_indices,
+    generate_smc_draft_decode_kv_indices,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
@@ -1296,8 +1299,12 @@ class TritonMultiStepDraftBackend:
         )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.pool_len = self.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
+        self.generate_smc_draft_decode_kv_indices = (
+            generate_smc_draft_decode_kv_indices
+        )
 
     def common_template(
         self,
@@ -1411,6 +1418,40 @@ class TritonMultiStepDraftBackend:
         self.attn_backends[-1].get_num_kv_splits(
             self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
             forward_batch.seq_lens[:bs],
+        )
+
+    def init_smc_forward_metadata_replay_cuda_graph(
+        self,
+        *,
+        bs: int,
+        raw_bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens_steps: torch.Tensor,
+        seq_lens_cpu_steps: torch.Tensor,
+        seq_lens_sum_steps: torch.Tensor,
+    ) -> None:
+        base_seq_lens = seq_lens_steps[0]
+        # 1 Triton kernel: fill kv_indices + kv_indptr for all steps
+        self.generate_smc_draft_decode_kv_indices[
+            (self.speculative_num_steps - 1, bs)
+        ](
+            req_pool_indices,
+            self.req_to_token,
+            base_seq_lens,
+            self.cuda_graph_kv_indices,
+            self.kv_indptr,
+            raw_bs,
+            self.pool_len,
+            self.cuda_graph_kv_indices.shape[1],
+            self.kv_indptr.shape[1],
+            next_power_of_2(bs),
+            next_power_of_2(self.speculative_num_steps - 1),
+        )
+        # Compute num_kv_splits once with last (largest) step's seq_lens
+        num_token = bs  # topk=1 for SMC
+        self.attn_backends[-1].get_num_kv_splits(
+            self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
+            seq_lens_steps[-1, :bs],
         )
 
 
