@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import logging
 from typing import List, Sequence, Union
 
@@ -167,7 +168,9 @@ class SMCWorkerV2(StandaloneWorkerV2):
             smc_logprob_diffs,
             score_can_run_cuda_graph,
         ) = self._run_score_batch(
-            reqs=reqs,
+            base_model_worker_batch=(
+                batch if is_overlap_batch else batch.get_model_worker_batch()
+            ),
             draft_committed_lens=draft_committed_lens,
             anchor_token_ids=last_token_ids,
             draft_tokens=draft_tokens,
@@ -510,7 +513,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
 
     def _run_score_batch(
         self,
-        reqs: Sequence[Req],
+        base_model_worker_batch: ModelWorkerBatch,
         draft_committed_lens: torch.Tensor,
         anchor_token_ids: torch.Tensor,
         draft_tokens: torch.Tensor,
@@ -519,7 +522,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
         verify_out_cache_loc: torch.Tensor | None,
     ):
         model_worker_batch = self._make_score_model_worker_batch(
-            reqs=reqs,
+            base_model_worker_batch=base_model_worker_batch,
             draft_committed_lens=draft_committed_lens,
             anchor_token_ids=anchor_token_ids,
             draft_tokens=draft_tokens,
@@ -575,7 +578,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
 
     def _make_score_model_worker_batch(
         self,
-        reqs: Sequence[Req],
+        base_model_worker_batch: ModelWorkerBatch,
         draft_committed_lens: torch.Tensor,
         anchor_token_ids: torch.Tensor,
         draft_tokens: torch.Tensor,
@@ -588,15 +591,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
                 "SMC target scoring requires verify_out_cache_loc prepared "
                 "during SMCDraftInput.prepare_for_decode()."
             )
-        batch = ScheduleBatch.init_new(
-            reqs=list(reqs),
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=self._internal_tree_cache,
-            model_config=self.target_worker.model_config,
-            enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.SMC,
-        )
         score_token_num = self.server_args.speculative_num_draft_tokens
         score_tokens = torch.cat(
             [
@@ -610,42 +604,37 @@ class SMCWorkerV2(StandaloneWorkerV2):
             pad = score_tokens[:, -1:].expand(-1, score_token_num - score_tokens.shape[1])
             score_tokens = torch.cat([score_tokens, pad], dim=1)
 
-        batch.forward_mode = ForwardMode.DECODE
-        batch.req_pool_indices = torch.tensor(
-            [req.req_pool_idx for req in reqs], dtype=torch.int64, device=self.device
-        )
-        batch.seq_lens = draft_committed_lens.to(dtype=torch.int64)
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        batch.orig_seq_lens = torch.tensor(
-            [len(req.origin_input_ids) for req in reqs],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        batch.top_logprobs_nums = [0] * len(reqs)
-        batch.token_ids_logprobs = [None] * len(reqs)
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            batch,
-            self.target_worker.model_config.vocab_size,
-        )
+        seq_lens = draft_committed_lens.to(dtype=torch.int64)
+        seq_lens_cpu = seq_lens.cpu()
         custom_mask = None
         if self.server_args.attention_backend != "flashinfer":
             from sglang.srt.speculative.smc_info import build_smc_causal_mask
 
-            custom_mask = build_smc_causal_mask(batch.seq_lens, score_token_num)
-        batch.spec_info = SMCScoreInput(
+            custom_mask = build_smc_causal_mask(seq_lens, score_token_num)
+        score_input = SMCScoreInput(
             draft_token=score_tokens.reshape(-1).contiguous(),
             draft_lengths=draft_lengths.to(dtype=torch.int32),
             draft_logprobs=draft_logprobs.to(dtype=torch.float32),
             verify_out_cache_loc=verify_out_cache_loc.to(dtype=torch.int64),
-            positions=build_smc_positions(batch.seq_lens, score_token_num),
+            positions=build_smc_positions(seq_lens, score_token_num),
             custom_mask=custom_mask,
             draft_token_num=score_token_num,
             target_temperature=max(
                 float(self.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
             ),
         )
-        return batch.get_model_worker_batch()
+        return dataclasses.replace(
+            base_model_worker_batch,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=None,
+            seq_lens=seq_lens,
+            out_cache_loc=None,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            spec_algorithm=SpeculativeAlgorithm.SMC,
+            spec_info=score_input,
+            capture_hidden_mode=score_input.capture_hidden_mode,
+        )
 
     def _make_decode_batch(self, reqs: List[Req], model_config) -> ScheduleBatch:
         batch = ScheduleBatch.init_new(
