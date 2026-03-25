@@ -1854,6 +1854,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_smc()
             or self.spec_algorithm.is_ngram()
         ):
             return not self.is_draft_worker
@@ -1888,6 +1889,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_smc()
             or self.spec_algorithm.is_ngram()
         ):
             if self.is_draft_worker:
@@ -2002,7 +2004,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone() or self.spec_algorithm.is_smc():
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:

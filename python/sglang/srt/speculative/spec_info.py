@@ -18,6 +18,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    SMC = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -43,11 +44,14 @@ class SpeculativeAlgorithm(Enum):
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_smc(self) -> bool:
+        return self == SpeculativeAlgorithm.SMC
+
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_smc()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -92,6 +96,16 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_smc():
+            if enable_overlap:
+                from sglang.srt.speculative.smc_worker_v2 import SmcWorkerV2
+
+                return SmcWorkerV2
+
+            raise ValueError(
+                "SMC speculative decoding requires the V2 overlap scheduler. "
+                "Set env SGLANG_ENABLE_SPEC_V2=True to enable it."
+            )
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(

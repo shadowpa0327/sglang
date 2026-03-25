@@ -1253,8 +1253,8 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
-                    # standalonedraft model and cuda graphs
+                if self.speculative_algorithm in ("STANDALONE", "SMC"):
+                    # standalone/smc draft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
@@ -2751,8 +2751,8 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
-            if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "SMC"):
+            if self.speculative_algorithm in ("STANDALONE", "SMC") and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
                     "Currently standalone speculative decoding does not support dp attention."
@@ -2765,7 +2765,7 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
+                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE", "SMC"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
@@ -6290,8 +6290,8 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_model_config().hf_config
     arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
-        # The default value for standalone speculative decoding
+    if self.speculative_algorithm in ("STANDALONE", "SMC"):
+        # The default value for standalone/SMC speculative decoding
         return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
