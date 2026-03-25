@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Deque, Dict, List, Optional, Set
 
 import torch
 
@@ -33,6 +34,8 @@ class SMCScheduler:
         self.device = device
         self.device_module = None
         self.resample_stream = None
+        self.wait_for_running: Deque[str] = deque()
+        self._wait_for_running_members: Set[str] = set()
         self.resampling_reqs: Dict[str, List[Req]] = {}
         self.pending_resamples: Dict[str, PendingResample] = {}
         self._groups_needing_resample: Set[str] = set()
@@ -45,9 +48,17 @@ class SMCScheduler:
         self.resample_stream = self.device_module.Stream(priority=0)
 
     def clear(self) -> None:
+        self.wait_for_running.clear()
+        self._wait_for_running_members.clear()
         self.resampling_reqs.clear()
         self.pending_resamples.clear()
         self._groups_needing_resample.clear()
+
+    def enqueue_group_for_running(self, group_id: Optional[str]) -> None:
+        if group_id is None or group_id in self._wait_for_running_members:
+            return
+        self.wait_for_running.append(group_id)
+        self._wait_for_running_members.add(group_id)
 
     def get_stalled_req_count(self) -> int:
         return sum(len(reqs) for reqs in self.resampling_reqs.values())
@@ -67,6 +78,7 @@ class SMCScheduler:
     def step(self, scheduler) -> None:
         self._sync_completed_resamples(scheduler)
         self._launch_pending_resamples(scheduler)
+        self._drain_wait_for_running(scheduler)
 
     def on_batch_done(
         self,
@@ -300,20 +312,100 @@ class SMCScheduler:
         ):
             self._restore_req_state(dst_req, snapshot)
 
-        stalled_reqs = self.resampling_reqs.pop(group_id)
-        resumed_batch = self.smc_manager._build_particle_batch(
-            stalled_reqs,
-            scheduler,
-            use_future_map=self._running_batch_uses_future_indices(
-                scheduler.running_batch
-            ),
-        )
-        if scheduler.running_batch.is_empty():
-            scheduler.running_batch = resumed_batch
-        else:
-            scheduler.running_batch.merge_batch(resumed_batch)
-
+        self.resampling_reqs.pop(group_id)
+        self.enqueue_group_for_running(group_id)
         del self.pending_resamples[group_id]
+
+    def _drain_wait_for_running(self, scheduler) -> None:
+        while self.wait_for_running:
+            group_id = self.wait_for_running[0]
+            group = self.smc_manager.get_group(group_id)
+            if group is None:
+                self._pop_wait_for_running_head()
+                continue
+
+            active_reqs = self.smc_manager.get_active_particle_reqs(group_id)
+            if not active_reqs:
+                self._pop_wait_for_running_head()
+                continue
+
+            group_size = len(active_reqs)
+            if self._remaining_req_capacity(scheduler) < group_size:
+                break
+
+            running_smc_req_count = self._running_smc_req_count(scheduler)
+            if self.should_delay_admission(
+                running_req_count=running_smc_req_count,
+                group_size=group_size,
+            ):
+                break
+
+            resumed_batch = self.smc_manager._build_particle_batch(
+                active_reqs,
+                scheduler,
+                use_future_map=self._running_batch_uses_future_indices(
+                    scheduler.running_batch
+                ),
+            )
+            self._pop_wait_for_running_head()
+
+            if scheduler.running_batch.is_empty():
+                scheduler.running_batch = resumed_batch
+            else:
+                scheduler.running_batch.merge_batch(resumed_batch)
+
+    def _pop_wait_for_running_head(self) -> Optional[str]:
+        if not self.wait_for_running:
+            return None
+        group_id = self.wait_for_running.popleft()
+        self._wait_for_running_members.discard(group_id)
+        return group_id
+
+    def _remaining_req_capacity(self, scheduler) -> int:
+        max_req_count = getattr(
+            getattr(scheduler, "server_args", None),
+            "pp_max_micro_batch_size",
+            None,
+        )
+        if max_req_count is None:
+            max_req_count = getattr(scheduler, "max_running_requests", None)
+        if max_req_count is None:
+            return 1 << 30
+
+        pending_prefill_reqs = 0
+        last_batch = getattr(scheduler, "last_batch", None)
+        if self._has_pending_last_batch(scheduler) and last_batch is not None and last_batch.forward_mode.is_extend():
+            if hasattr(last_batch, "batch_size"):
+                pending_prefill_reqs = last_batch.batch_size()
+            else:
+                pending_prefill_reqs = len(last_batch.reqs)
+
+        return max(
+            max_req_count - len(scheduler.running_batch.reqs) - pending_prefill_reqs,
+            0,
+        )
+
+    def _running_smc_req_count(self, scheduler) -> int:
+        running_smc_req_count = scheduler.running_batch.count_smc_particle_reqs()
+        last_batch = getattr(scheduler, "last_batch", None)
+        if (
+            self._has_pending_last_batch(scheduler)
+            and last_batch is not None
+            and last_batch.forward_mode.is_extend()
+            and getattr(last_batch, "spec_algorithm", None) is not None
+            and last_batch.spec_algorithm.is_smc()
+        ):
+            if hasattr(last_batch, "count_smc_particle_reqs"):
+                running_smc_req_count += last_batch.count_smc_particle_reqs()
+            else:
+                running_smc_req_count += sum(
+                    1 for req in last_batch.reqs if req.smc_group_id is not None
+                )
+        return running_smc_req_count
+
+    def _has_pending_last_batch(self, scheduler) -> bool:
+        result_queue = getattr(scheduler, "result_queue", None)
+        return result_queue is not None and len(result_queue) > 0
 
     def _sample_ancestors(self, group, active_indices: List[int]) -> List[int]:
         normalized_weights = normalize_log_weights(

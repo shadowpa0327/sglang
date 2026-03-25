@@ -119,6 +119,9 @@ class _FakeRunningBatch:
     def is_empty(self):
         return len(self.reqs) == 0
 
+    def batch_size(self):
+        return len(self.reqs)
+
     def filter_batch(self, keep_indices=None, **kwargs):
         keep_indices = keep_indices or []
         self.reqs = [self.reqs[i] for i in keep_indices]
@@ -326,7 +329,7 @@ class TestSMCScheduler(TestCase):
         self.assertTrue(scheduler.should_delay_admission(running_req_count=4, group_size=4))
         self.assertTrue(scheduler.should_delay_admission(running_req_count=8, group_size=4))
 
-    def test_complete_resample_waits_for_done_event_before_allocator_and_merge(self):
+    def test_complete_resample_waits_for_done_event_and_enqueues_group_for_running(self):
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
@@ -360,15 +363,13 @@ class TestSMCScheduler(TestCase):
             inc_ref=lambda indices: order.append(("inc", indices.clone())),
             dec_ref_and_free=lambda indices: order.append(("dec", indices.clone())),
         )
+        other_req = SimpleNamespace(rid="other")
         live_scheduler = SimpleNamespace(
             schedule_stream=SimpleNamespace(
                 wait_event=lambda event: order.append(("wait", event))
             ),
-            running_batch=_FakeRunningBatch([SimpleNamespace(rid="other")]),
+            running_batch=_FakeRunningBatch([other_req]),
             token_to_kv_pool_allocator=allocator,
-        )
-        manager._build_particle_batch = MagicMock(
-            return_value=SimpleNamespace(reqs=[req0, req1], is_empty=lambda: False)
         )
         scheduler.resampling_reqs["g1"] = [req0, req1]
 
@@ -399,12 +400,215 @@ class TestSMCScheduler(TestCase):
 
         self.assertEqual(order[0], ("wait", done_event))
         self.assertEqual([op for op, _ in order[1:3]], ["inc", "dec"])
-        self.assertEqual(live_scheduler.running_batch.reqs[1:], [req0, req1])
+        self.assertEqual(live_scheduler.running_batch.reqs, [other_req])
+        self.assertEqual(list(scheduler.wait_for_running), ["g1"])
+        self.assertEqual(scheduler._wait_for_running_members, {"g1"})
+        self.assertNotIn("g1", scheduler.resampling_reqs)
+
+    def test_drain_wait_for_running_drops_stale_head_and_admits_next_group(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+
+        req0 = _make_scheduler_req(
+            group_id="g2",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g2",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        manager.groups["g2"] = SMCGroupState(
+            group_id="g2",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        scheduler.enqueue_group_for_running("stale")
+        scheduler.enqueue_group_for_running("g2")
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch([]),
+            server_args=SimpleNamespace(pp_max_micro_batch_size=8),
+        )
+        rebuilt_batch = SimpleNamespace(reqs=[req0, req1], is_empty=lambda: False)
+        manager._build_particle_batch = MagicMock(return_value=rebuilt_batch)
+
+        scheduler._drain_wait_for_running(live_scheduler)
+
+        self.assertIs(live_scheduler.running_batch, rebuilt_batch)
+        self.assertFalse(scheduler.wait_for_running)
+        self.assertFalse(scheduler._wait_for_running_members)
         manager._build_particle_batch.assert_called_once_with(
             [req0, req1],
             live_scheduler,
             use_future_map=False,
         )
+
+    def test_drain_wait_for_running_respects_fifo_when_balance_blocks_head(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+
+        blocked_req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        blocked_req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        trailing_req0 = _make_scheduler_req(
+            group_id="g2",
+            particle_idx=0,
+            req_pool_idx=2,
+            output_ids=[30],
+            kv_indices=[301],
+        )
+        trailing_req1 = _make_scheduler_req(
+            group_id="g2",
+            particle_idx=1,
+            req_pool_idx=3,
+            output_ids=[40],
+            kv_indices=[401],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: blocked_req0, 1: blocked_req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+        manager.groups["g2"] = SMCGroupState(
+            group_id="g2",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: trailing_req0, 1: trailing_req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        scheduler.resampling_reqs["stalled"] = [SimpleNamespace(), SimpleNamespace()]
+        scheduler.enqueue_group_for_running("g1")
+        scheduler.enqueue_group_for_running("g2")
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch(
+                [
+                    _make_scheduler_req(
+                        group_id="running",
+                        particle_idx=0,
+                        req_pool_idx=4,
+                        output_ids=[50],
+                        kv_indices=[501],
+                    ),
+                    _make_scheduler_req(
+                        group_id="running",
+                        particle_idx=1,
+                        req_pool_idx=5,
+                        output_ids=[60],
+                        kv_indices=[601],
+                    ),
+                ]
+            ),
+            server_args=SimpleNamespace(pp_max_micro_batch_size=8),
+        )
+        manager._build_particle_batch = MagicMock()
+
+        scheduler._drain_wait_for_running(live_scheduler)
+
+        self.assertEqual([req.smc_group_id for req in live_scheduler.running_batch.reqs], ["running", "running"])
+        self.assertEqual(list(scheduler.wait_for_running), ["g1", "g2"])
+        manager._build_particle_batch.assert_not_called()
+
+    def test_running_smc_req_count_ignores_processed_last_batch_without_overlap_queue(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch(
+                [
+                    _make_scheduler_req(
+                        group_id="running",
+                        particle_idx=0,
+                        req_pool_idx=0,
+                        output_ids=[10],
+                        kv_indices=[101],
+                    )
+                ]
+            ),
+            last_batch=SimpleNamespace(
+                reqs=[
+                    _make_scheduler_req(
+                        group_id="last",
+                        particle_idx=0,
+                        req_pool_idx=1,
+                        output_ids=[20],
+                        kv_indices=[201],
+                    )
+                ],
+                forward_mode=SimpleNamespace(is_extend=lambda: True),
+                spec_algorithm=SimpleNamespace(is_smc=lambda: True),
+                count_smc_particle_reqs=lambda: 1,
+            ),
+            result_queue=[],
+        )
+
+        self.assertEqual(scheduler._running_smc_req_count(live_scheduler), 1)
+        self.assertEqual(scheduler._remaining_req_capacity(live_scheduler), 1 << 30)
+
+    def test_running_smc_req_count_includes_pending_overlap_last_batch(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch(
+                [
+                    _make_scheduler_req(
+                        group_id="running",
+                        particle_idx=0,
+                        req_pool_idx=0,
+                        output_ids=[10],
+                        kv_indices=[101],
+                    )
+                ]
+            ),
+            last_batch=SimpleNamespace(
+                reqs=[
+                    _make_scheduler_req(
+                        group_id="last",
+                        particle_idx=0,
+                        req_pool_idx=1,
+                        output_ids=[20],
+                        kv_indices=[201],
+                    )
+                ],
+                forward_mode=SimpleNamespace(is_extend=lambda: True),
+                spec_algorithm=SimpleNamespace(is_smc=lambda: True),
+                count_smc_particle_reqs=lambda: 1,
+                batch_size=lambda: 1,
+            ),
+            result_queue=[object()],
+            server_args=SimpleNamespace(pp_max_micro_batch_size=3),
+        )
+
+        self.assertEqual(scheduler._running_smc_req_count(live_scheduler), 2)
+        self.assertEqual(scheduler._remaining_req_capacity(live_scheduler), 1)
 
     def test_on_batch_done_uses_atomic_group_fast_path_for_contiguous_groups(self):
         manager = SMCManager(
@@ -1496,6 +1700,79 @@ class TestSMCDraftCudaGraphSamplingSupport(TestCase):
         self.assertTrue(
             self._check(self._make_sampling_info(penalizer_orchestrator=None))
         )
+
+
+class TestSMCPrefillOutputProcessor(TestCase):
+    @patch("sglang.srt.managers.scheduler_output_processor_mixin._release_smc_parent_req")
+    def test_process_batch_result_prefill_enqueues_new_smc_group_for_running(
+        self,
+        mock_release_parent,
+    ):
+        req = SimpleNamespace(
+            rid="parent-1",
+            output_ids=[],
+            finished=lambda: False,
+            is_retracted=False,
+            is_chunked=0,
+            smc_state=None,
+            smc_particle_idx=None,
+            return_logprob=False,
+            return_hidden_states=False,
+            multimodal_inputs=None,
+            grammar=None,
+            finished_reason=None,
+            finished_len=None,
+            time_stats=SimpleNamespace(
+                set_prefill_finished_time=lambda: None,
+                set_completion_time=lambda: None,
+                set_last_chunked_prefill_finish_time=lambda: None,
+            ),
+            check_finished=lambda: None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SimpleNamespace(is_smc=lambda: True),
+            return_logprob=False,
+            decoding_reqs=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+            filter_batch=MagicMock(),
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([41], dtype=torch.int32),
+            can_run_cuda_graph=False,
+        )
+
+        processor = _FakeOutputProcessor()
+        processor.is_generation = True
+        processor.enable_metrics = False
+        processor.smc_manager = SimpleNamespace(create_group=MagicMock(return_value=None))
+        processor.smc_scheduler = SimpleNamespace(
+            enqueue_group_for_running=MagicMock()
+        )
+        processor.req_to_token_pool = MagicMock()
+        processor.token_to_kv_pool_allocator = MagicMock()
+        processor.tree_cache = MagicMock()
+        processor.maybe_collect_routed_experts = MagicMock()
+        processor.maybe_collect_customized_info = MagicMock()
+        processor.stream_output = MagicMock()
+        processor.report_prefill_stats = MagicMock()
+
+        processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(req.output_ids, [41])
+        processor.smc_manager.create_group.assert_called_once_with(req, processor)
+        mock_release_parent.assert_called_once_with(
+            req,
+            tree_cache=processor.tree_cache,
+            req_to_token_pool=processor.req_to_token_pool,
+            token_to_kv_pool_allocator=processor.token_to_kv_pool_allocator,
+        )
+        processor.smc_scheduler.enqueue_group_for_running.assert_called_once_with(
+            "parent-1"
+        )
+        batch.filter_batch.assert_called_once_with(keep_indices=[])
 
 
 class TestSMCDecodeOutputProcessor(TestCase):

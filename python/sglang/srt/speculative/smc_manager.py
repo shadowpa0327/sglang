@@ -59,14 +59,6 @@ class SMCGroupState:
         # All must be at the same step and ahead of last resample point
         return len(set(counts)) == 1 and counts[0] > self.resampled_at_step
 
-
-def _running_batch_uses_future_indices(running_batch) -> bool:
-    if running_batch is None or running_batch.is_empty():
-        return False
-    spec_info = getattr(running_batch, "spec_info", None)
-    return getattr(spec_info, "future_indices", None) is not None
-
-
 class SMCManager:
     def __init__(self, server_args):
         self.server_args = server_args
@@ -207,16 +199,6 @@ class SMCManager:
             step_counts={req.smc_particle_idx: 0 for req in particle_reqs},
         )
         self.groups[parent_req.rid] = group
-
-        particle_batch = self._build_particle_batch(
-            particle_reqs,
-            scheduler,
-            use_future_map=_running_batch_uses_future_indices(scheduler.running_batch),
-        )
-        if scheduler.running_batch.is_empty():
-            scheduler.running_batch = particle_batch
-        else:
-            scheduler.running_batch.merge_batch(particle_batch)
         return None
 
     def _build_particle_batch(

@@ -38,6 +38,18 @@ def parse_args():
     return parser.parse_args()
 
 
+def _drop_none(value):
+    if isinstance(value, dict):
+        return {
+            key: cleaned
+            for key, item in value.items()
+            if (cleaned := _drop_none(item)) is not None
+        }
+    if isinstance(value, list):
+        return [cleaned for item in value if (cleaned := _drop_none(item)) is not None]
+    return value
+
+
 def main():
     args = parse_args()
     start = time.time()
@@ -57,33 +69,35 @@ def main():
         engine_kwargs["attention_backend"] = args.attention_backend
 
     with sgl.Engine(**engine_kwargs) as engine:
-        server_info = engine.get_server_info()
-        print(
-            "SERVER_INFO",
-            json.dumps(
-                {
-                    "speculative_algorithm": server_info.get("speculative_algorithm"),
-                    "disable_overlap_schedule": server_info.get(
-                        "disable_overlap_schedule"
-                    ),
-                    "smc_n_particles": server_info.get("smc_n_particles"),
-                    "smc_gamma": server_info.get("smc_gamma"),
-                    "attention_backend": server_info.get("attention_backend"),
-                    "avg_spec_accept_length": server_info.get("internal_states", [{}])[
-                        0
-                    ].get("avg_spec_accept_length"),
-                },
-                indent=2,
-            ),
-        )
-
         outputs = engine.generate(PROMPTS, SAMPLING_PARAMS)
+        server_info = engine.get_server_info()
+        compact_server_info = _drop_none(
+            {
+                "speculative_algorithm": server_info.get("speculative_algorithm"),
+                "disable_overlap_schedule": server_info.get(
+                    "disable_overlap_schedule"
+                ),
+                "smc_n_particles": server_info.get("smc_n_particles"),
+                "smc_gamma": server_info.get("smc_gamma"),
+                "attention_backend": server_info.get("attention_backend"),
+                "avg_spec_accept_length": server_info.get("internal_states", [{}])[0].get(
+                    "avg_spec_accept_length"
+                ),
+            }
+        )
+        print("SERVER_INFO", json.dumps(compact_server_info, indent=2))
+
         for i, (prompt, output) in enumerate(zip(PROMPTS, outputs, strict=True), start=1):
             print(f"PROMPT_{i}: {prompt}")
             print(f"OUTPUT_{i}: {output['text']}")
             print(
                 "META_{}: {}".format(
-                    i, json.dumps(output.get("meta_info"), indent=2, default=str)
+                    i,
+                    json.dumps(
+                        _drop_none(output.get("meta_info", {})),
+                        indent=2,
+                        default=str,
+                    ),
                 )
             )
             print("-" * 80)

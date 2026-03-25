@@ -275,12 +275,14 @@ class SchedulerOutputProcessorMixin:
                             release_kv_cache(req, self.tree_cache)
                             req.time_stats.set_completion_time()
                         else:
+                            assert self.smc_scheduler is not None
                             _release_smc_parent_req(
                                 req,
                                 tree_cache=self.tree_cache,
                                 req_to_token_pool=self.req_to_token_pool,
                                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                             )
+                            self.smc_scheduler.enqueue_group_for_running(req.rid)
                             smc_req_indices_to_remove.add(i)
                     elif is_smc and req.smc_particle_idx is not None:
                         if not batch.decoding_reqs or req not in batch.decoding_reqs:

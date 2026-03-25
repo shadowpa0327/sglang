@@ -301,7 +301,8 @@ class SchedulerRuntimeCheckerMixin:
             if smc_scheduler is not None:
                 msg += (
                     f"SMC_BUCKETS: stalled={list(smc_scheduler.resampling_reqs.keys())}, "
-                    f"pending={list(smc_scheduler.pending_resamples.keys())}\n"
+                    f"pending={list(smc_scheduler.pending_resamples.keys())}, "
+                    f"wait_for_running={list(smc_scheduler.wait_for_running)}\n"
                 )
             tracked_req_msgs = []
             tracked_rows = set()
