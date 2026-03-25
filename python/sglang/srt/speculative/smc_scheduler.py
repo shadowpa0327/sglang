@@ -15,6 +15,8 @@ from sglang.srt.speculative.smc_info import (
     set_smc_reserved_kv_len,
     systematic_resample,
 )
+
+
 @dataclass
 class PendingResample:
     group_id: str
@@ -62,6 +64,63 @@ class SMCScheduler:
         if not torch.is_tensor(logprob_diffs):
             logprob_diffs = torch.as_tensor(logprob_diffs, dtype=torch.float32)
 
+        atomic_group_spans = self._collect_atomic_group_spans(reqs)
+        if atomic_group_spans is not None:
+            return self._on_batch_done_atomic_groups(
+                reqs,
+                logprob_diffs,
+                atomic_group_spans,
+            )
+        return self._on_batch_done_grouped(reqs, logprob_diffs)
+
+    def _collect_atomic_group_spans(
+        self,
+        reqs: List[Req],
+    ) -> Optional[List[tuple[object, int, int]]]:
+        spans: List[tuple[object, int, int]] = []
+        seen_group_ids: Set[str] = set()
+        start = 0
+        while start < len(reqs):
+            group_id = reqs[start].smc_group_id
+            if group_id is None or group_id in seen_group_ids:
+                return None
+
+            end = start + 1
+            while end < len(reqs) and reqs[end].smc_group_id == group_id:
+                end += 1
+
+            group = self.smc_manager.get_group(group_id)
+            if group is None or len(group.active_particle_indices()) != end - start:
+                return None
+
+            spans.append((group, start, end))
+            seen_group_ids.add(group_id)
+            start = end
+
+        return spans
+
+    def _on_batch_done_atomic_groups(
+        self,
+        reqs: List[Req],
+        logprob_diffs: torch.Tensor,
+        atomic_group_spans: List[tuple[object, int, int]],
+    ) -> List[Req]:
+        finalized_reqs: List[Req] = []
+        for group, start, end in atomic_group_spans:
+            finalized_req = self._apply_group_step(
+                group,
+                reqs[start:end],
+                logprob_diffs[start:end],
+            )
+            if finalized_req is not None:
+                finalized_reqs.append(finalized_req)
+        return finalized_reqs
+
+    def _on_batch_done_grouped(
+        self,
+        reqs: List[Req],
+        logprob_diffs: torch.Tensor,
+    ) -> List[Req]:
         grouped_reqs: Dict[str, List[tuple[int, Req]]] = {}
         for row, req in enumerate(reqs):
             group_id = req.smc_group_id
@@ -80,35 +139,46 @@ class SMCScheduler:
                 dtype=torch.int64,
                 device=logprob_diffs.device,
             )
-            particle_indices = torch.tensor(
-                [req.smc_particle_idx for _, req in entries],
-                dtype=torch.int64,
-                device=group.log_weights.device,
+            finalized_req = self._apply_group_step(
+                group,
+                [req for _, req in entries],
+                logprob_diffs.index_select(0, row_indices),
             )
-            group.log_weights[particle_indices] += logprob_diffs.index_select(
-                0, row_indices
-            ).to(
-                dtype=group.log_weights.dtype,
-                device=group.log_weights.device,
-            )
-            for _, req in entries:
-                particle_idx = req.smc_particle_idx
-                group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
-
-            if not group.all_active_aligned():
-                continue
-
-            active_indices = group.active_particle_indices()
-            if active_indices:
-                group.resampled_at_step = group.step_counts[active_indices[0]]
-                if self._should_resample(group, active_indices):
-                    self._groups_needing_resample.add(group_id)
-            else:
-                finalized_req = self.smc_manager._finalize_group(group_id)
-                if finalized_req is not None:
-                    finalized_reqs.append(finalized_req)
+            if finalized_req is not None:
+                finalized_reqs.append(finalized_req)
 
         return finalized_reqs
+
+    def _apply_group_step(
+        self,
+        group,
+        reqs: List[Req],
+        logprob_diffs: torch.Tensor,
+    ) -> Optional[Req]:
+        particle_indices = torch.tensor(
+            [req.smc_particle_idx for req in reqs],
+            dtype=torch.int64,
+            device=group.log_weights.device,
+        )
+        group.log_weights[particle_indices] += logprob_diffs.to(
+            dtype=group.log_weights.dtype,
+            device=group.log_weights.device,
+        )
+        for req in reqs:
+            particle_idx = req.smc_particle_idx
+            group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
+
+        if not group.all_active_aligned():
+            return None
+
+        active_indices = group.active_particle_indices()
+        if active_indices:
+            group.resampled_at_step = group.step_counts[active_indices[0]]
+            if self._should_resample(group, active_indices):
+                self._groups_needing_resample.add(group.group_id)
+            return None
+
+        return self.smc_manager._finalize_group(group.group_id)
 
     def _should_resample(self, group, active_indices: List[int]) -> bool:
         if len(active_indices) <= 1:

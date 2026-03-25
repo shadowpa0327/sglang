@@ -490,8 +490,8 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
         smc_logprob_diffs = None
-        smc_step_reqs: List[Req] = []
-        smc_step_rows: List[int] = []
+        smc_filtered_reqs: Optional[List[Req]] = None
+        smc_filtered_rows: Optional[List[int]] = None
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
@@ -548,6 +548,9 @@ class SchedulerOutputProcessorMixin:
                 # (currently not, e.g. Eagle V1 still check finish during forward)
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 if batch.spec_algorithm.is_smc():
+                    if smc_filtered_reqs is None:
+                        smc_filtered_reqs = list(batch.reqs[:i])
+                        smc_filtered_rows = list(range(i))
                     if req.finished() and self.smc_manager is not None:
                         self.smc_manager.on_particle_finished(req)
                     _release_internal_req(
@@ -586,8 +589,10 @@ class SchedulerOutputProcessorMixin:
                     raise RuntimeError(
                         "SMC decode result is missing batched smc_logprob_diffs."
                     )
-                smc_step_reqs.append(req)
-                smc_step_rows.append(i)
+                if smc_filtered_reqs is not None:
+                    smc_filtered_reqs.append(req)
+                    assert smc_filtered_rows is not None
+                    smc_filtered_rows.append(i)
 
             if (
                 self.server_args.disaggregation_decode_enable_offload_kvcache
@@ -685,23 +690,25 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        if (
-            batch.spec_algorithm.is_smc()
-            and self.smc_scheduler is not None
-            and smc_step_reqs
-        ):
+        if batch.spec_algorithm.is_smc() and self.smc_scheduler is not None:
             assert smc_logprob_diffs is not None
-            row_indices = torch.tensor(
-                smc_step_rows,
-                dtype=torch.int64,
-                device=smc_logprob_diffs.device,
-            )
-            smc_finalized_reqs.extend(
-                self.smc_scheduler.on_batch_done(
-                    smc_step_reqs,
-                    smc_logprob_diffs.index_select(0, row_indices),
+            smc_step_reqs = batch.reqs if smc_filtered_reqs is None else smc_filtered_reqs
+            if smc_step_reqs:
+                if smc_filtered_rows is None:
+                    step_logprob_diffs = smc_logprob_diffs
+                else:
+                    row_indices = torch.tensor(
+                        smc_filtered_rows,
+                        dtype=torch.int64,
+                        device=smc_logprob_diffs.device,
+                    )
+                    step_logprob_diffs = smc_logprob_diffs.index_select(0, row_indices)
+                smc_finalized_reqs.extend(
+                    self.smc_scheduler.on_batch_done(
+                        smc_step_reqs,
+                        step_logprob_diffs,
+                    )
                 )
-            )
 
         self.stream_output(batch.reqs, batch.return_logprob)
         if smc_finalized_reqs:

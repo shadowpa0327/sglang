@@ -338,6 +338,83 @@ class TestSMCScheduler(TestCase):
             use_future_map=False,
         )
 
+    def test_on_batch_done_uses_atomic_group_fast_path_for_contiguous_groups(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=0.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        req2 = _make_scheduler_req(
+            group_id="g2",
+            particle_idx=0,
+            req_pool_idx=2,
+            output_ids=[30],
+            kv_indices=[301],
+        )
+        req3 = _make_scheduler_req(
+            group_id="g2",
+            particle_idx=1,
+            req_pool_idx=3,
+            output_ids=[40],
+            kv_indices=[401],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+        manager.groups["g2"] = SMCGroupState(
+            group_id="g2",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req2, 1: req3},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        with patch.object(
+            scheduler,
+            "_on_batch_done_grouped",
+            wraps=scheduler._on_batch_done_grouped,
+        ) as mock_grouped:
+            finalized = scheduler.on_batch_done(
+                [req0, req1, req2, req3],
+                torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32),
+            )
+
+        self.assertEqual(finalized, [])
+        mock_grouped.assert_not_called()
+        self.assertTrue(
+            torch.allclose(
+                manager.groups["g1"].log_weights,
+                torch.tensor([0.1, 0.2], dtype=torch.float64),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                manager.groups["g2"].log_weights,
+                torch.tensor([0.3, 0.4], dtype=torch.float64),
+            )
+        )
+        self.assertEqual(manager.groups["g1"].step_counts, {0: 1, 1: 1})
+        self.assertEqual(manager.groups["g2"].step_counts, {0: 1, 1: 1})
+        self.assertFalse(scheduler._groups_needing_resample)
+
     @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
     def test_step_resamples_and_reinserts_group_with_matching_future_mode(
         self,
@@ -1433,6 +1510,106 @@ class TestSMCDecodeOutputProcessor(TestCase):
         processor.token_to_kv_pool_allocator.free_group_begin.assert_called_once()
         processor.token_to_kv_pool_allocator.free_group_end.assert_called_once()
         processor.update_spec_metrics.assert_not_called()
+
+    def test_process_batch_result_decode_passes_full_smc_batch_when_no_rows_are_skipped(self):
+        req0 = SimpleNamespace(
+            rid="r-1",
+            output_ids=[17],
+            origin_input_ids=[1, 2, 3],
+            kv_committed_len=3,
+            kv_allocated_len=8,
+            finished=lambda: False,
+            is_retracted=False,
+            check_finished=lambda new_tokens: None,
+            time_stats=SimpleNamespace(
+                set_last_decode_finish_time=lambda: None,
+                set_completion_time=lambda: None,
+            ),
+            spec_verify_ct=0,
+            spec_accepted_tokens=0,
+            update_spec_acceptance_histogram=lambda accepted: None,
+            return_logprob=False,
+            multimodal_inputs=None,
+            grammar=None,
+            finished_reason=None,
+            finished_len=None,
+            smc_group_id="g1",
+            smc_particle_idx=0,
+            mamba_ping_pong_track_buffer=None,
+        )
+        req1 = SimpleNamespace(
+            rid="r-2",
+            output_ids=[27],
+            origin_input_ids=[1, 2, 3],
+            kv_committed_len=3,
+            kv_allocated_len=8,
+            finished=lambda: False,
+            is_retracted=False,
+            check_finished=lambda new_tokens: None,
+            time_stats=SimpleNamespace(
+                set_last_decode_finish_time=lambda: None,
+                set_completion_time=lambda: None,
+            ),
+            spec_verify_ct=0,
+            spec_accepted_tokens=0,
+            update_spec_acceptance_histogram=lambda accepted: None,
+            return_logprob=False,
+            multimodal_inputs=None,
+            grammar=None,
+            finished_reason=None,
+            finished_len=None,
+            smc_group_id="g1",
+            smc_particle_idx=1,
+            mamba_ping_pong_track_buffer=None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req0, req1],
+            spec_algorithm=SimpleNamespace(
+                is_none=lambda: False,
+                is_smc=lambda: True,
+            ),
+            is_spec_v2=True,
+            return_logprob=False,
+            batch_size=lambda: 2,
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([41, 51, 0, 0, 0], dtype=torch.int32),
+            accept_lens=torch.tensor([1, 1], dtype=torch.int32),
+            smc_logprob_diffs=torch.tensor([0.25, 0.75], dtype=torch.float32),
+            can_run_cuda_graph=False,
+        )
+
+        processor = _FakeOutputProcessor()
+        processor.enable_overlap = True
+        processor.enable_metrics = False
+        processor.device = "cpu"
+        processor.num_generated_tokens = 0
+        processor.forward_ct_decode = 0
+        processor.draft_worker = SimpleNamespace(speculative_num_draft_tokens=5)
+        processor.server_args = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False
+        )
+        processor.token_to_kv_pool_allocator = SimpleNamespace(
+            free_group_begin=MagicMock(),
+            free_group_end=MagicMock(),
+        )
+        processor.req_to_token_pool = MagicMock()
+        processor.tree_cache = MagicMock()
+        processor.smc_manager = SimpleNamespace(on_particle_finished=MagicMock())
+        processor.smc_scheduler = SimpleNamespace(on_batch_done=MagicMock(return_value=[]))
+        processor.stream_output = MagicMock()
+        processor.report_decode_stats = MagicMock()
+        processor.update_spec_metrics = MagicMock()
+        processor.maybe_collect_customized_info = MagicMock()
+        processor.maybe_collect_routed_experts = MagicMock()
+        processor._resolve_spec_overlap_token_ids = MagicMock(return_value=[[41], [51]])
+
+        processor.process_batch_result_decode(batch, result)
+
+        called_reqs, called_diffs = processor.smc_scheduler.on_batch_done.call_args.args
+        self.assertIs(called_reqs, batch.reqs)
+        self.assertIs(called_diffs, result.smc_logprob_diffs)
 
     def test_process_batch_result_decode_releases_already_finished_smc_req_in_overlap(self):
         req = SimpleNamespace(
