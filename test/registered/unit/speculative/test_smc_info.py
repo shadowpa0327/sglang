@@ -6,20 +6,34 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.speculative.smc_manager import SMCFinishedParticleSnapshot, SMCGroupState, SMCManager
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.speculative.smc_manager import (
+    SMCFinishedParticleSnapshot,
+    SMCGroupState,
+    SMCManager,
+)
 from sglang.srt.speculative.smc_info import SMCDraftInput, SMCScoreInput
 from sglang.srt.speculative.smc_info import (
     SMCParticleState,
     SMCRequestState,
+    _release_internal_req,
+    _release_smc_parent_req,
     effective_sample_size,
+    get_smc_reserved_kv_len,
     multinomial_resample,
     normalize_log_weights,
     resolve_smc_proposal_length,
     resolve_smc_seed_output_ids,
+    set_smc_reserved_kv_len,
     systematic_resample,
     validate_smc_parent_req,
 )
+from sglang.srt.speculative.smc_scheduler import PendingResample, SMCScheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu-only")
@@ -41,6 +55,78 @@ def _make_particle(output_len: int, log_weight: float, finished: bool = False):
         draft_req=draft_req,
         log_weight=log_weight,
     )
+
+
+def _make_scheduler_req(
+    *,
+    group_id: str,
+    particle_idx: int,
+    req_pool_idx: int,
+    output_ids: list[int],
+    kv_indices: list[int],
+    allocated_kv_indices: list[int] | None = None,
+):
+    allocated_kv_indices = (
+        list(allocated_kv_indices)
+        if allocated_kv_indices is not None
+        else list(kv_indices)
+    )
+    return SimpleNamespace(
+        smc_group_id=group_id,
+        smc_particle_idx=particle_idx,
+        req_pool_idx=req_pool_idx,
+        origin_input_ids=[1, 2],
+        output_ids=list(output_ids),
+        kv_committed_len=len(kv_indices),
+        kv_allocated_len=len(allocated_kv_indices),
+        cache_protected_len=len(kv_indices),
+        logprob_start_len=0,
+        draft_prefix_materialized=True,
+        prefix_indices=torch.tensor(kv_indices, dtype=torch.int64),
+        finished_reason=None,
+        finished_len=None,
+        finished_output=None,
+        to_finish=None,
+        finished=lambda: False,
+    )
+
+
+class _FakeAllocator:
+    def __init__(self):
+        self.inc_calls = []
+        self.dec_calls = []
+        self.ops = []
+
+    def inc_ref(self, indices):
+        cloned = indices.clone()
+        self.inc_calls.append(cloned)
+        self.ops.append(("inc", cloned))
+
+    def dec_ref_and_free(self, indices):
+        cloned = indices.clone()
+        self.dec_calls.append(cloned)
+        self.ops.append(("dec", cloned))
+
+
+class _FakeRunningBatch:
+    def __init__(self, reqs, future_indices=None, batch_is_full=False):
+        self.reqs = list(reqs)
+        self.batch_is_full = batch_is_full
+        self.spec_info = SimpleNamespace(future_indices=future_indices)
+
+    def is_empty(self):
+        return len(self.reqs) == 0
+
+    def filter_batch(self, keep_indices=None, **kwargs):
+        keep_indices = keep_indices or []
+        self.reqs = [self.reqs[i] for i in keep_indices]
+
+    def merge_batch(self, other):
+        self.reqs.extend(other.reqs)
+
+
+class _FakeOutputProcessor(SchedulerOutputProcessorMixin):
+    pass
 
 
 class TestSMCWeightHelpers(TestCase):
@@ -107,6 +193,592 @@ class TestSMCManagerHelpers(TestCase):
         self.assertTrue(manager.all_active_members_present("g1", [req0, req1, req2]))
         self.assertFalse(manager.all_active_members_present("g1", [req0]))
 
+    def test_release_internal_req_frees_reserved_tail_when_visible_len_shrinks(self):
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            kv_committed_len=1,
+            kv_allocated_len=1,
+            prefix_indices=torch.tensor([11], dtype=torch.int64),
+        )
+        set_smc_reserved_kv_len(req, 2)
+        req_to_token = torch.tensor([[11, 99, 0]], dtype=torch.int32)
+        allocator = _FakeAllocator()
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=req_to_token,
+            free=lambda target_req: setattr(target_req, "req_pool_idx", None),
+        )
+
+        _release_internal_req(req, req_to_token_pool, allocator)
+
+        self.assertEqual(len(allocator.dec_calls), 1)
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[0], torch.tensor([11, 99], dtype=torch.int64))
+        )
+        self.assertIsNone(req.req_pool_idx)
+        self.assertEqual(req.kv_allocated_len, 0)
+        self.assertEqual(get_smc_reserved_kv_len(req), 0)
+
+
+class TestSMCReleaseHelpers(TestCase):
+    @patch("sglang.srt.speculative.smc_info.get_global_server_args")
+    def test_release_smc_parent_req_dec_refs_non_protected_committed_kv(
+        self,
+        mock_get_global_server_args,
+    ):
+        mock_get_global_server_args.return_value = SimpleNamespace(page_size=1)
+
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            cache_protected_len=2,
+            last_node="node-1",
+            pop_committed_kv_cache=lambda: 4,
+            pop_overallocated_kv_cache=lambda: (4, 4),
+        )
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[11, 12, 13, 14, 15]], dtype=torch.int32),
+            free=MagicMock(side_effect=lambda released_req: setattr(released_req, "req_pool_idx", None)),
+        )
+        allocator = _FakeAllocator()
+        tree_cache = SimpleNamespace(dec_lock_ref=MagicMock())
+
+        _release_smc_parent_req(
+            req,
+            tree_cache=tree_cache,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertEqual(req.req_pool_idx, None)
+        self.assertEqual(len(allocator.dec_calls), 1)
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[0], torch.tensor([13, 14], dtype=torch.int64))
+        )
+        req_to_token_pool.free.assert_called_once_with(req)
+        tree_cache.dec_lock_ref.assert_called_once_with("node-1")
+
+
+class TestSMCScheduler(TestCase):
+    def test_complete_resample_waits_for_done_event_before_allocator_and_merge(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        order = []
+        done_event = object()
+        allocator = SimpleNamespace(
+            inc_ref=lambda indices: order.append(("inc", indices.clone())),
+            dec_ref_and_free=lambda indices: order.append(("dec", indices.clone())),
+        )
+        live_scheduler = SimpleNamespace(
+            schedule_stream=SimpleNamespace(
+                wait_event=lambda event: order.append(("wait", event))
+            ),
+            running_batch=_FakeRunningBatch([SimpleNamespace(rid="other")]),
+            token_to_kv_pool_allocator=allocator,
+        )
+        manager._build_particle_batch = MagicMock(
+            return_value=SimpleNamespace(reqs=[req0, req1], is_empty=lambda: False)
+        )
+        scheduler.resampling_reqs["g1"] = [req0, req1]
+
+        pending = PendingResample(
+            group_id="g1",
+            dst_reqs=[req1],
+            src_snapshots=[
+                {
+                    "indices": torch.tensor([101], dtype=torch.int64),
+                    "output_ids": [10],
+                    "finished_reason": None,
+                    "finished_len": None,
+                    "finished_output": None,
+                    "to_finish": None,
+                    "kv_committed_len": 1,
+                    "cache_protected_len": 1,
+                    "logprob_start_len": 0,
+                    "draft_prefix_materialized": True,
+                }
+            ],
+            inc_ref=[torch.tensor([101], dtype=torch.int64)],
+            dec_ref=[torch.tensor([201], dtype=torch.int64)],
+            done_event=done_event,
+        )
+        scheduler.pending_resamples["g1"] = pending
+
+        scheduler._complete_resample("g1", pending, live_scheduler)
+
+        self.assertEqual(order[0], ("wait", done_event))
+        self.assertEqual([op for op, _ in order[1:3]], ["inc", "dec"])
+        self.assertEqual(live_scheduler.running_batch.reqs[1:], [req0, req1])
+        manager._build_particle_batch.assert_called_once_with(
+            [req0, req1],
+            live_scheduler,
+            use_future_map=False,
+        )
+
+    @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
+    def test_step_resamples_and_reinserts_group_with_matching_future_mode(
+        self,
+        mock_systematic_resample,
+    ):
+        mock_systematic_resample.return_value = [0, 0]
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        scheduler.init_streams(enable_overlap=False)
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10, 11],
+            kv_indices=[101, 102],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        req_to_token = torch.tensor(
+            [
+                [101, 102, 0, 0],
+                [201, 0, 0, 0],
+                [301, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        allocator = _FakeAllocator()
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch(
+                [req0, req1, SimpleNamespace(rid="other")],
+                future_indices=SimpleNamespace(indices=torch.tensor([1])),
+                batch_is_full=True,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token,
+                write=lambda indices, values: req_to_token.__setitem__(indices, values),
+            ),
+            token_to_kv_pool_allocator=allocator,
+        )
+        manager.req_to_token_pool = live_scheduler.req_to_token_pool
+        rebuilt_batch = SimpleNamespace(reqs=[req0, req1])
+        manager._build_particle_batch = MagicMock(return_value=rebuilt_batch)
+
+        finalized = scheduler.on_batch_done(
+            [req0, req1],
+            torch.tensor([9.0, 0.0], dtype=torch.float32),
+        )
+        self.assertEqual(finalized, [])
+
+        scheduler.step(live_scheduler)
+
+        self.assertEqual(live_scheduler.running_batch.reqs[0].rid, "other")
+        self.assertEqual(live_scheduler.running_batch.reqs[1:], [req0, req1])
+        self.assertEqual(req1.output_ids, req0.output_ids)
+        self.assertTrue(
+            torch.equal(
+                req_to_token[req1.req_pool_idx, : req0.kv_committed_len],
+                req_to_token[req0.req_pool_idx, : req0.kv_committed_len],
+            )
+        )
+        self.assertEqual(len(allocator.dec_calls), 1)
+        self.assertEqual(len(allocator.inc_calls), 1)
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[0], torch.tensor([201], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(allocator.inc_calls[0], torch.tensor([101, 102], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(
+                manager.groups["g1"].log_weights,
+                torch.zeros(2, dtype=torch.float64),
+            )
+        )
+        manager._build_particle_batch.assert_called_once_with(
+            [req0, req1],
+            live_scheduler,
+            use_future_map=True,
+        )
+
+    @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
+    def test_step_skips_stall_when_resample_has_no_evictions(
+        self,
+        mock_systematic_resample,
+    ):
+        mock_systematic_resample.return_value = [0, 1]
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        scheduler.init_streams(enable_overlap=False)
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch([req0, req1]),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor(
+                    [[101, 0, 0], [201, 0, 0]],
+                    dtype=torch.int32,
+                ),
+                write=MagicMock(),
+            ),
+            token_to_kv_pool_allocator=_FakeAllocator(),
+        )
+        manager.req_to_token_pool = live_scheduler.req_to_token_pool
+        manager._build_particle_batch = MagicMock()
+
+        scheduler.on_batch_done(
+            [req0, req1],
+            torch.tensor([9.0, 0.0], dtype=torch.float32),
+        )
+        scheduler.step(live_scheduler)
+
+        self.assertEqual(live_scheduler.running_batch.reqs, [req0, req1])
+        self.assertFalse(scheduler.resampling_reqs)
+        self.assertFalse(scheduler.pending_resamples)
+        manager._build_particle_batch.assert_not_called()
+        self.assertTrue(
+            torch.equal(
+                manager.groups["g1"].log_weights,
+                torch.zeros(2, dtype=torch.float64),
+            )
+        )
+
+    @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
+    def test_step_replaces_empty_running_batch_before_reinsert(
+        self,
+        mock_systematic_resample,
+    ):
+        mock_systematic_resample.return_value = [0, 0]
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        scheduler.init_streams(enable_overlap=False)
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        req_to_token = torch.tensor([[101, 0], [201, 0]], dtype=torch.int32)
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch([req0, req1], batch_is_full=True),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token,
+                write=lambda indices, values: req_to_token.__setitem__(indices, values),
+            ),
+            token_to_kv_pool_allocator=_FakeAllocator(),
+        )
+        manager.req_to_token_pool = live_scheduler.req_to_token_pool
+        rebuilt_batch = SimpleNamespace(reqs=[req0, req1], is_empty=lambda: False)
+        manager._build_particle_batch = MagicMock(return_value=rebuilt_batch)
+
+        scheduler.on_batch_done(
+            [req0, req1],
+            torch.tensor([9.0, 0.0], dtype=torch.float32),
+        )
+        scheduler.step(live_scheduler)
+
+        self.assertIs(live_scheduler.running_batch, rebuilt_batch)
+        manager._build_particle_batch.assert_called_once_with(
+            [req0, req1],
+            live_scheduler,
+            use_future_map=False,
+        )
+
+    @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
+    def test_step_snapshots_resample_sources_before_destination_writes(
+        self,
+        mock_systematic_resample,
+    ):
+        mock_systematic_resample.return_value = [1, 0]
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        scheduler.init_streams(enable_overlap=False)
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10, 11],
+            kv_indices=[101, 102],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20, 21],
+            kv_indices=[201, 202],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        req_to_token = torch.tensor(
+            [[101, 102, 0], [201, 202, 0]],
+            dtype=torch.int32,
+        )
+        allocator = _FakeAllocator()
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch([req0, req1]),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token,
+                write=lambda indices, values: req_to_token.__setitem__(indices, values),
+            ),
+            token_to_kv_pool_allocator=allocator,
+        )
+        manager.req_to_token_pool = live_scheduler.req_to_token_pool
+        manager._build_particle_batch = MagicMock(
+            return_value=SimpleNamespace(reqs=[req0, req1], is_empty=lambda: False)
+        )
+
+        scheduler.on_batch_done(
+            [req0, req1],
+            torch.tensor([9.0, 0.0], dtype=torch.float32),
+        )
+        scheduler.step(live_scheduler)
+
+        self.assertEqual(req0.output_ids, [20, 21])
+        self.assertEqual(req1.output_ids, [10, 11])
+        self.assertTrue(
+            torch.equal(
+                req_to_token[0, :2],
+                torch.tensor([201, 202], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                req_to_token[1, :2],
+                torch.tensor([101, 102], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(len(allocator.dec_calls), 2)
+        self.assertEqual(len(allocator.inc_calls), 2)
+        self.assertEqual([op for op, _ in allocator.ops[:2]], ["inc", "inc"])
+
+    @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
+    def test_step_trims_stale_overalloc_before_reinsert(
+        self,
+        mock_systematic_resample,
+    ):
+        mock_systematic_resample.return_value = [0, 0]
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        scheduler.init_streams(enable_overlap=False)
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+            allocated_kv_indices=[101, 111],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+            allocated_kv_indices=[201, 211],
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        req_to_token = torch.tensor([[101, 111, 0], [201, 211, 0]], dtype=torch.int32)
+        allocator = _FakeAllocator()
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch([req0, req1]),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token,
+                write=lambda indices, values: req_to_token.__setitem__(indices, values),
+            ),
+            token_to_kv_pool_allocator=allocator,
+        )
+        manager.req_to_token_pool = live_scheduler.req_to_token_pool
+        manager._build_particle_batch = MagicMock(return_value=SimpleNamespace(reqs=[req0, req1]))
+
+        scheduler.on_batch_done(
+            [req0, req1],
+            torch.tensor([9.0, 0.0], dtype=torch.float32),
+        )
+        scheduler.step(live_scheduler)
+
+        self.assertEqual(req0.kv_allocated_len, req0.kv_committed_len)
+        self.assertEqual(req1.kv_allocated_len, req1.kv_committed_len)
+        self.assertEqual(len(allocator.dec_calls), 3)
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[0], torch.tensor([111], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[1], torch.tensor([211], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[2], torch.tensor([201], dtype=torch.int64))
+        )
+
+    @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
+    def test_step_trims_hidden_reserved_tail_before_reinsert(
+        self,
+        mock_systematic_resample,
+    ):
+        mock_systematic_resample.return_value = [0, 0]
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        scheduler.init_streams(enable_overlap=False)
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        set_smc_reserved_kv_len(req0, 2)
+        set_smc_reserved_kv_len(req1, 2)
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.zeros(2, dtype=torch.float64),
+            step_counts={0: 0, 1: 0},
+        )
+
+        req_to_token = torch.tensor([[101, 111, 0], [201, 211, 0]], dtype=torch.int32)
+        allocator = _FakeAllocator()
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch([req0, req1]),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token,
+                write=lambda indices, values: req_to_token.__setitem__(indices, values),
+            ),
+            token_to_kv_pool_allocator=allocator,
+        )
+        manager.req_to_token_pool = live_scheduler.req_to_token_pool
+        manager._build_particle_batch = MagicMock(return_value=SimpleNamespace(reqs=[req0, req1]))
+
+        scheduler.on_batch_done(
+            [req0, req1],
+            torch.tensor([9.0, 0.0], dtype=torch.float32),
+        )
+        scheduler.step(live_scheduler)
+
+        self.assertEqual(req0.kv_allocated_len, req0.kv_committed_len)
+        self.assertEqual(req1.kv_allocated_len, req1.kv_committed_len)
+        self.assertEqual(get_smc_reserved_kv_len(req0), req0.kv_committed_len)
+        self.assertEqual(get_smc_reserved_kv_len(req1), req1.kv_committed_len)
+        self.assertEqual(len(allocator.dec_calls), 3)
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[0], torch.tensor([111], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[1], torch.tensor([211], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(allocator.dec_calls[2], torch.tensor([201], dtype=torch.int64))
+        )
+
 
 class TestSMCScoreInput(TestCase):
     def _make_score_input(self, draft_token_num: int = 4) -> SMCScoreInput:
@@ -114,17 +786,16 @@ class TestSMCScoreInput(TestCase):
             draft_token=torch.tensor([17, 23, 29, 29], dtype=torch.int32),
             draft_lengths=torch.tensor([2], dtype=torch.int32),
             draft_logprobs=torch.tensor([0.5], dtype=torch.float32),
-            verify_out_cache_loc=torch.tensor(
-                [[11], [12], [13], [14]], dtype=torch.int64
-            ),
             positions=torch.tensor([3, 4, 5, 6], dtype=torch.int64),
             custom_mask=None,
             draft_token_num=draft_token_num,
             target_temperature=1.0,
         )
 
+    @patch("sglang.srt.speculative.smc_info.assign_extend_cache_locs_func")
     def test_prepare_for_v2_verify_uses_graph_runner_when_available(
         self,
+        mock_assign_extend_cache_locs,
     ):
         with patch("sglang.srt.speculative.smc_info.ForwardBatch.init_new") as mock_init_forward_batch:
             score_input = self._make_score_input()
@@ -144,6 +815,10 @@ class TestSMCScoreInput(TestCase):
             graph_runner = MagicMock()
             graph_runner.can_run.return_value = True
             attn_backend = MagicMock()
+            mock_assign_extend_cache_locs.return_value = torch.tensor(
+                [11, 12, 13, 14],
+                dtype=torch.int64,
+            )
             target_worker = SimpleNamespace(
                 model_runner=SimpleNamespace(
                     token_to_kv_pool_allocator=MagicMock(),
@@ -188,10 +863,12 @@ class TestSMCScoreInput(TestCase):
             )
             graph_runner.replay_prepare.assert_called_once_with(fake_forward_batch)
             attn_backend.init_forward_metadata.assert_not_called()
+            self.assertFalse(verify_forward_batch.disable_graph_runner)
 
+    @patch("sglang.srt.speculative.smc_info.assign_extend_cache_locs_func")
     @patch("sglang.srt.speculative.smc_info.ForwardBatch.init_new")
     def test_prepare_for_v2_verify_falls_back_to_attn_backend_without_graph(
-        self, mock_init_forward_batch
+        self, mock_init_forward_batch, mock_assign_extend_cache_locs
     ):
         score_input = self._make_score_input()
         req = SimpleNamespace(req_pool_idx=2, kv_allocated_len=8, rid="r-2")
@@ -210,6 +887,10 @@ class TestSMCScoreInput(TestCase):
         graph_runner = MagicMock()
         graph_runner.can_run.return_value = False
         attn_backend = MagicMock()
+        mock_assign_extend_cache_locs.return_value = torch.tensor(
+            [11, 12, 13, 14],
+            dtype=torch.int64,
+        )
         target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
                 token_to_kv_pool_allocator=MagicMock(),
@@ -233,6 +914,7 @@ class TestSMCScoreInput(TestCase):
         self.assertFalse(can_run_cuda_graph)
         attn_backend.init_forward_metadata.assert_called_once_with(fake_forward_batch)
         graph_runner.replay_prepare.assert_not_called()
+        self.assertTrue(verify_forward_batch.disable_graph_runner)
 
     def test_score_input_uses_linear_target_verify(self):
         score_input = self._make_score_input()
@@ -275,11 +957,81 @@ class TestSMCScoreInput(TestCase):
         self.assertEqual(logprob_diffs.dtype, torch.float32)
 
 
+class TestSMCVerifyGraphGate(TestCase):
+    def test_model_runner_forward_respects_disable_graph_runner(self):
+        graph_runner = SimpleNamespace(
+            can_run=MagicMock(return_value=True),
+            replay=MagicMock(return_value="graph"),
+        )
+        fake_self = SimpleNamespace(
+            device="cuda",
+            graph_runner=graph_runner,
+            forward_decode=MagicMock(),
+            forward_extend=MagicMock(return_value=("extend", False)),
+            forward_idle=MagicMock(),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            disable_graph_runner=True,
+            global_num_tokens_cpu=None,
+            num_token_non_padded=None,
+            global_num_tokens_gpu=None,
+            out_cache_loc_swa=None,
+            prepare_attn_tp_scatter_input=MagicMock(),
+        )
+
+        out = ModelRunner._forward_raw(
+            fake_self,
+            forward_batch,
+            skip_attn_backend_init=True,
+            pp_proxy_tensors=None,
+        )
+
+        graph_runner.can_run.assert_not_called()
+        graph_runner.replay.assert_not_called()
+        fake_self.forward_extend.assert_called_once_with(
+            forward_batch,
+            skip_attn_backend_init=True,
+            pp_proxy_tensors=None,
+        )
+        self.assertEqual(out.logits_output, "extend")
+        self.assertFalse(out.can_run_graph)
+
+
 class TestSMCDraftInput(TestCase):
+    def test_filter_batch_with_future_indices_only_updates_future_map_view(self):
+        future_indices = SimpleNamespace(indices=torch.tensor([4, 7], dtype=torch.int64))
+        draft_input = SMCDraftInput(
+            last_token_ids=torch.tensor([10], dtype=torch.int32),
+            new_seq_lens=torch.tensor([20], dtype=torch.int64),
+            future_indices=future_indices,
+        )
+
+        draft_input.filter_batch(torch.tensor([1], dtype=torch.int64))
+
+        self.assertTrue(
+            torch.equal(
+                future_indices.indices,
+                torch.tensor([7], dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.last_token_ids,
+                torch.tensor([10], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.new_seq_lens,
+                torch.tensor([20], dtype=torch.int64),
+            )
+        )
+
     @patch("sglang.srt.speculative.smc_info.get_global_server_args")
     @patch("sglang.srt.speculative.smc_info.alloc_token_slots")
     @patch("sglang.srt.speculative.smc_info.assign_req_to_token_pool_func")
-    def test_prepare_for_decode_prepares_proposal_and_verify_cache_locs(
+    def test_prepare_for_decode_updates_allocated_lens_and_slot_assignments(
         self,
         mock_assign_req_to_token_pool,
         mock_alloc_token_slots,
@@ -340,40 +1092,58 @@ class TestSMCDraftInput(TestCase):
         self.assertEqual(batch.seq_lens_sum, 14)
         self.assertTrue(
             torch.equal(
-                draft_input.verify_out_cache_loc,
-                torch.tensor(
-                    [[101, 105], [102, 106], [103, 107], [104, 108]],
-                    dtype=torch.int64,
-                ),
+                req_to_token[3, 5:9],
+                torch.tensor([101, 102, 103, 104], dtype=torch.int32),
             )
         )
         self.assertTrue(
             torch.equal(
-                draft_input.proposal_out_cache_loc,
-                torch.tensor(
-                    [[101, 105], [102, 106], [103, 107]],
-                    dtype=torch.int64,
-                ),
+                req_to_token[4, 7:11],
+                torch.tensor([105, 106, 107, 108], dtype=torch.int32),
             )
         )
-        self.assertTrue(
-            torch.equal(
-                draft_input.proposal_seq_lens_steps,
-                torch.tensor([[5, 7], [6, 8], [7, 9]], dtype=torch.int32),
-            )
+
+    @patch("sglang.srt.speculative.smc_info.get_global_server_args")
+    @patch("sglang.srt.speculative.smc_info.alloc_token_slots")
+    @patch("sglang.srt.speculative.smc_info.assign_req_to_token_pool_func")
+    def test_prepare_for_decode_reuses_reserved_len_after_visible_shrink(
+        self,
+        mock_assign_req_to_token_pool,
+        mock_alloc_token_slots,
+        mock_get_global_server_args,
+    ):
+        mock_get_global_server_args.return_value = SimpleNamespace(
+            smc_gamma=3,
+            speculative_num_draft_tokens=4,
         )
-        self.assertTrue(
-            torch.equal(
-                draft_input.proposal_seq_lens_cpu_steps,
-                torch.tensor([[5, 7], [6, 8], [7, 9]], dtype=torch.int32),
-            )
+
+        req = SimpleNamespace(req_pool_idx=3, kv_allocated_len=5, decode_batch_idx=0)
+        set_smc_reserved_kv_len(req, 9)
+        req_to_token = torch.zeros((8, 32), dtype=torch.int32)
+        batch = SimpleNamespace(
+            reqs=[req],
+            seq_lens=torch.tensor([6], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([99], dtype=torch.int64),
+            seq_lens_sum=99,
+            req_pool_indices=torch.tensor([3], dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            tree_cache=MagicMock(),
+            device=torch.device("cpu"),
+            maybe_evict_swa=MagicMock(),
+            batch_size=lambda: 1,
         )
-        self.assertTrue(
-            torch.equal(
-                draft_input.proposal_seq_lens_sum_steps,
-                torch.tensor([12, 14, 16], dtype=torch.int64),
-            )
+
+        draft_input = SMCDraftInput(
+            last_token_ids=torch.tensor([7], dtype=torch.int32),
+            new_seq_lens=torch.tensor([6], dtype=torch.int64),
         )
+        draft_input.prepare_for_decode(batch)
+
+        mock_alloc_token_slots.assert_not_called()
+        mock_assign_req_to_token_pool.assert_not_called()
+        self.assertEqual(req.kv_allocated_len, 9)
+        self.assertEqual(get_smc_reserved_kv_len(req), 9)
+        self.assertEqual(req.decode_batch_idx, 1)
 
 
 class TestSMCRequestState(TestCase):
@@ -581,3 +1351,174 @@ class TestSMCDraftCudaGraphSamplingSupport(TestCase):
         self.assertTrue(
             self._check(self._make_sampling_info(penalizer_orchestrator=None))
         )
+
+
+class TestSMCDecodeOutputProcessor(TestCase):
+    def test_process_batch_result_decode_does_not_double_increment_committed_kv(self):
+        req = SimpleNamespace(
+            rid="r-1",
+            output_ids=[17],
+            origin_input_ids=[1, 2, 3],
+            kv_committed_len=3,
+            kv_allocated_len=8,
+            finished=lambda: False,
+            is_retracted=False,
+            check_finished=lambda new_tokens: None,
+            time_stats=SimpleNamespace(
+                set_last_decode_finish_time=lambda: None,
+                set_completion_time=lambda: None,
+            ),
+            spec_verify_ct=0,
+            spec_accepted_tokens=0,
+            update_spec_acceptance_histogram=lambda accepted: None,
+            return_logprob=False,
+            multimodal_inputs=None,
+            grammar=None,
+            finished_reason=None,
+            finished_len=None,
+            smc_group_id="g1",
+            smc_particle_idx=0,
+            mamba_ping_pong_track_buffer=None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SimpleNamespace(
+                is_none=lambda: False,
+                is_smc=lambda: True,
+            ),
+            is_spec_v2=True,
+            return_logprob=False,
+            batch_size=lambda: 1,
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([41, 43, 0, 0, 0], dtype=torch.int32),
+            accept_lens=torch.tensor([2], dtype=torch.int32),
+            smc_logprob_diffs=torch.tensor([0.75], dtype=torch.float32),
+            can_run_cuda_graph=False,
+        )
+
+        processor = _FakeOutputProcessor()
+        processor.enable_overlap = False
+        processor.enable_metrics = False
+        processor.device = "cpu"
+        processor.num_generated_tokens = 0
+        processor.forward_ct_decode = 0
+        processor.draft_worker = SimpleNamespace(speculative_num_draft_tokens=5)
+        processor.server_args = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False
+        )
+        processor.token_to_kv_pool_allocator = SimpleNamespace(
+            free_group_begin=MagicMock(),
+            free_group_end=MagicMock(),
+        )
+        processor.req_to_token_pool = MagicMock()
+        processor.tree_cache = MagicMock()
+        processor.smc_manager = SimpleNamespace(on_particle_finished=MagicMock())
+        processor.smc_scheduler = SimpleNamespace(on_batch_done=MagicMock(return_value=[]))
+        processor.stream_output = MagicMock()
+        processor.report_decode_stats = MagicMock()
+        processor.update_spec_metrics = MagicMock()
+        processor.maybe_collect_customized_info = MagicMock()
+        processor.maybe_collect_routed_experts = MagicMock()
+
+        processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(req.output_ids, [17, 41, 43])
+        self.assertEqual(req.kv_committed_len, 5)
+        self.assertEqual(req.kv_allocated_len, 8)
+        self.assertEqual(req.spec_verify_ct, 1)
+        self.assertEqual(req.spec_accepted_tokens, 1)
+        processor.smc_scheduler.on_batch_done.assert_called_once()
+        processor.token_to_kv_pool_allocator.free_group_begin.assert_called_once()
+        processor.token_to_kv_pool_allocator.free_group_end.assert_called_once()
+        processor.update_spec_metrics.assert_not_called()
+
+    def test_process_batch_result_decode_releases_already_finished_smc_req_in_overlap(self):
+        req = SimpleNamespace(
+            rid="r-2",
+            output_ids=[17],
+            origin_input_ids=[1, 2, 3],
+            kv_committed_len=3,
+            kv_allocated_len=5,
+            req_pool_idx=0,
+            prefix_indices=torch.tensor([11, 12, 13], dtype=torch.int64),
+            finished=lambda: True,
+            is_retracted=False,
+            check_finished=lambda new_tokens: None,
+            time_stats=SimpleNamespace(
+                set_last_decode_finish_time=lambda: None,
+                set_completion_time=lambda: None,
+            ),
+            spec_verify_ct=0,
+            spec_accepted_tokens=0,
+            update_spec_acceptance_histogram=lambda accepted: None,
+            return_logprob=False,
+            multimodal_inputs=None,
+            grammar=None,
+            finished_reason=None,
+            finished_len=None,
+            smc_group_id="g1",
+            smc_particle_idx=0,
+            mamba_ping_pong_track_buffer=None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SimpleNamespace(
+                is_none=lambda: False,
+                is_smc=lambda: True,
+            ),
+            is_spec_v2=True,
+            return_logprob=False,
+            batch_size=lambda: 1,
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([0, 0, 0, 0, 0], dtype=torch.int32),
+            accept_lens=torch.tensor([0], dtype=torch.int32),
+            smc_logprob_diffs=torch.tensor([0.0], dtype=torch.float32),
+            can_run_cuda_graph=False,
+        )
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[11, 12, 13, 14, 15]], dtype=torch.int32),
+            free=MagicMock(side_effect=lambda released_req: setattr(released_req, "req_pool_idx", None)),
+        )
+        allocator = _FakeAllocator()
+
+        processor = _FakeOutputProcessor()
+        processor.enable_overlap = True
+        processor.enable_metrics = False
+        processor.device = "cpu"
+        processor.num_generated_tokens = 0
+        processor.forward_ct_decode = 0
+        processor.draft_worker = SimpleNamespace(speculative_num_draft_tokens=5)
+        processor.server_args = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False
+        )
+        processor.token_to_kv_pool_allocator = SimpleNamespace(
+            free_group_begin=MagicMock(),
+            free_group_end=MagicMock(),
+            dec_ref_and_free=allocator.dec_ref_and_free,
+        )
+        processor.req_to_token_pool = req_to_token_pool
+        processor.tree_cache = MagicMock()
+        processor.smc_manager = SimpleNamespace(on_particle_finished=MagicMock())
+        processor.smc_scheduler = SimpleNamespace(on_batch_done=MagicMock(return_value=[]))
+        processor.stream_output = MagicMock()
+        processor.report_decode_stats = MagicMock()
+        processor.update_spec_metrics = MagicMock()
+        processor.maybe_collect_customized_info = MagicMock()
+        processor.maybe_collect_routed_experts = MagicMock()
+        processor._resolve_spec_overlap_token_ids = MagicMock(return_value=[[]])
+
+        processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(len(allocator.dec_calls), 1)
+        self.assertTrue(
+            torch.equal(
+                allocator.dec_calls[0],
+                torch.tensor([11, 12, 13, 14, 15], dtype=torch.int64),
+            )
+        )
+        self.assertIsNone(req.req_pool_idx)
+        processor.smc_manager.on_particle_finished.assert_called_once_with(req)

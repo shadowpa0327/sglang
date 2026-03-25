@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.smc_info import (
     _release_internal_req,
+    _release_smc_parent_req,
     cleanup_smc_request_state,
 )
 
@@ -274,7 +275,12 @@ class SchedulerOutputProcessorMixin:
                             release_kv_cache(req, self.tree_cache)
                             req.time_stats.set_completion_time()
                         else:
-                            release_kv_cache(req, self.tree_cache, is_insert=False)
+                            _release_smc_parent_req(
+                                req,
+                                tree_cache=self.tree_cache,
+                                req_to_token_pool=self.req_to_token_pool,
+                                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                            )
                             smc_req_indices_to_remove.add(i)
                     elif is_smc and req.smc_particle_idx is not None:
                         if not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -541,6 +547,14 @@ class SchedulerOutputProcessorMixin:
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # (currently not, e.g. Eagle V1 still check finish during forward)
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                if batch.spec_algorithm.is_smc():
+                    if req.finished() and self.smc_manager is not None:
+                        self.smc_manager.on_particle_finished(req)
+                    _release_internal_req(
+                        req,
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    )
                 continue
 
             new_accepted_len = 1
@@ -559,6 +573,13 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if batch.spec_algorithm.is_smc() and self.smc_manager is not None:
+                # Spec-v2 overlap already advanced kv_committed_len in
+                # _resolve_spec_overlap_token_ids(). SMC only needs to keep the
+                # allocated watermark in sync so resample snapshots do not
+                # reinterpret stale speculative slots as committed KV.
+                req.kv_allocated_len = max(
+                    req.kv_allocated_len, req.kv_committed_len
+                )
                 if req.finished():
                     self.smc_manager.on_particle_finished(req)
                 if smc_logprob_diffs is None:
@@ -666,7 +687,7 @@ class SchedulerOutputProcessorMixin:
 
         if (
             batch.spec_algorithm.is_smc()
-            and self.smc_manager is not None
+            and self.smc_scheduler is not None
             and smc_step_reqs
         ):
             assert smc_logprob_diffs is not None
@@ -676,7 +697,7 @@ class SchedulerOutputProcessorMixin:
                 device=smc_logprob_diffs.device,
             )
             smc_finalized_reqs.extend(
-                self.smc_manager.on_particle_step_batch(
+                self.smc_scheduler.on_batch_done(
                     smc_step_reqs,
                     smc_logprob_diffs.index_select(0, row_indices),
                 )

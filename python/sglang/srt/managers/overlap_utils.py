@@ -154,6 +154,9 @@ class FutureMap:
             draft_input = model_worker_batch.spec_info
             if draft_input is None:
                 return
+            if draft_input.future_indices is None:
+                # Direct values already set (e.g. after SMC resample).
+                return
             indices = draft_input.future_indices.indices
             indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.last_token_ids = self.last_token_ids_buf[indices]

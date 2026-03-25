@@ -280,6 +280,83 @@ class SchedulerRuntimeCheckerMixin:
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+            smc_manager = getattr(self, "smc_manager", None)
+            smc_scheduler = getattr(self, "smc_scheduler", None)
+            if smc_manager is not None and smc_manager.groups:
+                group_msgs = []
+                for group_id, group in smc_manager.groups.items():
+                    particle_msgs = []
+                    for particle_idx, req in sorted(group.particle_reqs.items()):
+                        particle_msgs.append(
+                            f"idx={particle_idx} pool={req.req_pool_idx} "
+                            f"finished={req.finished()} committed={req.kv_committed_len} "
+                            f"allocated={req.kv_allocated_len}"
+                        )
+                    group_msgs.append(
+                        f"group={group_id} active={group.active_particle_indices()} "
+                        f"finished={sorted(group.finished_particles.keys())} "
+                        + "; ".join(particle_msgs)
+                    )
+                msg += "SMC_GROUPS:\n" + "\n".join(group_msgs) + "\n"
+            if smc_scheduler is not None:
+                msg += (
+                    f"SMC_BUCKETS: stalled={list(smc_scheduler.resampling_reqs.keys())}, "
+                    f"pending={list(smc_scheduler.pending_resamples.keys())}\n"
+                )
+            tracked_req_msgs = []
+            tracked_rows = set()
+            tracked_sources = [
+                ("running", getattr(getattr(self, "running_batch", None), "reqs", [])),
+                ("waiting", getattr(self, "waiting_queue", [])),
+                ("last", getattr(getattr(self, "last_batch", None), "reqs", [])),
+                ("cur", getattr(getattr(self, "cur_batch", None), "reqs", [])),
+            ]
+            for source, reqs in tracked_sources:
+                for req in reqs:
+                    req_pool_idx = getattr(req, "req_pool_idx", None)
+                    if req_pool_idx is None:
+                        continue
+                    tracked_rows.add(int(req_pool_idx))
+                    tracked_req_msgs.append(
+                        f"{source}: rid={getattr(req, 'rid', None)} "
+                        f"pool={req_pool_idx} finished={req.finished()} "
+                        f"committed={req.kv_committed_len} "
+                        f"allocated={req.kv_allocated_len} "
+                        f"group={getattr(req, 'smc_group_id', None)} "
+                        f"particle={getattr(req, 'smc_particle_idx', None)}"
+                    )
+            if tracked_req_msgs:
+                msg += "TRACKED_REQS:\n" + "\n".join(tracked_req_msgs[:64]) + "\n"
+            allocator = getattr(self, "token_to_kv_pool_allocator", None)
+            req_to_token_pool = getattr(self, "req_to_token_pool", None)
+            if (
+                allocator is not None
+                and req_to_token_pool is not None
+                and hasattr(allocator, "slot_ref_count")
+            ):
+                occupied_rows = sorted(
+                    set(range(req_to_token_pool.size))
+                    - set(req_to_token_pool.free_slots)
+                )
+                if occupied_rows:
+                    msg += (
+                        "OCCUPIED_REQ_ROWS: "
+                        + str(occupied_rows[:64])
+                        + (
+                            " (untracked rows="
+                            + str(
+                                [
+                                    row
+                                    for row in occupied_rows
+                                    if row not in tracked_rows
+                                ][:64]
+                            )
+                            + ")"
+                            if tracked_rows
+                            else ""
+                        )
+                        + "\n"
+                    )
             raise_error_or_warn(
                 self,
                 envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),

@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
+
+import torch
+
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.speculative.smc_info import (
+    effective_sample_size,
+    get_smc_reserved_kv_len,
+    multinomial_resample,
+    normalize_log_weights,
+    set_smc_reserved_kv_len,
+    systematic_resample,
+)
+@dataclass
+class PendingResample:
+    group_id: str
+    dst_reqs: List[Req] = field(default_factory=list)
+    src_snapshots: List[dict] = field(default_factory=list)
+    inc_ref: List[torch.Tensor] = field(default_factory=list)
+    dec_ref: List[torch.Tensor] = field(default_factory=list)
+    done_event: Optional[torch.cuda.Event] = None
+
+
+class SMCScheduler:
+    def __init__(self, smc_manager, device):
+        self.smc_manager = smc_manager
+        self.device = device
+        self.device_module = None
+        self.resample_stream = None
+        self.resampling_reqs: Dict[str, List[Req]] = {}
+        self.pending_resamples: Dict[str, PendingResample] = {}
+        self._groups_needing_resample: Set[str] = set()
+
+    def init_streams(self, enable_overlap: bool) -> None:
+        self.device_module = torch.get_device_module(self.device)
+        if not enable_overlap or str(self.device) == "cpu":
+            self.resample_stream = None
+            return
+        self.resample_stream = self.device_module.Stream(priority=0)
+
+    def clear(self) -> None:
+        self.resampling_reqs.clear()
+        self.pending_resamples.clear()
+        self._groups_needing_resample.clear()
+
+    def step(self, scheduler) -> None:
+        self._sync_completed_resamples(scheduler)
+        self._launch_pending_resamples(scheduler)
+
+    def on_batch_done(
+        self,
+        reqs: List[Req],
+        logprob_diffs: torch.Tensor,
+    ) -> List[Req]:
+        if not reqs:
+            return []
+
+        if not torch.is_tensor(logprob_diffs):
+            logprob_diffs = torch.as_tensor(logprob_diffs, dtype=torch.float32)
+
+        grouped_reqs: Dict[str, List[tuple[int, Req]]] = {}
+        for row, req in enumerate(reqs):
+            group_id = req.smc_group_id
+            if group_id is None or self.smc_manager.get_group(group_id) is None:
+                continue
+            grouped_reqs.setdefault(group_id, []).append((row, req))
+
+        finalized_reqs: List[Req] = []
+        for group_id, entries in grouped_reqs.items():
+            group = self.smc_manager.get_group(group_id)
+            if group is None:
+                continue
+
+            row_indices = torch.tensor(
+                [row for row, _ in entries],
+                dtype=torch.int64,
+                device=logprob_diffs.device,
+            )
+            particle_indices = torch.tensor(
+                [req.smc_particle_idx for _, req in entries],
+                dtype=torch.int64,
+                device=group.log_weights.device,
+            )
+            group.log_weights[particle_indices] += logprob_diffs.index_select(
+                0, row_indices
+            ).to(
+                dtype=group.log_weights.dtype,
+                device=group.log_weights.device,
+            )
+            for _, req in entries:
+                particle_idx = req.smc_particle_idx
+                group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
+
+            if not group.all_active_aligned():
+                continue
+
+            active_indices = group.active_particle_indices()
+            if active_indices:
+                group.resampled_at_step = group.step_counts[active_indices[0]]
+                if self._should_resample(group, active_indices):
+                    self._groups_needing_resample.add(group_id)
+            else:
+                finalized_req = self.smc_manager._finalize_group(group_id)
+                if finalized_req is not None:
+                    finalized_reqs.append(finalized_req)
+
+        return finalized_reqs
+
+    def _should_resample(self, group, active_indices: List[int]) -> bool:
+        if len(active_indices) <= 1:
+            return False
+
+        normalized_weights = normalize_log_weights(
+            group.log_weights[active_indices],
+            device=self.device,
+        )
+        ess = effective_sample_size(normalized_weights, device=self.device)
+        return ess < len(active_indices) * self.smc_manager.server_args.smc_resample_threshold
+
+    def _launch_pending_resamples(self, scheduler) -> None:
+        group_ids = list(self._groups_needing_resample)
+        self._groups_needing_resample.clear()
+
+        for group_id in group_ids:
+            if group_id in self.pending_resamples:
+                continue
+
+            group = self.smc_manager.get_group(group_id)
+            if group is None:
+                continue
+
+            active_indices = group.active_particle_indices()
+            if len(active_indices) <= 1:
+                continue
+
+            ancestors = self._sample_ancestors(group, active_indices)
+            active_tensor = torch.tensor(
+                active_indices,
+                dtype=torch.int64,
+                device=group.log_weights.device,
+            )
+            group.log_weights[active_tensor] = 0.0
+
+            evictions = [
+                (dst_idx, active_indices[src_pos])
+                for dst_idx, src_pos in zip(active_indices, ancestors, strict=True)
+                if dst_idx != active_indices[src_pos]
+            ]
+            if not evictions:
+                continue
+
+            stalled_reqs = [group.particle_reqs[idx] for idx in active_indices]
+            self._stall_group_reqs(group_id, stalled_reqs, scheduler)
+
+            pending = PendingResample(group_id=group_id)
+            if self.resample_stream is None:
+                self._prepare_pending_resample(group, evictions, scheduler, pending)
+                self.pending_resamples[group_id] = pending
+                self._complete_resample(group_id, pending, scheduler)
+                continue
+
+            with self.device_module.stream(self.resample_stream):
+                self._prepare_pending_resample(group, evictions, scheduler, pending)
+                pending.done_event = self.device_module.Event()
+                pending.done_event.record()
+
+            self.pending_resamples[group_id] = pending
+
+    def _sync_completed_resamples(self, scheduler) -> None:
+        for group_id, pending in list(self.pending_resamples.items()):
+            if pending.done_event is not None and not pending.done_event.query():
+                continue
+            self._complete_resample(group_id, pending, scheduler)
+
+    def _complete_resample(self, group_id: str, pending: PendingResample, scheduler) -> None:
+        if pending.done_event is not None:
+            scheduler.schedule_stream.wait_event(pending.done_event)
+
+        for indices in pending.inc_ref:
+            scheduler.token_to_kv_pool_allocator.inc_ref(indices)
+        for indices in pending.dec_ref:
+            scheduler.token_to_kv_pool_allocator.dec_ref_and_free(indices)
+
+        for dst_req, snapshot in zip(
+            pending.dst_reqs,
+            pending.src_snapshots,
+            strict=True,
+        ):
+            self._restore_req_state(dst_req, snapshot)
+
+        stalled_reqs = self.resampling_reqs.pop(group_id)
+        resumed_batch = self.smc_manager._build_particle_batch(
+            stalled_reqs,
+            scheduler,
+            use_future_map=self._running_batch_uses_future_indices(
+                scheduler.running_batch
+            ),
+        )
+        if scheduler.running_batch.is_empty():
+            scheduler.running_batch = resumed_batch
+        else:
+            scheduler.running_batch.merge_batch(resumed_batch)
+
+        del self.pending_resamples[group_id]
+
+    def _sample_ancestors(self, group, active_indices: List[int]) -> List[int]:
+        normalized_weights = normalize_log_weights(
+            group.log_weights[active_indices],
+            device=self.device,
+        )
+        if self.smc_manager.server_args.smc_resample_method == "multinomial":
+            return multinomial_resample(normalized_weights, device=self.device)
+        return systematic_resample(normalized_weights, device=self.device)
+
+    def _stall_group_reqs(
+        self,
+        group_id: str,
+        stalled_reqs: List[Req],
+        scheduler,
+    ) -> None:
+        self._trim_stale_overalloc(stalled_reqs, scheduler)
+
+        stalled_req_ids = {id(req) for req in stalled_reqs}
+        keep_indices = [
+            idx
+            for idx, req in enumerate(scheduler.running_batch.reqs)
+            if id(req) not in stalled_req_ids
+        ]
+        if len(keep_indices) + len(stalled_reqs) != len(scheduler.running_batch.reqs):
+            raise RuntimeError(
+                f"SMC group {group_id} could not be isolated from running_batch for resampling."
+            )
+
+        batch_is_full = scheduler.running_batch.batch_is_full
+        scheduler.running_batch.filter_batch(keep_indices=keep_indices)
+        scheduler.running_batch.batch_is_full = False
+        if not keep_indices:
+            scheduler.running_batch = ScheduleBatch(
+                reqs=[],
+                batch_is_full=batch_is_full,
+            )
+            scheduler.running_batch.batch_is_full = False
+
+        self.resampling_reqs[group_id] = stalled_reqs
+
+    def _trim_stale_overalloc(self, reqs: List[Req], scheduler) -> None:
+        for req in reqs:
+            reserved_len = get_smc_reserved_kv_len(req)
+            if reserved_len <= req.kv_committed_len:
+                continue
+            indices_to_free = scheduler.req_to_token_pool.req_to_token[
+                req.req_pool_idx,
+                req.kv_committed_len:reserved_len,
+            ].to(dtype=torch.int64, copy=True)
+            scheduler.token_to_kv_pool_allocator.dec_ref_and_free(indices_to_free)
+            req.kv_allocated_len = req.kv_committed_len
+            set_smc_reserved_kv_len(req, req.kv_committed_len)
+
+    def _prepare_pending_resample(
+        self,
+        group,
+        evictions: List[tuple[int, int]],
+        scheduler,
+        pending: PendingResample,
+    ) -> None:
+        req_to_token = scheduler.req_to_token_pool.req_to_token
+        staged_snapshots: Dict[int, dict] = {}
+        staged_copies: Dict[int, torch.Tensor] = {}
+        staged_actions: List[tuple[Req, int, int]] = []
+
+        for dst_idx, src_idx in evictions:
+            dst_req = group.particle_reqs[dst_idx]
+            src_req = group.particle_reqs[src_idx]
+            src_len = src_req.kv_committed_len
+
+            dst_reserved_len = get_smc_reserved_kv_len(dst_req)
+            if dst_reserved_len > 0:
+                pending.dec_ref.append(
+                    req_to_token[
+                        dst_req.req_pool_idx, :dst_reserved_len
+                    ].to(dtype=torch.int64, copy=True)
+                )
+
+            if src_idx not in staged_snapshots:
+                staged_snapshots[src_idx] = self._snapshot_req_state(src_req)
+                if src_len > 0:
+                    staged_copies[src_idx] = req_to_token[
+                        src_req.req_pool_idx, :src_len
+                    ].to(dtype=torch.int64, copy=True)
+                else:
+                    staged_copies[src_idx] = torch.empty(
+                        (0,),
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+
+            staged_actions.append((dst_req, src_idx, src_len))
+
+        for dst_req, src_idx, src_len in staged_actions:
+            copied_indices = staged_copies[src_idx]
+            if src_len > 0:
+                scheduler.req_to_token_pool.write(
+                    (dst_req.req_pool_idx, slice(0, src_len)),
+                    copied_indices.to(dtype=torch.int32),
+                )
+                pending.inc_ref.append(copied_indices)
+
+            pending.dst_reqs.append(dst_req)
+            pending.src_snapshots.append(staged_snapshots[src_idx])
+
+    def _snapshot_req_state(self, req: Req) -> dict:
+        seq_len = req.kv_committed_len
+        if seq_len > 0:
+            indices = self.smc_manager.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :seq_len
+            ].to(dtype=torch.int64, copy=True)
+        else:
+            indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        return {
+            "indices": indices,
+            "output_ids": list(req.output_ids),
+            "finished_reason": copy.copy(req.finished_reason),
+            "finished_len": req.finished_len,
+            "finished_output": req.finished_output,
+            "to_finish": copy.copy(req.to_finish),
+            "kv_committed_len": req.kv_committed_len,
+            "cache_protected_len": req.cache_protected_len,
+            "logprob_start_len": req.logprob_start_len,
+            "draft_prefix_materialized": req.draft_prefix_materialized,
+        }
+
+    def _restore_req_state(self, req: Req, snapshot: dict) -> None:
+        indices = snapshot["indices"]
+        if indices.numel() > 0:
+            req.prefix_indices = indices.to(dtype=torch.int64, copy=True)
+        else:
+            req.prefix_indices = torch.empty((0,), dtype=torch.int64, device=indices.device)
+
+        req.output_ids = list(snapshot["output_ids"])
+        req.finished_reason = copy.copy(snapshot["finished_reason"])
+        req.finished_len = snapshot["finished_len"]
+        req.finished_output = snapshot["finished_output"]
+        req.to_finish = copy.copy(snapshot["to_finish"])
+        req.kv_committed_len = snapshot["kv_committed_len"]
+        req.kv_allocated_len = snapshot["kv_committed_len"]
+        set_smc_reserved_kv_len(req, snapshot["kv_committed_len"])
+        req.cache_protected_len = snapshot["cache_protected_len"]
+        req.logprob_start_len = snapshot["logprob_start_len"]
+        req.draft_prefix_materialized = snapshot["draft_prefix_materialized"]
+
+    def _running_batch_uses_future_indices(self, running_batch) -> bool:
+        if running_batch is None or running_batch.is_empty():
+            return False
+        spec_info = getattr(running_batch, "spec_info", None)
+        return getattr(spec_info, "future_indices", None) is not None

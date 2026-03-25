@@ -331,10 +331,13 @@ class Scheduler(
             server_args.speculative_algorithm
         )
         self.smc_manager = None
+        self.smc_scheduler = None
         if self.spec_algorithm.is_smc():
             from sglang.srt.speculative.smc_manager import SMCManager
+            from sglang.srt.speculative.smc_scheduler import SMCScheduler
 
             self.smc_manager = SMCManager(server_args)
+            self.smc_scheduler = SMCScheduler(self.smc_manager, device=None)
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -1055,6 +1058,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
+        if self.smc_scheduler is not None:
+            self.smc_scheduler.device = self.device
+            self.smc_scheduler.init_streams(enable_overlap=self.enable_overlap)
 
         if not self.enable_overlap:
             self.future_map = None
@@ -1261,6 +1267,9 @@ class Scheduler(
                 self.cancel_bubble_timer()
                 continue
 
+            if self.smc_scheduler is not None:
+                self.smc_scheduler.step(self)
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1297,6 +1306,19 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            processed_last_batch = False
+            if (
+                self.last_batch is not None
+                and self.last_batch.forward_mode.is_decode()
+                and self.last_batch.spec_algorithm.is_smc()
+                and len(self.result_queue) > 0
+            ):
+                pop_and_process()
+                processed_last_batch = True
+
+            if self.smc_scheduler is not None:
+                self.smc_scheduler.step(self)
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1309,8 +1331,9 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and self.last_batch and not processed_last_batch:
                 pop_and_process()
+                processed_last_batch = True
 
             # Launch the current batch
             if batch:
@@ -1323,8 +1346,9 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not processed_last_batch:
                     pop_and_process()
+                    processed_last_batch = True
                 elif batch is None:
                     # When the server is idle, do self-check and re-init some states
                     self.self_check_during_idle()
@@ -3073,6 +3097,8 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.reset_metrics()
+            if self.smc_scheduler is not None:
+                self.smc_scheduler.clear()
             if self.smc_manager is not None:
                 self.smc_manager.clear()
 

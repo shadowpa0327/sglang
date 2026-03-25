@@ -17,10 +17,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
     clone_req_for_smc_particle,
-    effective_sample_size,
-    multinomial_resample,
-    normalize_log_weights,
-    systematic_resample,
+    set_smc_reserved_kv_len,
     validate_smc_parent_req,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -61,6 +58,13 @@ class SMCGroupState:
         counts = [self.step_counts.get(idx, 0) for idx in active]
         # All must be at the same step and ahead of last resample point
         return len(set(counts)) == 1 and counts[0] > self.resampled_at_step
+
+
+def _running_batch_uses_future_indices(running_batch) -> bool:
+    if running_batch is None or running_batch.is_empty():
+        return False
+    spec_info = getattr(running_batch, "spec_info", None)
+    return getattr(spec_info, "future_indices", None) is not None
 
 
 class SMCManager:
@@ -184,6 +188,7 @@ class SMCManager:
             )
             particle_req.kv_committed_len = shared_seq_len
             particle_req.kv_allocated_len = shared_seq_len
+            set_smc_reserved_kv_len(particle_req, shared_seq_len)
             particle_req.prefix_indices = scheduler.req_to_token_pool.req_to_token[
                 particle_req.req_pool_idx, :shared_seq_len
             ].to(dtype=torch.int64, copy=True)
@@ -203,14 +208,23 @@ class SMCManager:
         )
         self.groups[parent_req.rid] = group
 
-        particle_batch = self._build_particle_batch(particle_reqs, scheduler)
+        particle_batch = self._build_particle_batch(
+            particle_reqs,
+            scheduler,
+            use_future_map=_running_batch_uses_future_indices(scheduler.running_batch),
+        )
         if scheduler.running_batch.is_empty():
             scheduler.running_batch = particle_batch
         else:
             scheduler.running_batch.merge_batch(particle_batch)
         return None
 
-    def _build_particle_batch(self, particle_reqs: List[Req], scheduler) -> ScheduleBatch:
+    def _build_particle_batch(
+        self,
+        particle_reqs: List[Req],
+        scheduler,
+        use_future_map: bool = True,
+    ) -> ScheduleBatch:
         batch = ScheduleBatch.init_new(
             reqs=particle_reqs,
             req_to_token_pool=scheduler.req_to_token_pool,
@@ -255,7 +269,7 @@ class SMCManager:
             last_token_ids=last_token_ids,
             new_seq_lens=visible_seq_lens,
         )
-        if scheduler.enable_overlap and scheduler.future_map is not None:
+        if use_future_map and scheduler.enable_overlap and scheduler.future_map is not None:
             future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))
             scheduler.future_map.store_to_map_for_new_smc_batch(
                 future_indices,
@@ -280,175 +294,6 @@ class SMCManager:
             finished_reason=copy.copy(req.finished_reason),
             finished_len=req.finished_len,
         )
-
-    def on_particle_step(self, req: Req, logprob_diff: float | torch.Tensor) -> Optional[Req]:
-        group = self.groups.get(req.smc_group_id)
-        if group is None:
-            return None
-
-        particle_idx = req.smc_particle_idx
-        group.log_weights[particle_idx].add_(
-            torch.as_tensor(
-                logprob_diff,
-                dtype=group.log_weights.dtype,
-                device=group.log_weights.device,
-            )
-        )
-        group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
-
-        if not group.all_active_aligned():
-            return None
-
-        self._maybe_resample(group)
-        # Record the step at which we resampled so we can detect the next round
-        active = group.active_particle_indices()
-        if active:
-            group.resampled_at_step = group.step_counts[active[0]]
-
-        if not active:
-            return self._finalize_group(group.group_id)
-        return None
-
-    def on_particle_step_batch(
-        self,
-        reqs: List[Req],
-        logprob_diffs: torch.Tensor,
-    ) -> List[Req]:
-        if not reqs:
-            return []
-
-        if not torch.is_tensor(logprob_diffs):
-            logprob_diffs = torch.as_tensor(logprob_diffs, dtype=torch.float32)
-
-        grouped_reqs: Dict[str, List[tuple[int, Req]]] = {}
-        for row, req in enumerate(reqs):
-            group_id = req.smc_group_id
-            if group_id is None or group_id not in self.groups:
-                continue
-            grouped_reqs.setdefault(group_id, []).append((row, req))
-
-        finalized_reqs: List[Req] = []
-        for group_id, entries in grouped_reqs.items():
-            group = self.groups.get(group_id)
-            if group is None:
-                continue
-
-            row_indices = torch.tensor(
-                [row for row, _ in entries],
-                dtype=torch.int64,
-                device=logprob_diffs.device,
-            )
-            particle_indices = torch.tensor(
-                [req.smc_particle_idx for _, req in entries],
-                dtype=torch.int64,
-                device=group.log_weights.device,
-            )
-            group.log_weights[particle_indices] += logprob_diffs[row_indices].to(
-                dtype=group.log_weights.dtype,
-                device=group.log_weights.device,
-            )
-            for _, req in entries:
-                particle_idx = req.smc_particle_idx
-                group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
-
-            if not group.all_active_aligned():
-                continue
-
-            self._maybe_resample(group)
-            active = group.active_particle_indices()
-            if active:
-                group.resampled_at_step = group.step_counts[active[0]]
-            else:
-                finalized_req = self._finalize_group(group_id)
-                if finalized_req is not None:
-                    finalized_reqs.append(finalized_req)
-
-        return finalized_reqs
-
-    def _maybe_resample(self, group: SMCGroupState) -> None:
-        active_indices = group.active_particle_indices()
-        if len(active_indices) <= 1:
-            return
-
-        normalized_weights = normalize_log_weights(
-            group.log_weights[active_indices],
-            device=self.device,
-        )
-        ess = effective_sample_size(normalized_weights, device=self.device)
-        if ess >= len(active_indices) * self.server_args.smc_resample_threshold:
-            return
-
-        if self.server_args.smc_resample_method == "multinomial":
-            ancestors = multinomial_resample(normalized_weights, device=self.device)
-        else:
-            ancestors = systematic_resample(normalized_weights, device=self.device)
-
-        source_indices = [active_indices[idx] for idx in ancestors]
-        snapshots = [
-            self._snapshot_req_state(group.particle_reqs[idx]) for idx in source_indices
-        ]
-        for dst_idx, snapshot in zip(active_indices, snapshots, strict=True):
-            dst_req = group.particle_reqs[dst_idx]
-            self._restore_req_state(dst_req, snapshot)
-            group.log_weights[dst_idx] = 0.0
-        for snapshot in snapshots:
-            self._release_snapshot(snapshot)
-
-    def _snapshot_req_state(self, req: Req) -> dict:
-        seq_len = req.kv_committed_len
-        if seq_len > 0:
-            indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :seq_len
-            ].to(dtype=torch.int64, copy=True)
-            self.token_to_kv_pool_allocator.inc_ref(indices)
-        else:
-            indices = torch.empty((0,), dtype=torch.int64)
-        return {
-            "indices": indices,
-            "output_ids": list(req.output_ids),
-            "finished_reason": copy.copy(req.finished_reason),
-            "finished_len": req.finished_len,
-            "finished_output": req.finished_output,
-            "to_finish": copy.copy(req.to_finish),
-            "kv_committed_len": req.kv_committed_len,
-            "cache_protected_len": req.cache_protected_len,
-            "logprob_start_len": req.logprob_start_len,
-            "draft_prefix_materialized": req.draft_prefix_materialized,
-        }
-
-    def _restore_req_state(self, req: Req, snapshot: dict) -> None:
-        if req.kv_allocated_len > 0:
-            old_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_allocated_len
-            ].to(dtype=torch.int64, copy=True)
-            self.token_to_kv_pool_allocator.dec_ref_and_free(old_indices)
-
-        indices = snapshot["indices"]
-        if indices.numel() > 0:
-            self.token_to_kv_pool_allocator.inc_ref(indices)
-            self.req_to_token_pool.write(
-                (req.req_pool_idx, slice(0, indices.shape[0])),
-                indices.to(torch.int32),
-            )
-            req.prefix_indices = indices.to(dtype=torch.int64, copy=True)
-        else:
-            req.prefix_indices = torch.empty((0,), dtype=torch.int64)
-
-        req.output_ids = list(snapshot["output_ids"])
-        req.finished_reason = copy.copy(snapshot["finished_reason"])
-        req.finished_len = snapshot["finished_len"]
-        req.finished_output = snapshot["finished_output"]
-        req.to_finish = copy.copy(snapshot["to_finish"])
-        req.kv_committed_len = snapshot["kv_committed_len"]
-        req.kv_allocated_len = snapshot["kv_committed_len"]
-        req.cache_protected_len = snapshot["cache_protected_len"]
-        req.logprob_start_len = snapshot["logprob_start_len"]
-        req.draft_prefix_materialized = snapshot["draft_prefix_materialized"]
-
-    def _release_snapshot(self, snapshot: dict) -> None:
-        indices = snapshot["indices"]
-        if indices.numel() > 0:
-            self.token_to_kv_pool_allocator.dec_ref_and_free(indices)
 
     def _finalize_group(self, group_id: str) -> Optional[Req]:
         group = self.groups.pop(group_id, None)

@@ -24,7 +24,9 @@ from sglang.srt.speculative.smc_info import (
     SMC_MIN_TEMPERATURE,
     SMCScoreInput,
     build_smc_positions,
+    get_smc_reserved_kv_len,
     resolve_smc_proposal_length,
+    set_smc_reserved_kv_len,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.standalone_worker_v2 import (
@@ -205,28 +207,25 @@ class SMCWorkerV2(EAGLEWorkerV2):
 
         self._ensure_draft_prefix_filled(reqs, draft_committed_lens_cpu.tolist())
 
-        if self._can_use_fused_draft_cuda_graph(reqs, batch.sampling_info):
-            model_worker_batch = (
-                batch if is_overlap_batch else batch.get_model_worker_batch()
-            )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        model_worker_batch = batch if is_overlap_batch else batch.get_model_worker_batch()
+        with self.draft_worker.draft_tp_context(
+            self.draft_worker.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            if self._can_use_fused_draft_cuda_graph(reqs, batch.sampling_info):
                 (
                     draft_tokens,
                     draft_logprobs,
                     draft_lengths,
+                    draft_can_run_cuda_graph,
                 ) = self._run_fused_draft_reqs(
                     reqs,
                     model_worker_batch,
                     last_token_ids,
                     model_worker_batch.sampling_info,
+                    visible_seq_lens,
+                    draft_committed_lens,
                 )
-            draft_can_run_cuda_graph = True
-        else:
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            else:
                 (
                     draft_tokens,
                     draft_logprobs,
@@ -427,6 +426,8 @@ class SMCWorkerV2(EAGLEWorkerV2):
         model_worker_batch: ModelWorkerBatch,
         last_token_ids: torch.Tensor,
         draft_sampling_info: SamplingBatchInfo,
+        visible_seq_lens: torch.Tensor,
+        draft_committed_lens: torch.Tensor,
     ):
         runner = self.draft_worker.smc_draft_cuda_graph_runner
         draft_input = SMCDraftInput(
@@ -442,8 +443,14 @@ class SMCWorkerV2(EAGLEWorkerV2):
             draft_sampling_info=draft_sampling_info,
         )
         if not can_cuda_graph:
-            raise RuntimeError(
-                "SMC fused draft path requires CUDA graph support but can_run returned False."
+            # Large or mixed batches can still fail the exact replay check even after
+            # supports_replay() passes. Fall back to the stepwise draft path instead
+            # of tearing down the server.
+            return self._run_stepwise_draft_reqs(
+                reqs,
+                visible_seq_lens,
+                draft_committed_lens,
+                last_token_ids,
             )
         token_matrix, logprob_matrix = runner.replay(forward_batch)
         bs = token_matrix.shape[0]
@@ -451,7 +458,7 @@ class SMCWorkerV2(EAGLEWorkerV2):
             (bs,), self.smc_gamma, dtype=torch.int32, device=self.device
         )
         draft_logprobs = logprob_matrix.sum(dim=1)
-        return token_matrix, draft_logprobs, draft_lengths
+        return token_matrix, draft_logprobs, draft_lengths, True
 
     def _run_stepwise_draft_reqs(
         self,
@@ -482,11 +489,23 @@ class SMCWorkerV2(EAGLEWorkerV2):
             seed_token_ids,
             strict=True,
         ):
+            snapshot_allocated_len = get_smc_reserved_kv_len(req)
+            if snapshot_allocated_len > 0:
+                snapshot_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :snapshot_allocated_len
+                ].to(dtype=torch.int64, copy=True)
+            else:
+                snapshot_indices = torch.empty(
+                    (0,),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
             snapshots.append(
                 {
+                    "indices": snapshot_indices,
                     "output_ids": list(req.output_ids),
                     "kv_committed_len": req.kv_committed_len,
-                    "kv_allocated_len": req.kv_allocated_len,
+                    "kv_allocated_len": snapshot_allocated_len,
                     "finished_reason": copy.copy(req.finished_reason),
                     "finished_len": req.finished_len,
                     "finished_output": req.finished_output,
@@ -537,9 +556,44 @@ class SMCWorkerV2(EAGLEWorkerV2):
                 draft_finished[row_idx] = proposal_finished
 
         for req, snapshot in zip(reqs, snapshots, strict=True):
+            snapshot_indices = snapshot["indices"]
+            snapshot_allocated_len = snapshot["kv_allocated_len"]
+            current_allocated_len = req.kv_allocated_len
+            indices_to_free = []
+            if current_allocated_len > 0:
+                current_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :current_allocated_len
+                ].to(dtype=torch.int64, copy=True)
+            else:
+                current_indices = torch.empty(
+                    (0,),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+
+            if snapshot_allocated_len > 0:
+                current_prefix = current_indices[:snapshot_allocated_len]
+                changed_mask = current_prefix != snapshot_indices
+                if bool(changed_mask.any().item()):
+                    indices_to_free.append(current_prefix[changed_mask])
+                    self.req_to_token_pool.write(
+                        (req.req_pool_idx, slice(0, snapshot_allocated_len)),
+                        snapshot_indices.to(dtype=torch.int32),
+                    )
+
+            if current_allocated_len > snapshot_allocated_len:
+                indices_to_free.append(
+                    current_indices[snapshot_allocated_len:current_allocated_len]
+                )
+
+            if indices_to_free:
+                self.token_to_kv_pool_allocator.dec_ref_and_free(
+                    torch.cat(indices_to_free)
+                )
             req.output_ids = snapshot["output_ids"]
             req.kv_committed_len = snapshot["kv_committed_len"]
-            req.kv_allocated_len = snapshot["kv_allocated_len"]
+            req.kv_allocated_len = snapshot_allocated_len
+            set_smc_reserved_kv_len(req, snapshot_allocated_len)
             req.finished_reason = snapshot["finished_reason"]
             req.finished_len = snapshot["finished_len"]
             req.finished_output = snapshot["finished_output"]
@@ -587,10 +641,16 @@ class SMCWorkerV2(EAGLEWorkerV2):
         # Non-CG fallback needs it applied here so sample() gets log_probs.
         if not can_run_cuda_graph:
             logits = forward_output.logits_output.next_token_logits
+            logits = logits.view(
+                score_input.draft_lengths.shape[0],
+                score_input.draft_token_num,
+                -1,
+            )
             forward_output.logits_output.next_token_logits = (
                 torch.nn.functional.log_softmax(
                     logits / score_input.target_temperature, dim=-1
                 )
+                .view_as(forward_output.logits_output.next_token_logits)
             )
         (
             accept_lens,
@@ -671,6 +731,9 @@ class SMCWorkerV2(EAGLEWorkerV2):
             positions=build_smc_positions(seq_lens, score_token_num),
             custom_mask=custom_mask,
             draft_token_num=score_token_num,
+            # (ccc) SMC target verify intentionally uses one global target
+            # temperature. Do not reintroduce per-request verify temperatures
+            # without updating both the eager and CUDA-graph paths together.
             target_temperature=max(
                 float(self.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
             ),
@@ -726,5 +789,25 @@ class SMCWorkerV2(EAGLEWorkerV2):
             batch,
             model_config.vocab_size,
         )
+        decode_locs = batch.seq_lens.clone()
+        reserved_out_cache_loc = self.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, decode_locs
+        ].to(dtype=torch.int64, copy=True)
         batch.prepare_for_decode()
+        new_out_cache_loc = batch.out_cache_loc
+        self.req_to_token_pool.write(
+            (batch.req_pool_indices, decode_locs),
+            reserved_out_cache_loc.to(dtype=torch.int32),
+        )
+        self.token_to_kv_pool_allocator.dec_ref_and_free(
+            new_out_cache_loc.to(dtype=torch.int64, copy=True)
+        )
+        batch.out_cache_loc = reserved_out_cache_loc
+
+        for req in reqs:
+            req.kv_allocated_len = max(
+                get_smc_reserved_kv_len(req),
+                req.kv_committed_len,
+            )
+
         return batch

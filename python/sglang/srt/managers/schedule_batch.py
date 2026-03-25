@@ -2002,7 +2002,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if req.smc_particle_idx is not None:
+            from sglang.srt.speculative.smc_info import _release_internal_req
+
+            _release_internal_req(
+                req,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+        else:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
