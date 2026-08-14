@@ -1,8 +1,12 @@
 """Unit tests for srt/mem_cache/hiradix_cache.py KV cache events."""
 
+import json
 import os
 import unittest
 from array import array
+from queue import Queue
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -21,6 +25,141 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 
 PAGE_SIZE = 2
+
+
+class TestHiRadixCacheRuntimeSnapshot(CustomTestCase):
+    @staticmethod
+    def _queue(size):
+        queue = Queue()
+        for item in range(size):
+            queue.put(item)
+        return queue
+
+    def _cache(self):
+        cache = object.__new__(HiRadixCache)
+        cache.enable_storage = True
+        cache.eviction_policy = "lru"
+        cache._device_evicted_tokens = 0
+        cache._host_evicted_tokens = 0
+        cache._dropped_tokens = 0
+        cache.ongoing_write_through = {1: object(), 2: object()}
+        cache.ongoing_load_back = {3: object()}
+        cache.ongoing_prefetch = {"request": object()}
+        cache.ongoing_backup = {4: object()}
+        cache.work_list = [object()]
+        cache.cache_controller = SimpleNamespace(
+            write_queue=[object()],
+            load_queue=[],
+            ack_write_queue=[object(), object()],
+            ack_load_queue=[],
+            prefetch_queue=self._queue(3),
+            backup_queue=self._queue(1),
+            prefetch_hit_queue=self._queue(2),
+            ack_backup_queue=self._queue(1),
+            host_mem_release_queue=self._queue(4),
+            prefetch_buffer=self._queue(2),
+            extra_host_mem_release_queues={
+                "draft": self._queue(2),
+                "indexer": self._queue(1),
+            },
+        )
+        return cache
+
+    def test_runtime_snapshot_reports_all_activity(self):
+        snapshot = self._cache().hicache_runtime_snapshot()
+
+        json.dumps(snapshot)
+        self.assertEqual(snapshot["schema_version"], 1)
+        self.assertEqual(snapshot["backend"], "hiradix")
+        self.assertTrue(snapshot["enabled"])
+        self.assertTrue(snapshot["storage_enabled"])
+        self.assertEqual(snapshot["radix_eviction_policy"], "lru")
+        self.assertEqual(
+            snapshot["eviction_counters"],
+            {
+                "device_evicted_tokens": 0,
+                "host_evicted_tokens": 0,
+                "dropped_tokens": 0,
+            },
+        )
+        self.assertEqual(
+            snapshot["ongoing"],
+            {
+                "write": 2,
+                "load": 1,
+                "prefetch": 1,
+                "backup": 1,
+                "work": 1,
+            },
+        )
+        self.assertEqual(snapshot["controller_queues"]["ack_write_queue"], 2)
+        self.assertEqual(snapshot["controller_queues"]["prefetch_queue"], 3)
+        self.assertEqual(snapshot["controller_queues"]["prefetch_buffer"], 2)
+        self.assertEqual(snapshot["controller_queues"]["extra_host_mem_release"], 3)
+        self.assertFalse(snapshot["quiescent"])
+
+    def test_runtime_snapshot_marks_empty_controller_quiescent(self):
+        cache = self._cache()
+        cache.enable_storage = False
+        cache.ongoing_write_through.clear()
+        cache.ongoing_load_back.clear()
+        cache.ongoing_prefetch.clear()
+        cache.ongoing_backup.clear()
+        cache.work_list.clear()
+        cache.cache_controller = SimpleNamespace(
+            write_queue=[],
+            load_queue=[],
+            ack_write_queue=[],
+            ack_load_queue=[],
+        )
+
+        snapshot = cache.hicache_runtime_snapshot()
+
+        self.assertFalse(snapshot["storage_enabled"])
+        self.assertTrue(snapshot["quiescent"])
+        self.assertTrue(
+            all(count == 0 for count in snapshot["controller_queues"].values())
+        )
+
+    def test_lifetime_eviction_counters_are_monotonic(self):
+        cache = self._cache()
+
+        cache._record_evicted_tokens(device=8, dropped=4)
+        cache._record_evicted_tokens(device=2, host=6, dropped=2)
+
+        self.assertEqual(
+            cache.hicache_runtime_snapshot()["eviction_counters"],
+            {
+                "device_evicted_tokens": 10,
+                "host_evicted_tokens": 6,
+                "dropped_tokens": 6,
+            },
+        )
+        with self.assertRaises(ValueError):
+            cache._record_evicted_tokens(host=-1)
+
+    def test_regular_unbacked_eviction_records_device_release_and_drop(self):
+        cache = self._cache()
+        cache.cache_controller.mem_pool_device_allocator = SimpleNamespace(
+            free=mock.Mock()
+        )
+        cache._record_remove_event = mock.Mock()
+        cache._delete_leaf = mock.Mock()
+        node = SimpleNamespace(children={}, value=torch.arange(4), id=17)
+
+        self.assertEqual(cache._evict_regular(node), 4)
+
+        cache.cache_controller.mem_pool_device_allocator.free.assert_called_once_with(
+            node.value
+        )
+        self.assertEqual(
+            cache.hicache_runtime_snapshot()["eviction_counters"],
+            {
+                "device_evicted_tokens": 4,
+                "host_evicted_tokens": 0,
+                "dropped_tokens": 4,
+            },
+        )
 
 
 class TestHiRadixCacheKVEvents(CustomTestCase):

@@ -18,6 +18,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.disaggregation.utils import DisaggregationMode
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -80,6 +81,17 @@ class TestWaitingTimeout(CustomTestCase):
             s._abort_on_waiting_timeout()
         self.assertEqual(len(s.waiting_queue), 1)
 
+    def test_hierarchical_cache_without_generic_storage_releases_lookup(self):
+        stale = _req("svd-stale", wait_entry=time.perf_counter() - 10)
+        s = _scheduler([stale])
+        s.enable_hierarchical_cache = True
+        s.tree_cache = MagicMock()
+
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
+            s._abort_on_waiting_timeout()
+
+        s.tree_cache.terminate_prefetch.assert_called_once_with("svd-stale")
+
 
 class TestRunningTimeout(CustomTestCase):
     @staticmethod
@@ -115,6 +127,58 @@ class TestRunningTimeout(CustomTestCase):
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(0):
             s._abort_on_running_timeout(self._batch([req]))
         self.assertIsNone(req.to_finish)
+
+
+class TestSchedulerHiCacheIdle(CustomTestCase):
+    @staticmethod
+    def _idle_scheduler(tree_cache):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
+        scheduler.chunked_req = None
+        scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler.result_queue = []
+        scheduler._pp_microbatches_drained = lambda: True
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = True
+        scheduler.tree_cache = tree_cache
+        return scheduler
+
+    def test_svd_write_may_sleep_but_does_not_allow_destructive_idle(self):
+        tree_cache = SimpleNamespace(
+            hicache_writes_allow_idle_sleep=True,
+            ongoing_write_through={1: object()},
+            ongoing_load_back={},
+            enable_storage=False,
+        )
+        scheduler = self._idle_scheduler(tree_cache)
+
+        self.assertFalse(scheduler.is_fully_idle())
+        self.assertTrue(scheduler.is_fully_idle(allow_background_hicache=True))
+
+        # Stock cache controllers keep their existing polling contract.
+        tree_cache.hicache_writes_allow_idle_sleep = False
+        self.assertFalse(scheduler.is_fully_idle(allow_background_hicache=True))
+
+    def test_background_svd_write_yields_without_idle_sleeper(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.idle_sleeper = None
+
+        with unittest.mock.patch(
+            "sglang.srt.managers.scheduler.time.sleep"
+        ) as sleep_mock:
+            scheduler.maybe_sleep_on_idle(timeout_ms=5, yield_if_missing=True)
+            sleep_mock.assert_called_once_with(0.005)
+
+        with unittest.mock.patch(
+            "sglang.srt.managers.scheduler.time.sleep"
+        ) as sleep_mock:
+            scheduler.maybe_sleep_on_idle(timeout_ms=5)
+            sleep_mock.assert_not_called()
 
 
 if __name__ == "__main__":

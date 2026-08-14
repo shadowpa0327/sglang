@@ -399,5 +399,23 @@ class TestIdleMetrics(unittest.TestCase):
         self.assertEqual(self.published_occupancies, [])
 
 
+class TestHiCacheMetrics(unittest.TestCase):
+    def test_compressed_external_tier_without_raw_host_pool_is_supported(self):
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = types.SimpleNamespace(
+            enable_hierarchical_cache=True,
+            tree_cache=types.SimpleNamespace(),
+        )
+        reporter.stats = types.SimpleNamespace(
+            hicache_host_used_tokens=11,
+            hicache_host_total_tokens=22,
+        )
+
+        reporter._log_hicache_stats()
+
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 11)
+        self.assertEqual(reporter.stats.hicache_host_total_tokens, 22)
+
+
 if __name__ == "__main__":
     unittest.main()

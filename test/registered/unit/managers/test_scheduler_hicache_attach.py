@@ -71,6 +71,24 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         )
         self.assertEqual(self.server_args.hicache_storage_backend, "file")
 
+    def test_cache_owned_storage_enables_scheduler_prefetch(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hicache_storage = False
+        scheduler.tree_cache = SimpleNamespace(enable_storage=True)
+
+        scheduler._sync_hicache_storage_capability()
+
+        self.assertTrue(scheduler.enable_hicache_storage)
+
+    def test_cache_without_storage_does_not_enable_prefetch(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hicache_storage = False
+        scheduler.tree_cache = SimpleNamespace(enable_storage=False)
+
+        scheduler._sync_hicache_storage_capability()
+
+        self.assertFalse(scheduler.enable_hicache_storage)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -542,6 +542,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self._sync_hicache_storage_capability()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -954,6 +955,18 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+
+    def _sync_hicache_storage_capability(self) -> None:
+        """Enable scheduler prefetch for cache-owned storage backends.
+
+        Most HiCache L3 backends are selected by ``--hicache-storage-backend``.
+        Experimental SVD chunks instead own their opaque L3 backend and expose
+        that fact on the constructed tree cache.
+        """
+
+        self.enable_hicache_storage = self.enable_hicache_storage or bool(
+            getattr(self.tree_cache, "enable_storage", False)
+        )
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -2740,7 +2753,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
-                elif self.enable_hierarchical_cache:
+                elif getattr(self, "enable_hierarchical_cache", False):
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
@@ -2772,6 +2785,8 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                elif getattr(self, "enable_hierarchical_cache", False):
+                    self.tree_cache.terminate_prefetch(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2907,6 +2922,8 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
+        elif getattr(self, "enable_hierarchical_cache", False):
+            self.tree_cache.terminate_prefetch(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
@@ -3978,7 +3995,7 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
-        if not self.is_fully_idle():
+        if not self.is_fully_idle(allow_background_hicache=True):
             return
 
         if self.enable_unified_memory:
@@ -4012,10 +4029,25 @@ class Scheduler(
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
+        # A Python SVD worker needs the GIL and its completion must be polled to
+        # release the radix source lock / start the next bounded candidate.
+        # Park briefly while such work exists; use the ordinary one-second
+        # ingress poll once the background queue is empty.
+        short_hicache_poll = bool(
+            self.enable_hierarchical_cache
+            and getattr(self.tree_cache, "hicache_writes_allow_idle_sleep", False)
+            and self.tree_cache.ongoing_write_through
+        )
+        self.maybe_sleep_on_idle(
+            timeout_ms=5 if short_hicache_poll else 1000,
+            yield_if_missing=short_hicache_poll,
+        )
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(
+        self,
+        for_health_check=False,
+        allow_background_hicache=False,
+    ) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -4065,7 +4097,11 @@ class Scheduler(
             # destructive operations like attach/detach/flush_cache.
             if self.enable_hierarchical_cache:
                 tc = self.tree_cache
-                idle &= len(tc.ongoing_write_through) == 0
+                writes_may_sleep = allow_background_hicache and bool(
+                    getattr(tc, "hicache_writes_allow_idle_sleep", False)
+                )
+                if not writes_may_sleep:
+                    idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
@@ -4233,6 +4269,8 @@ class Scheduler(
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        self._add_hicache_runtime_snapshots(ret)
+
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -4265,6 +4303,25 @@ class Scheduler(
         ret.pop("custom_sigquit_handler", None)
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
+
+    def _add_hicache_runtime_snapshots(self, state: dict) -> None:
+        """Add generic HiCache activity without replacing SVD diagnostics."""
+
+        hicache_runtime_snapshot = getattr(
+            self.tree_cache,
+            "hicache_runtime_snapshot",
+            None,
+        )
+        if callable(hicache_runtime_snapshot):
+            state["hicache_runtime"] = hicache_runtime_snapshot()
+
+        svd_runtime_snapshot = getattr(
+            self.tree_cache,
+            "runtime_metrics_snapshot",
+            None,
+        )
+        if callable(svd_runtime_snapshot):
+            state["hicache_svd_runtime"] = svd_runtime_snapshot()
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -4395,6 +4452,8 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
+            elif getattr(self, "enable_hierarchical_cache", False):
+                self.tree_cache.terminate_prefetch(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -4427,6 +4486,8 @@ class Scheduler(
             ):
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
+                elif getattr(self, "enable_hierarchical_cache", False):
+                    self.tree_cache.terminate_prefetch(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=req.rid), req
                 )
@@ -4451,6 +4512,8 @@ class Scheduler(
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(req.rid)
+                    elif getattr(self, "enable_hierarchical_cache", False):
+                        self.tree_cache.terminate_prefetch(req.rid)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -4782,9 +4845,20 @@ class Scheduler(
         ):
             self.session_controller.close(recv_req)
 
-    def maybe_sleep_on_idle(self):
+    def maybe_sleep_on_idle(
+        self,
+        *,
+        timeout_ms: int = 1000,
+        yield_if_missing: bool = False,
+    ):
         if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
+            self.idle_sleeper.maybe_sleep(timeout_ms=timeout_ms)
+        elif yield_if_missing and timeout_ms > 0:
+            # ``--sleep-on-idle`` is normally optional, but the SVD encoder is
+            # a Python background thread.  A hot scheduler loop can otherwise
+            # starve it of the GIL after each completed chunk, leaving deferred
+            # chunks unpublished until the next request arrives.
+            time.sleep(timeout_ms / 1000)
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""

@@ -76,6 +76,13 @@ logger = logging.getLogger(__name__)
 class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
+        # Lifetime observability counters intentionally survive reset()/flush_cache.
+        # They are advanced only after the corresponding allocator/controller
+        # eviction call succeeds, so before/after server snapshots can be safely
+        # differenced even when a benchmark flushes the logical cache.
+        self._device_evicted_tokens = 0
+        self._host_evicted_tokens = 0
+        self._dropped_tokens = 0
         self._enable_metrics_flag = params.enable_metrics
 
         self.page_size = params.page_size
@@ -994,6 +1001,87 @@ class HiRadixCache(RadixCache):
             ready_count += 1
         return ready_count
 
+    @staticmethod
+    def _runtime_queue_size(queue) -> int:
+        """Return a JSON-safe queue depth for list- and Queue-like objects."""
+
+        if queue is None:
+            return 0
+        qsize = getattr(queue, "qsize", None)
+        if callable(qsize):
+            try:
+                return int(qsize())
+            except (NotImplementedError, OSError):
+                pass
+        try:
+            return int(len(queue))
+        except TypeError:
+            return 0
+
+    def hicache_runtime_snapshot(self) -> dict:
+        """Return backend-neutral HiCache activity used to prove quiescence.
+
+        This intentionally reports live bookkeeping and queue depths instead of
+        cumulative performance counters.  A consumer can therefore wait for
+        ``quiescent`` before starting a resident-cache measurement phase.
+        """
+
+        controller = self.cache_controller
+        controller_queues = {
+            name: self._runtime_queue_size(getattr(controller, name, None))
+            for name in (
+                "write_queue",
+                "load_queue",
+                "ack_write_queue",
+                "ack_load_queue",
+                "prefetch_queue",
+                "backup_queue",
+                "prefetch_hit_queue",
+                "ack_backup_queue",
+                "host_mem_release_queue",
+                "prefetch_buffer",
+            )
+        }
+        extra_release_queues = getattr(controller, "extra_host_mem_release_queues", {})
+        controller_queues["extra_host_mem_release"] = sum(
+            self._runtime_queue_size(queue) for queue in extra_release_queues.values()
+        )
+
+        ongoing = {
+            "write": len(self.ongoing_write_through),
+            "load": len(self.ongoing_load_back),
+            "prefetch": len(self.ongoing_prefetch),
+            "backup": len(self.ongoing_backup),
+            "work": len(self.work_list),
+        }
+        quiescent = not any(ongoing.values()) and not any(controller_queues.values())
+        return {
+            "schema_version": 1,
+            "backend": "hiradix",
+            "enabled": True,
+            "storage_enabled": bool(self.enable_storage),
+            "radix_eviction_policy": self.eviction_policy,
+            "eviction_counters": {
+                "device_evicted_tokens": self._device_evicted_tokens,
+                "host_evicted_tokens": self._host_evicted_tokens,
+                "dropped_tokens": self._dropped_tokens,
+            },
+            "ongoing": ongoing,
+            "controller_queues": controller_queues,
+            "quiescent": quiescent,
+        }
+
+    def _record_evicted_tokens(
+        self, *, device: int = 0, host: int = 0, dropped: int = 0
+    ) -> None:
+        """Advance lifetime eviction totals after a successful release."""
+
+        if device < 0 or host < 0 or dropped < 0:
+            raise ValueError("evicted token counts must be non-negative")
+        self._device_evicted_tokens += int(device)
+        self._host_evicted_tokens += int(host)
+        self._dropped_tokens += int(dropped)
+
     def _sync_hicache_ready_counts(self) -> tuple[int, int, tuple[int, ...]]:
         cache_controller = self.cache_controller
         storage_queue_sizes = (
@@ -1237,6 +1325,7 @@ class HiRadixCache(RadixCache):
             self.writing_check(write_back=True)
             for node, device_indices in staged:
                 self.cache_controller.evict_device(device_indices)
+                self._record_evicted_tokens(device=len(device_indices))
                 node.release_host()
             staged.clear()
 
@@ -1274,6 +1363,7 @@ class HiRadixCache(RadixCache):
         device_indices = node.value
         num_evicted = self._detach_backuped(node)
         self.cache_controller.evict_device(device_indices)
+        self._record_evicted_tokens(device=num_evicted)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1283,6 +1373,7 @@ class HiRadixCache(RadixCache):
         self._record_remove_event(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
+        self._record_evicted_tokens(device=num_evicted, dropped=num_evicted)
         self._delete_leaf(node)
         return num_evicted
 
@@ -1307,13 +1398,18 @@ class HiRadixCache(RadixCache):
         for n in nodes:
             if n.host_value is not None:
                 self._record_remove_event(n, medium=StorageMedium.CPU)
-                self.cache_controller.evict_host(n.host_value)
+                host_evicted = self.cache_controller.evict_host(n.host_value)
+                self._record_evicted_tokens(host=host_evicted)
                 n.host_value = None
             if n.value is not None:
                 self._record_remove_event(n, medium=StorageMedium.GPU)
                 self.cache_controller.mem_pool_device_allocator.free(n.value)
-                freed_device += len(n.value)
-                self.evictable_size_ -= len(n.value)
+                device_evicted = len(n.value)
+                self._record_evicted_tokens(
+                    device=device_evicted, dropped=device_evicted
+                )
+                freed_device += device_evicted
+                self.evictable_size_ -= device_evicted
                 n.value = None
             self.ongoing_write_through.pop(n.id, None)
             self.evictable_leaves.discard(n)
@@ -1353,7 +1449,9 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
+            host_evicted = self.cache_controller.evict_host(x.host_value)
+            self._record_evicted_tokens(host=host_evicted)
+            num_evicted += host_evicted
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
