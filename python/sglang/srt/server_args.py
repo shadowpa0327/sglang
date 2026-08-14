@@ -2613,6 +2613,12 @@ class ServerArgs:
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
         NS("memory"),
     ] = 0
+    hicache_svd_shadow_config: A[
+        Optional[str],
+        "Experimental non-owning SVD observer configuration as a JSON object. "
+        "This measures L1-to-L2 compression while keeping raw HiCache authoritative.",
+        NS("memory"),
+    ] = None
     hicache_write_policy: A[
         str,
         Arg(
@@ -7799,6 +7805,14 @@ class ServerArgs:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
+            )
+
+        if (
+            self.hicache_svd_shadow_config is not None
+            and not self.enable_hierarchical_cache
+        ):
+            raise ValueError(
+                "--hicache-svd-shadow-config requires --enable-hierarchical-cache"
             )
 
         if self.disaggregation_decode_enable_offload_kvcache:

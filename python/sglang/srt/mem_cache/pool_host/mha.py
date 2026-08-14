@@ -84,6 +84,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
         pool_label: str = "kv",
+        svd_shadow_config: object = None,
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
@@ -146,6 +147,30 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
         self._init_write_back_staging_buffers()
+        self._hicache_svd_shadow = None
+        # Keep the disabled path import-free.  The explicit constructor value is
+        # the production plumbing; the environment variable is a development
+        # convenience for launching an unmodified server command.
+        shadow_requested = (
+            svd_shadow_config is not None and svd_shadow_config is not False
+        )
+        if svd_shadow_config is None:
+            import os
+
+            shadow_requested = os.environ.get("SGLANG_HICACHE_SVD_SHADOW") is not None
+        if shadow_requested:
+            from sglang.srt.mem_cache.hicache_svd_shadow import (
+                maybe_create_hicache_svd_shadow,
+            )
+
+            self._hicache_svd_shadow = maybe_create_hicache_svd_shadow(
+                device_pool=self.device_pool,
+                page_size=self.page_size,
+                pool_label=self.pool_label,
+                config_value=svd_shadow_config,
+                use_env_fallback=svd_shadow_config is None,
+                has_mtp_draft=bool(self.mtp_draft_device_pools),
+            )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -381,6 +406,28 @@ class MHATokenToKVPoolHost(HostKVCache):
             device_pool.v_buffer,
         )
 
+    def _observe_svd_shadow_backup(
+        self, device_pool, device_indices, io_backend
+    ) -> None:
+        observer = getattr(self, "_hicache_svd_shadow", None)
+        if observer is None:
+            return
+        try:
+            observer.observe_backup(device_pool, device_indices, io_backend)
+        except Exception:
+            # The observer is explicitly non-owning.  Its failure must never
+            # invalidate the raw host copy that was already enqueued above it on
+            # the same stream.
+            logger.exception(
+                "Unexpected HiCache SVD shadow failure; disabling the observer"
+            )
+            self._hicache_svd_shadow = None
+
+    def get_svd_shadow_metrics(self):
+        """Return a point-in-time shadow snapshot, or ``None`` when disabled."""
+        observer = getattr(self, "_hicache_svd_shadow", None)
+        return None if observer is None else observer.metrics_snapshot()
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -492,6 +539,13 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        # This call executes under HiCacheController.write_stream.  Keeping it
+        # after the raw D2H dispatch makes L2 authoritative, while the controller's
+        # existing finish event naturally covers all shadow kernels as well.  The
+        # disabled path pays only this predictable branch (and imports no codec).
+        if getattr(self, "_hicache_svd_shadow", None) is not None:
+            self._observe_svd_shadow_backup(device_pool, device_indices, io_backend)
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
