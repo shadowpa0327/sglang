@@ -76,6 +76,16 @@ def registered_radix_cache_backends() -> list[str]:
     return list(_RADIX_CACHE_REGISTRY.keys())
 
 
+def _hicache_svd_enabled(value: Any) -> bool:
+    if value is None:
+        return False
+    from sglang.srt.mem_cache.storage.svd_chunk.svd_chunk_connector import (
+        resolve_svd_chunk_connector_config,
+    )
+
+    return resolve_svd_chunk_connector_config(value) is not None
+
+
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Built-in Radix Cache selection chain."""
     server_args = ctx.server_args
@@ -93,6 +103,35 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
+
+    if _hicache_svd_enabled(server_args.hicache_svd_config):
+        if not ctx.enable_hierarchical_cache:
+            raise ValueError(
+                "--hicache-svd-config requires --enable-hierarchical-cache"
+            )
+        if ctx.is_hybrid_swa or ctx.is_hybrid_ssm or ctx.is_dsa:
+            raise ValueError(
+                "The experimental SVD chunk cache currently supports plain "
+                "MHA models only; hybrid SWA/SSM and DSA pools are not yet "
+                "supported."
+            )
+        from sglang.srt.mem_cache.storage.svd_chunk.svd_chunk_radix_cache import (
+            SVDChunkRadixCache,
+        )
+
+        cache = SVDChunkRadixCache(
+            params=params,
+            server_args=server_args,
+            model_config=ctx.model_config,
+        )
+        if cache.layerwise_restore:
+            # The KV pool owns the per-layer waits, but TPWorker selects the
+            # producer-ring consumer for each scheduled batch.  Register the
+            # same counter on both sides, exactly as stock HiCache does below.
+            ctx.tp_worker.register_hicache_layer_transfer_counter(
+                cache.connector.layer_done_counter
+            )
+        return cache
 
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
@@ -196,6 +235,11 @@ def _create_unified_radix_cache(
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = ctx.server_args.radix_cache_backend
+    if name and _hicache_svd_enabled(ctx.server_args.hicache_svd_config):
+        raise ValueError(
+            "--hicache-svd-config owns the radix integration and cannot be "
+            "combined with --radix-cache-backend"
+        )
     if name:
         factory = get_radix_cache_factory(name)
         if factory is None:

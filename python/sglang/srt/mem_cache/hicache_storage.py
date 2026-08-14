@@ -463,17 +463,35 @@ class HiCacheFile(HiCacheStorage):
     def get(
         self,
         key: str,
-        target_location: torch.Tensor,
+        target_location: Optional[torch.Tensor] = None,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
-            expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
+                if target_location is None:
+                    # Opaque values (for example, compressed KV chunks) do not
+                    # have a caller-known tensor shape.  Size the byte tensor
+                    # from the opened file so the stat and read refer to the
+                    # same inode even if another writer atomically replaces the
+                    # key concurrently.
+                    file_size = os.fstat(f.fileno()).st_size
+                    target_location = torch.empty(
+                        file_size, dtype=torch.uint8, device="cpu"
+                    )
+
+                expected = target_location.numel() * target_location.element_size()
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
-                if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+                bytes_read = 0
+                while bytes_read < expected:
+                    n = f.readinto(buf[bytes_read:])
+                    if not n:
+                        raise IOError(
+                            f"Short read for {suffixed}: "
+                            f"expected {expected} bytes, got {bytes_read}"
+                        )
+                    bytes_read += n
             self._evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
@@ -487,7 +505,7 @@ class HiCacheFile(HiCacheStorage):
     def batch_get(
         self,
         keys: List[str],
-        target_locations: List[torch.Tensor],
+        target_locations: Optional[List[torch.Tensor]] = None,
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
         return [
@@ -568,6 +586,23 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.add(key)
             return True
         return False
+
+    def delete(self, key: str) -> bool:
+        """Delete one opaque key, including LRU and metadata bookkeeping."""
+
+        suffixed = self._get_suffixed_key(key)
+        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        try:
+            os.remove(tensor_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.error(f"Failed to delete tensor {key}: {exc}")
+            return False
+        self._evictor.forget(suffixed)
+        if self.metadata_cache is not None:
+            self.metadata_cache.remove(suffixed)
+        return True
 
     def _collect_existing_component_keys(
         self,

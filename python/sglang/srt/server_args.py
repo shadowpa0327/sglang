@@ -2613,6 +2613,13 @@ class ServerArgs:
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
         NS("memory"),
     ] = 0
+    hicache_svd_config: A[
+        Optional[str],
+        "Experimental byte-budgeted SVD chunk cache configuration as a JSON "
+        "object. Requires --enable-hierarchical-cache and replaces the raw "
+        "token-slot L2 with fixed chunks of at least 4096 tokens.",
+        NS("memory"),
+    ] = None
     hicache_svd_shadow_config: A[
         Optional[str],
         "Experimental non-owning SVD observer configuration as a JSON object. "
@@ -7801,13 +7808,69 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if self.hicache_svd_config is False or (
+            isinstance(self.hicache_svd_config, str)
+            and self.hicache_svd_config.strip().lower()
+            in ("", "0", "false", "off", "no", "none")
+        ):
+            self.hicache_svd_config = None
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 
-        if (
+        if self.hicache_svd_config is not None:
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--hicache-svd-config requires --enable-hierarchical-cache"
+                )
+            if self.radix_cache_backend is not None:
+                raise ValueError(
+                    "--hicache-svd-config owns the radix integration and cannot "
+                    "be combined with --radix-cache-backend"
+                )
+            if self.enable_lmcache or self.enable_flexkv:
+                raise ValueError(
+                    "--hicache-svd-config cannot be combined with LMCache or "
+                    "FlexKV; select exactly one external KV-cache backend"
+                )
+            if self.disaggregation_decode_enable_radix_cache:
+                raise ValueError(
+                    "--hicache-svd-config does not support decode "
+                    "disaggregation HiCache restore"
+                )
+            if self.hicache_svd_shadow_config is not None:
+                raise ValueError(
+                    "--hicache-svd-config and --hicache-svd-shadow-config are "
+                    "mutually exclusive"
+                )
+            if self.hicache_storage_backend is not None:
+                raise ValueError(
+                    "The experimental SVD cache owns opaque L3 blobs itself; "
+                    "configure l3_path inside --hicache-svd-config instead of "
+                    "--hicache-storage-backend."
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "The first --hicache-svd-config prototype does not support "
+                    "speculative decoding or draft KV pools."
+                )
+            if any(
+                size != 1
+                for size in (
+                    self.tp_size,
+                    self.pp_size,
+                    self.attn_cp_size,
+                    self.dcp_size,
+                )
+            ):
+                raise ValueError(
+                    "The first --hicache-svd-config prototype requires "
+                    "TP=PP=CP=DCP=1 so all workers agree on chunk hits."
+                )
+        elif (
             self.hicache_svd_shadow_config is not None
             and not self.enable_hierarchical_cache
         ):

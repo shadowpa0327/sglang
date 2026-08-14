@@ -31,12 +31,14 @@ def _make_ctx(
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
+    hicache_svd_config=None,
 ):
     server_args = MagicMock()
     server_args.radix_cache_backend = backend
     server_args.enable_streaming_session = enable_streaming
     server_args.enable_lmcache = enable_lmcache
     server_args.enable_flexkv = False
+    server_args.hicache_svd_config = hicache_svd_config
     return TreeCacheBuildContext(
         server_args=server_args,
         params=MagicMock(),
@@ -213,6 +215,81 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                 params=ctx.params, server_args=ctx.server_args
             )
             self.assertIs(result, fake_module.RadixCacheCpp.return_value)
+
+    def test_svd_chunk_cache_when_explicitly_configured(self):
+        ctx = _make_ctx(
+            enable_hierarchical_cache=True,
+            hicache_svd_config='{"chunk_tokens":4096}',
+        )
+        fake_module = MagicMock()
+        counter = MagicMock(name="svd_layer_done_counter")
+        fake_module.SVDChunkRadixCache.return_value.layerwise_restore = True
+        fake_module.SVDChunkRadixCache.return_value.connector.layer_done_counter = (
+            counter
+        )
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.svd_chunk.svd_chunk_radix_cache": (
+                    fake_module
+                )
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_module.SVDChunkRadixCache.assert_called_once_with(
+            params=ctx.params,
+            server_args=ctx.server_args,
+            model_config=ctx.model_config,
+        )
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
+            counter
+        )
+        self.assertIs(result, fake_module.SVDChunkRadixCache.return_value)
+
+    def test_svd_sync_fallback_does_not_register_layer_counter(self):
+        ctx = _make_ctx(
+            enable_hierarchical_cache=True,
+            hicache_svd_config='{"chunk_tokens":4096}',
+        )
+        fake_module = MagicMock()
+        fake_module.SVDChunkRadixCache.return_value.layerwise_restore = False
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.svd_chunk.svd_chunk_radix_cache": (
+                    fake_module
+                )
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_not_called()
+
+    def test_svd_chunk_cache_rejects_hybrid_models(self):
+        ctx = _make_ctx(
+            enable_hierarchical_cache=True,
+            hicache_svd_config='{"chunk_tokens":4096}',
+            is_hybrid_swa=True,
+        )
+        with self.assertRaisesRegex(ValueError, "plain MHA"):
+            default_radix_cache_factory(ctx)
+
+    def test_svd_chunk_cache_rejects_an_explicit_radix_backend(self):
+        ctx = _make_ctx(
+            enable_hierarchical_cache=True,
+            hicache_svd_config='{"chunk_tokens":4096}',
+            backend="custom",
+        )
+        with self.assertRaisesRegex(ValueError, "owns the radix integration"):
+            create_tree_cache(ctx)
+
+    def test_disabled_svd_spelling_uses_the_normal_cache_chain(self):
+        ctx = _make_ctx(hicache_svd_config="false")
+        with patch("sglang.srt.mem_cache.radix_cache.RadixCache") as RadixCache:
+            result = default_radix_cache_factory(ctx)
+        RadixCache.assert_called_once_with(ctx.params)
+        self.assertIs(result, RadixCache.return_value)
 
     def test_unified_radix_cache_when_env_flag_set(self):
         ctx = _make_ctx()

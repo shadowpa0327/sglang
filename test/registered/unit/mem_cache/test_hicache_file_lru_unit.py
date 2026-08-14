@@ -359,6 +359,61 @@ class TestTrackOrTouch(HiCacheFileLRUTestBase):
         self.assertEqual(b._evictor._total_bytes, 64)
 
 
+class TestOpaqueBlobReads(HiCacheFileLRUTestBase):
+    def test_get_without_target_allocates_exact_uint8_blob(self):
+        b = self.make_backend(max_size="2000")
+        value = torch.arange(257, dtype=torch.int32).view(torch.uint8)
+        self.assertTrue(b.set("blob", value))
+
+        out = b.get("blob")
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out.device.type, "cpu")
+        self.assertEqual(out.dtype, torch.uint8)
+        self.assertEqual(tuple(out.shape), (value.numel(),))
+        self.assertTrue(torch.equal(out, value))
+
+    def test_get_without_target_supports_empty_blob(self):
+        b = self.make_backend(max_size="1000")
+        self.assertTrue(b.set("empty", torch.empty(0, dtype=torch.uint8)))
+
+        out = b.get("empty")
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out.dtype, torch.uint8)
+        self.assertEqual(out.numel(), 0)
+
+    def test_batch_get_without_targets_allocates_each_blob(self):
+        b = self.make_backend(max_size="1000")
+        first = torch.tensor([1, 2, 3], dtype=torch.uint8)
+        second = torch.arange(19, dtype=torch.uint8)
+        self.assertTrue(b.set("first", first))
+        self.assertTrue(b.set("second", second))
+
+        out = b.batch_get(["first", "second"])
+
+        self.assertTrue(torch.equal(out[0], first))
+        self.assertTrue(torch.equal(out[1], second))
+
+    def test_get_without_target_missing_key_returns_none(self):
+        b = self.make_backend(max_size="1000")
+        self.assertIsNone(b.get("missing"))
+
+    def test_delete_removes_blob_and_lru_accounting(self):
+        b = self.make_backend(max_size="1000")
+        value = torch.arange(57, dtype=torch.uint8)
+        self.assertTrue(b.set("replaceable", value))
+        suffixed = b._get_suffixed_key("replaceable")
+        self.assertIn(suffixed, b._evictor._lru)
+
+        self.assertTrue(b.delete("replaceable"))
+
+        self.assertFalse(b.exists("replaceable"))
+        self.assertNotIn(suffixed, b._evictor._lru)
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertTrue(b.delete("replaceable"))
+
+
 class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
     def test_refuses_when_fs_would_drop_below_min_free(self):
         # Force statvfs to report a tiny free figure so the watermark trips.

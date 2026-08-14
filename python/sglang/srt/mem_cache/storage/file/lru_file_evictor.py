@@ -265,6 +265,17 @@ class LRUFileEvictor:
             self._pending_writes.clear()
             self._total_bytes = 0
 
+    def forget(self, suffixed_key: str) -> None:
+        """Drop one externally-unlinked file from the accounting index."""
+
+        if not self._eviction_enabled:
+            return
+        with self._lock:
+            size = self._lru.pop(suffixed_key, None)
+            self._pending_writes.discard(suffixed_key)
+            if size is not None:
+                self._total_bytes -= size
+
     def _fs_stats(self) -> Optional[tuple]:
         """(total, available) bytes for the filesystem; None if unavailable."""
         try:

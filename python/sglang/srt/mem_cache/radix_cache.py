@@ -577,6 +577,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            # Backends that demote L1 data must consume the node while both its
+            # radix ancestry and device slots are still authoritative.  The
+            # default cache has no lower tier, so this hook is a no-op.
+            self._before_evict_leaf(x)
+
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
@@ -590,6 +595,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _before_evict_leaf(self, node: TreeNode) -> None:
+        """Synchronously consume an L1 leaf before its slots are released.
+
+        Lower-tier cache implementations may override this hook to demote the
+        node.  Implementations must finish reading ``node.value`` before they
+        return; the allocator frees those device slots immediately afterwards.
+        """
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
