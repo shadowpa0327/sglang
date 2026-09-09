@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
@@ -926,6 +928,213 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             )._swa_req_never_fits(**req)
         )
+
+    # ---- prefill_boundary_tokens: no chunk straddles an absolute boundary ----
+    # The compression linker stores a block only when a chunk ends exactly at
+    # the block end (a hybrid model's recurrent state exists only there). A
+    # shared chunk budget can admit a request with a short leftover chunk,
+    # after which every chunk end would sit off the block grid; the cap makes
+    # the next chunk stop at the boundary instead of crossing it.
+
+    def _boundary_req(self, rid, prompt_len, *, ignore_eos=False):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+        req.full_untruncated_fill_ids = list(range(prompt_len))
+        req.origin_input_ids = req.full_untruncated_fill_ids
+        req.last_node = MagicMock()
+        req.sampling_params = SimpleNamespace(max_new_tokens=1, ignore_eos=ignore_eos)
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def _boundary_adder(self, rem_chunk_tokens, boundary):
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        return self.create_adder(
+            self.create_running_batch(),
+            rem_chunk_tokens=rem_chunk_tokens,
+            prefill_boundary_tokens=boundary,
+        )
+
+    def _chunk_ends(self, req, *, first_budget, budget=1024, boundary=2048):
+        """Admit `req` under `first_budget` of chunk budget, then continue it
+        round by round with a fresh adder of `budget` (as the scheduler does)
+        and return the absolute end of every chunk."""
+        adder = self._boundary_adder(first_budget, boundary)
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIn(req, adder.can_run_list)
+        ends = [req.extend_range.end]
+        chunked = adder.new_chunked_req
+        while chunked is not None:
+            # init_next_round_input: the finished chunks become the prefix.
+            req.prefix_indices = list(range(req.extend_range.end))
+            chunked = self._boundary_adder(budget, boundary).add_chunked_req(req)
+            ends.append(req.extend_range.end)
+        return ends
+
+    def test_cap_extend_at_boundary(self):
+        adder = self._boundary_adder(1024, 2048)
+        cases = [
+            # (prefix, extend, expected)
+            (0, 1024, 1024),
+            (72, 1024, 1024),
+            (1096, 1024, 952),
+            (2048, 952, 952),
+            (2032, 1024, 16),
+            (4096, 3000, 2048),
+        ]
+        for prefix, extend, expected in cases:
+            with self.subTest(prefix=prefix, extend=extend):
+                self.assertEqual(
+                    adder._cap_extend_at_boundary(prefix, extend), expected
+                )
+        # Without chunked prefill or a boundary the extend is untouched.
+        self.assertEqual(
+            self._boundary_adder(None, 2048)._cap_extend_at_boundary(1096, 1024),
+            1024,
+        )
+        self.assertEqual(
+            self._boundary_adder(1024, None)._cap_extend_at_boundary(1096, 1024),
+            1024,
+        )
+
+    def test_boundary_keeps_aligned_chunk_grid(self):
+        # (a) an aligned start keeps the usual grid: 1024, 2048, then the tail.
+        req = self._boundary_req("aligned", 3000)
+        self.assertEqual(
+            self._chunk_ends(req, first_budget=1024), [1024, 2048, 3000]
+        )
+
+    def test_boundary_realigns_after_leftover_first_chunk(self):
+        # (b) admitted with 72 tokens of shared budget: the chunk after 1096
+        # stops at 2048 instead of running to 2120 across the block end.
+        req = self._boundary_req("leftover", 3000)
+        self.assertEqual(
+            self._chunk_ends(req, first_budget=72), [72, 1096, 2048, 3000]
+        )
+
+    def test_boundary_realigns_ignore_eos_path(self):
+        # Same leftover case through add_one_req_ignore_eos (ignore_eos with a
+        # disabled tree cache, as in the compressed trial mode).
+        self.mock_tree_cache.disable = True
+        req = self._boundary_req("leftover-ignore-eos", 3000, ignore_eos=True)
+        self.assertEqual(
+            self._chunk_ends(req, first_budget=72), [72, 1096, 2048, 3000]
+        )
+
+    def test_boundary_follows_restored_prefix(self):
+        # (c) init_load_back extends the prefix before the cap is computed. A
+        # 4096-token compressed restore chunks its residual on the absolute
+        # grid; an unaligned 1000-token host restore proves the ordering: a cap
+        # taken before load-back (prefix 0) would let the chunk run to 3048.
+        cases = [
+            # (restored, first_budget, expected chunk ends)
+            (4096, 1024, [5120, 6144, 7096]),
+            (1000, 2048, [2048, 3072, 4000]),
+        ]
+        for restored, first_budget, expected in cases:
+            with self.subTest(restored=restored):
+                req = self._boundary_req("restored", restored + 3000)
+                req.prefix_indices = torch.empty(0, dtype=torch.int64)
+                req.host_hit_length = restored
+                req.needs_host_load_back.return_value = True
+                req.best_match_node = MagicMock()
+                req.kv = SimpleNamespace(cache_protected_len=0)
+                self.mock_tree_cache.init_load_back.return_value = (
+                    torch.arange(restored),
+                    MagicMock(),
+                )
+                self.assertEqual(
+                    self._chunk_ends(req, first_budget=first_budget), expected
+                )
+                self.assertEqual(req.kv.cache_protected_len, restored)
+
+    def test_boundary_splits_extend_that_fits_the_budget(self):
+        # A whole extend that fits the chunk budget is still split when it
+        # would straddle a boundary; both admission paths agree.
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos):
+                self.mock_tree_cache.disable = ignore_eos
+                req = self._boundary_req("split", 1500, ignore_eos=ignore_eos)
+                self.assertEqual(
+                    self._chunk_ends(
+                        req, first_budget=4096, budget=4096, boundary=1024
+                    ),
+                    [1024, 1500],
+                )
+
+    def test_boundary_cap_precedes_truncation_align(self):
+        # The cap applies first; truncation_align_size then rounds the capped
+        # chunk down (1536 -> 1024), so the chunk still ends before 1536.
+        req = self._boundary_req("align", 6000)
+        adder = self._boundary_adder(4096, 1536)
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=1024)
+        self.assertEqual(req.extend_range.end, 1024)
+
+    def test_boundary_none_leaves_chunking_unchanged(self):
+        # (d) without a boundary the leftover chunk keeps its offset grid.
+        req = self._boundary_req("unbounded", 3000)
+        self.assertEqual(
+            self._chunk_ends(req, first_budget=72, boundary=None),
+            [72, 1096, 2120, 3000],
+        )
+
+    def test_boundary_truncated_chunk_refuses_second_chunked_req(self):
+        # Regression: a chunk stopped at a boundary leaves chunk budget, so more
+        # requests are admitted behind it. The scheduler tracks a single chunked
+        # request (`assert self.chunked_req is None`), so one that would need
+        # chunking is refused on both admission paths while one that fits whole
+        # still joins the batch.
+        adder = self._boundary_adder(1024, 2048)
+        inflight = self._boundary_req("inflight", 2200)
+        inflight.prefix_indices = list(range(2032))
+        self.assertIs(adder.add_chunked_req(inflight), inflight)
+        self.assertEqual(inflight.extend_range.end, 2048)
+        self.assertEqual(adder.rem_chunk_tokens, 1008)
+
+        big = self._boundary_req("big", 2500)
+        self.assertEqual(
+            adder.add_one_req(
+                big, has_chunked_req=True, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertNotIn(big, adder.can_run_list)
+
+        small = self._boundary_req("small", 500)
+        self.assertEqual(
+            adder.add_one_req(
+                small, has_chunked_req=True, truncation_align_size=None
+            ),
+            AddReqResult.CONTINUE,
+        )
+        self.assertIn(small, adder.can_run_list)
+
+        self.mock_tree_cache.disable = True
+        big_eos = self._boundary_req("big-eos", 2500, ignore_eos=True)
+        self.assertEqual(
+            adder.add_one_req(
+                big_eos, has_chunked_req=True, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertIsNone(adder.new_chunked_req)
+
+    def test_unified_radix_cache_prefill_boundary_accessor(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.linker = None
+        self.assertIsNone(cache.prefill_boundary_tokens())
+        cache.linker = SimpleNamespace(cache_linker=SimpleNamespace())
+        self.assertIsNone(cache.prefill_boundary_tokens())
+        cache.linker = SimpleNamespace(
+            cache_linker=SimpleNamespace(prefill_boundary_tokens=2048)
+        )
+        self.assertEqual(cache.prefill_boundary_tokens(), 2048)
 
 
 if __name__ == "__main__":

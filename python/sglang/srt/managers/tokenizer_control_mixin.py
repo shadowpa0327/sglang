@@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    PrefixCompressionReqInput,
+    PrefixCompressionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -98,6 +100,7 @@ logger = logging.getLogger(__name__)
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
+    ("prefix_compression", PrefixCompressionReqOutput),
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -843,6 +846,10 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def prefix_compression(self, obj: PrefixCompressionReqInput):
+        self.auto_create_handle_loop()
+        return (await self.prefix_compression_communicator(obj))[0]
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()

@@ -339,6 +339,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+        if hasattr(cache_linker, "cache_mode"):
+            self.disable = cache_linker.cache_mode != "native"
+
+    def prefill_boundary_tokens(self) -> Optional[int]:
+        """Absolute token boundary that prefill chunks must not straddle, when
+        the attached linker declares one (compression blocks); else None."""
+        if self.linker is None:
+            return None
+        return getattr(self.linker.cache_linker, "prefill_boundary_tokens", None)
 
     def reset(self) -> None:
         if self.linker is not None:
@@ -519,6 +528,15 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if self.linker is not None and getattr(
+            self.linker.cache_linker, "compressed_only", False
+        ):
+            # Target requests own private active KV. Neither a previous request
+            # nor a duplicate admitted in this batch can bypass reconstruction.
+            result = self.tree_core.empty_match_result
+            if params.req is not None:
+                return self.linker.match(params.key, params.req, result)
+            return result
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -537,6 +555,10 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def supports_fast_match_prefix(self) -> bool:
+        if self.linker is not None and getattr(
+            self.linker.cache_linker, "compressed_only", False
+        ):
+            return False
         return self.tree_core.supports_fast_match_prefix()
 
     def is_chunk_cache(self) -> bool:
@@ -852,6 +874,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if self.linker is not None:
+            audit = getattr(self.linker.cache_linker, "audit", None)
+            if audit is not None:
+                audit.release(req.rid)
+            self.linker.private_loads.pop(req.rid, None)
+            self.linker.on_request_progress(
+                req, min(kv_len_to_handle, len(req.origin_input_ids)), finished=True
+            )
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -939,6 +969,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        if self.linker is not None:
+            self.linker.on_request_progress(req, len(req.get_fill_ids()), finished=False)
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 

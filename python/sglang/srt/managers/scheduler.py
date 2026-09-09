@@ -159,6 +159,8 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
+    PrefixCompressionReqInput,
+    PrefixCompressionReqOutput,
     RpcReqInput,
     RpcReqOutput,
     ScaleElasticEPReqInput,
@@ -1286,6 +1288,15 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # Absolute chunk boundary the compression linker declares through the
+        # unified cache; every other cache chunks freely.
+        self.prefill_boundary_tokens = (
+            self.tree_cache.prefill_boundary_tokens()
+            if isinstance(self.tree_cache, UnifiedRadixCache)
+            else None
+        )
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -1747,6 +1758,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (PrefixCompressionReqInput, self.handle_prefix_compression),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -3731,6 +3743,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            prefill_boundary_tokens=self.prefill_boundary_tokens,
         )
 
         if self.chunked_req is not None:
@@ -4866,6 +4879,74 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def handle_prefix_compression(self, req: PrefixCompressionReqInput):
+        wrapper = getattr(self.tree_cache, "linker", None)
+        linker = getattr(wrapper, "cache_linker", None)
+        if not hasattr(linker, "cache_mode"):
+            return PrefixCompressionReqOutput(status_code=400, data={"error": "Compression linker is not enabled"})
+        if req.action == "events":
+            if not req.request_id:
+                return PrefixCompressionReqOutput(status_code=400, data={"error": "request_id is required"})
+            return PrefixCompressionReqOutput(data={"events": linker.request_events.pop(req.request_id, [])})
+        if req.action not in {"status", "reset", "frozen", "unfreeze"}:
+            return PrefixCompressionReqOutput(status_code=400, data={"error": "Unknown protocol control"})
+        if req.action != "status":
+            if not self.is_fully_idle():
+                return PrefixCompressionReqOutput(status_code=409, data={"error": "Protocol control requires an idle engine"})
+            if req.action == "reset":
+                self.flush_cache(empty_cache=False)
+            elif req.action == "frozen":
+                if linker.cache_mode == "compressed":
+                    self.prefix_compression_control("frozen")
+            else:
+                linker.writes_enabled = linker.cache_mode == "compressed"
+                linker.record({"event": "unfreeze"})
+        return PrefixCompressionReqOutput(data={
+            "idle": self.is_fully_idle(),
+            "cache_mode": linker.cache_mode,
+            "writes_enabled": linker.writes_enabled,
+            "block_tokens": linker.block_tokens,
+            "stored_blocks": len(linker.store.blocks),
+            "identity": linker.store.identity,
+        })
+
+    def prefix_compression_control(self, action: str):
+        """Idle-only experimental trial boundary, reachable through collective_rpc."""
+        from sglang.srt.mem_cache.compression.linker import CompressionLinker
+
+        if not self.is_fully_idle():
+            raise RuntimeError("Compression trial control requires an idle engine")
+        wrapper = getattr(self.tree_cache, "linker", None)
+        if wrapper is None or not isinstance(wrapper.cache_linker, CompressionLinker):
+            raise RuntimeError("The compression linker is not enabled")
+        linker = wrapper.cache_linker
+        if action in {"no_reuse", "native", "compressed"}:
+            requested = "none" if action == "no_reuse" else action
+            if requested != linker.cache_mode:
+                raise ValueError("Cache mode is fixed at server startup; launch a separate run")
+            # no_reuse: chunk cache only. native: radix reuse, no compression.
+            # compressed: radix disabled; blocks compressed during prefill and
+            # every hit restored from the store into private slots.
+            if not self.flush_cache(empty_cache=False):
+                raise RuntimeError("Compression trial control requires an idle engine")
+            self.tree_cache.disable = action != "native"
+            linker.compressed_only = action == "compressed"
+            linker.writes_enabled = action == "compressed"
+            linker.record({"event": "trial_mode", "mode": action})
+            linker.record({"event": "reuse_policy", "compressed_only": linker.compressed_only})
+        elif action == "frozen":
+            # Keep restoring from the store but stop adding to it; the audit
+            # poisons freed source slots so stale KV cannot pass as restored.
+            if not linker.compressed_only:
+                raise RuntimeError("frozen requires the compressed mode")
+            self.tree_cache.check_hicache_events()
+            linker.writes_enabled = False
+            if linker.audit is not None:
+                linker.audit.poison_native(self.tree_cache)
+            linker.record({"event": "frozen"})
+        else:
+            raise ValueError(f"Unknown compression control action: {action}")
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

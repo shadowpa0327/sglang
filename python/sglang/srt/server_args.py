@@ -2860,10 +2860,16 @@ class ServerArgs:
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
+            choices=["mooncake", "mori", "compression"],
         ),
         NS("memory"),
     ] = "mooncake"
+
+    prefix_compression_config: A[
+        Optional[str],
+        "JSON settings for the experimental compression linker: plugin (identity, int8 or .py path), parameters, block_pages (compression/lookup unit in pages, default 16), key_space (auto: follow the plugin's declaration; pre_rope; post_rope), metrics_path, audit.",
+        NS("memory"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

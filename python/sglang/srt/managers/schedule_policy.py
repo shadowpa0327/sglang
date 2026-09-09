@@ -497,6 +497,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        prefill_boundary_tokens: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -506,6 +507,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.prefill_boundary_tokens = prefill_boundary_tokens
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -808,6 +810,20 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _cap_extend_at_boundary(self, prefix_len: int, extend_len: int) -> int:
+        # The compression linker stores a block only when a chunk ends exactly at
+        # the block end, so no chunk may straddle an absolute k * boundary position.
+        boundary = self.prefill_boundary_tokens
+        # DLLM sizes its own blocks; without chunking there is nothing to cap.
+        if (
+            boundary is None
+            or self.rem_chunk_tokens is None
+            or self.dllm_config is not None
+        ):
+            return extend_len
+        next_boundary = (prefix_len // boundary + 1) * boundary
+        return min(extend_len, next_boundary - prefix_len)
+
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
@@ -1025,6 +1041,9 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        _rem_tokens = self._cap_extend_at_boundary(
+            len(req.prefix_indices), _rem_tokens
+        )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -1061,7 +1080,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1140,6 +1159,13 @@ class PrefillAdder:
         ):
             return AddReqResult.OTHER
 
+        chunk_tokens_limit = self.rem_chunk_tokens
+        if chunk_tokens_limit is not None:
+            # Chunks never straddle an absolute prefill boundary.
+            chunk_tokens_limit = self._cap_extend_at_boundary(
+                len(req.prefix_indices), chunk_tokens_limit
+            )
+
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
@@ -1151,8 +1177,8 @@ class PrefillAdder:
 
             self._add_dllm_req(req, 0)
         elif (
-            self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            chunk_tokens_limit is None  # chunked prefill is disabled
+            or cand_extend_input_len <= chunk_tokens_limit  # it is the last chunk
         ):
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1174,9 +1200,13 @@ class PrefillAdder:
         else:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
+            if has_chunked_req:
+                # The scheduler tracks one chunked request; a chunk that stopped
+                # at a prefill boundary leaves budget but must not start another.
+                return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = chunk_tokens_limit
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1209,8 +1239,12 @@ class PrefillAdder:
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+        if (
+            req.sampling_params.ignore_eos
+            and getattr(self.tree_cache, "disable", True)
+            and not req.needs_host_load_back()
+        ):
+            return self.add_one_req_ignore_eos(req, has_chunked_req=has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1328,6 +1362,12 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
+            if chunk_tokens_limit is not None:
+                # Chunks never straddle an absolute prefill boundary; the cap
+                # follows the prefix init_load_back may just have restored.
+                chunk_tokens_limit = self._cap_extend_at_boundary(
+                    len(req.prefix_indices), chunk_tokens_limit
+                )
 
             if (
                 self.rem_chunk_tokens is None
@@ -1379,6 +1419,12 @@ class PrefillAdder:
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
+                if has_chunked_req:
+                    # The scheduler tracks one chunked request; a chunk that
+                    # stopped at a prefill boundary leaves budget but must not
+                    # start another.
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 

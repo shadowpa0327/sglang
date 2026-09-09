@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    BackupKV,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     MambaEvictExcessPathStates,
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -234,6 +236,12 @@ class MambaComponent(TreeComponent):
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
+            # A split can inherit an external KV copy without a checkpoint at
+            # its new endpoint. Persist newly attached state even though the
+            # full-attention pages were already offloaded before the split.
+            if self.cache.linker is not None and node.external_cache_stored:
+                node.external_cache_stored = False
+                cache_actions.append(BackupKV([node.id]))
             # move from host LRU to device LRU
             host_lru = self.tree_core.host_lru_lists[self.component_type]
             if host_lru.in_list(node):
@@ -655,9 +663,63 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        if self.int8_ckpt_pool is not None:
+            raise ValueError("External linker requires native recurrent checkpoints")
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value,
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        if not keys:
+            return None
+        if phase == LinkerTransferPhase.LOOKUP:
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=list(keys),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        if phase == LinkerTransferPhase.LOAD:
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=self._alloc_mamba_slot(),
+                keys=[keys[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+    def update_external_linker_load(
+        self,
+        phase,
+        req,
+        full_transfer,
+        transfer,
+        prefix_len,
+        *,
+        insert_result=None,
+        canonical_full=None,
+    ):
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            self.cache.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+            return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            if not req.kv.holds_mamba:
+                req.kv.mamba_pool_idx = self._alloc_mamba_slot()[0]
+            return transfer
+        # The tree owns one immutable checkpoint; the request receives a native
+        # copy via SGLang's existing batched deferred-CoW path before forward.
+        src = self.tree_core.get_component_device_value(
+            insert_result.last_device_node, self.component_type
         )
+        assert src is not None
+        req.kv.mamba_cow_src_index = src
+        req.kv.mamba_needs_clear = False
+        return None if insert_result.mamba_exist else transfer
 
     # ---- HiCache Hooks ----
 

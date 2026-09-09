@@ -204,6 +204,10 @@ def _create_unified_radix_cache(
             )
 
             linker_cls = MooncakeDirectLinker
+        elif backend == "compression":
+            from sglang.srt.mem_cache.compression.linker import CompressionLinker
+
+            linker_cls = CompressionLinker
         elif backend == "mori":
             from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
                 UMBPDirectLinker,

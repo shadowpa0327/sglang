@@ -798,6 +798,32 @@ async def weight_version():
     )
 
 
+@app.get("/prefix_compression/status")
+async def prefix_compression_status():
+    from sglang.srt.managers.io_struct import PrefixCompressionReqInput
+    result = await _global_state.tokenizer_manager.prefix_compression(PrefixCompressionReqInput())
+    return ORJSONResponse(result.data, status_code=result.status_code)
+
+
+@app.get("/prefix_compression/events/{request_id}")
+async def prefix_compression_events(request_id: str):
+    from sglang.srt.managers.io_struct import PrefixCompressionReqInput
+    result = await _global_state.tokenizer_manager.prefix_compression(
+        PrefixCompressionReqInput(action="events", request_id=request_id)
+    )
+    return ORJSONResponse(result.data, status_code=result.status_code)
+
+
+@app.post("/prefix_compression/control")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prefix_compression_control_http(body: dict):
+    from sglang.srt.managers.io_struct import PrefixCompressionReqInput
+    result = await _global_state.tokenizer_manager.prefix_compression(
+        PrefixCompressionReqInput(action=body.get("action", ""))
+    )
+    return ORJSONResponse(result.data, status_code=result.status_code)
+
+
 @app.get("/get_server_info")
 async def get_server_info():
     """Get the server information (deprecated - use /server_info instead)."""

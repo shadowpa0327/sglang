@@ -1615,6 +1615,10 @@ class ModelRunner:
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+        if (
+            audit := getattr(self.token_to_kv_pool, "compression_audit", None)
+        ) is not None:
+            audit.forward(forward_batch)
 
         self.forward_pass_id += 1
 

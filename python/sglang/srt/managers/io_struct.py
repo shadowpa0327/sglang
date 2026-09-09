@@ -2245,6 +2245,16 @@ class VertexGenerateReqInput(BaseReq, kw_only=True):
     parameters: Optional[Dict[str, Any]] = None
 
 
+class PrefixCompressionReqInput(BaseReq, kw_only=True):
+    action: str = "status"
+    request_id: Optional[str] = None
+
+
+class PrefixCompressionReqOutput(BaseReq, kw_only=True):
+    status_code: int = 200
+    data: Dict[str, Any] = msgspec.field(default_factory=dict)
+
+
 class RpcReqInput(BaseReq, kw_only=True):
     method: str
     # collective_rpc kwargs are flat scalars across all in-tree callers.

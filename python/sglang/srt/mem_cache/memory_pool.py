@@ -2330,7 +2330,10 @@ class MHATokenToKVPool(KVCache):
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self._get_key_buffer(layer_id)
+        buffer = self._get_key_buffer(layer_id)
+        if (audit := getattr(self, "compression_audit", None)) is not None:
+            audit.read(layer_id, "key", buffer)
+        return buffer
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
@@ -2351,7 +2354,10 @@ class MHATokenToKVPool(KVCache):
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self._get_value_buffer(layer_id)
+        buffer = self._get_value_buffer(layer_id)
+        if (audit := getattr(self, "compression_audit", None)) is not None:
+            audit.read(layer_id, "value", buffer)
+        return buffer
 
     def get_v_head_dim(self):
         # Every layer in this pool is full-attention, so the value head dim is
@@ -2378,6 +2384,8 @@ class MHATokenToKVPool(KVCache):
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
+        if (audit := getattr(self, "compression_audit", None)) is not None:
+            audit.write(loc)
         maybe_detect_kernel_facing_loc(
             loc, self.page_size, self.kernel_page_blocks, "set_kv_buffer (MHA)"
         )

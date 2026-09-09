@@ -95,6 +95,9 @@ class UnifiedCacheLinker(ABC):
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         """Queue every transfer for atomic persistence."""
 
+    def on_request_progress(self, req: Req, processed_tokens: int, *, finished: bool) -> None:
+        """Prompt tokens with KV in the request's slots grew; the finish call is last."""
+
     @abstractmethod
     def num_completed_offloads(self) -> int:
         """Return the number of completed offloads waiting to be consumed."""
@@ -147,6 +150,9 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Private destinations may be allocated before admission is deferred.
+        # Retain ownership until the request's normal KV row takes over.
+        self.private_loads: dict[str, tuple[Req, torch.Tensor]] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -156,11 +162,20 @@ class UnifiedCacheLinkerWrapper:
         return self.cache_linker.layer_done_counter
 
     def has_hit(self, rid: str) -> bool:
-        return rid in self.hit_markers
+        return rid in self.hit_markers or rid in self.private_loads
 
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        if (
+            getattr(self.cache_linker, "compressed_only", False)
+            and req.rid in self.private_loads
+        ):
+            _, indices = self.private_loads[req.rid]
+            return result._replace(
+                host_hit_length=len(indices),
+                mamba_host_hit_length=int(req.kv.holds_mamba),
+            )
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
@@ -258,6 +273,8 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
+        if getattr(self.cache_linker, "compressed_only", False):
+            return self._load_private(req)
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
@@ -349,6 +366,59 @@ class UnifiedCacheLinkerWrapper:
             node = node.parent
         return canonical_tail, insert_result.last_device_node
 
+    def _load_private(self, req: Req) -> tuple[torch.Tensor, NodeId]:
+        """Restore into request-owned slots without inserting a native radix entry.
+
+        The cache is in its normal disabled/chunk-cache lifecycle: unfinished
+        chunks keep their own indices, and completion frees the entire KV row.
+        Hybrid state is loaded directly into this request's native active slot.
+        """
+        cache = self.cache
+        assert cache.disable
+        empty = cache.tree_core.empty_match_result
+        if req.rid in self.private_loads:
+            return self.private_loads[req.rid][1], empty.last_device_node
+        hit = self.hit_markers.pop(req.rid, None)
+        if hit is None:
+            return empty.device_indices, empty.last_device_node
+        assert hit.device_hit_len == 0
+        transfers = []
+        for component in cache._components_tuple:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOAD, None, hit.tail_hashes
+            )
+            if transfer is None:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, req, transfers, len(hit.prefix_key)
+                )
+                return empty.device_indices, empty.last_device_node
+            transfers.append((component, transfer))
+        for _, transfer in transfers:
+            if transfer.name == PoolName.MAMBA:
+                if req.kv.holds_mamba:
+                    cache.req_to_token_pool.mamba_allocator.free(
+                        transfer.device_indices
+                    )
+                    transfer.device_indices = req.kv.mamba_pool_idx.view(-1)
+                else:
+                    req.kv.mamba_pool_idx = transfer.device_indices[0]
+                req.kv.mamba_cow_src_index = None
+                req.kv.mamba_needs_clear = False
+        self._queue_load(req.rid, empty.last_device_node, [t for _, t in transfers])
+        self.private_loads[req.rid] = (req, transfers[0][1].device_indices)
+        audit = getattr(self.cache_linker, "audit", None)
+        if audit is not None:
+            audit.bind(req, transfers[0][1].device_indices)
+        self.cache_linker.record(
+            {
+                "event": "private_restore",
+                "rid": req.rid,
+                "matched_tokens": len(hit.prefix_key),
+                "native_hit_tokens": 0,
+            }
+        )
+        return transfers[0][1].device_indices, empty.last_device_node
+
     def _queue_load(
         self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
     ) -> None:
@@ -387,7 +457,10 @@ class UnifiedCacheLinkerWrapper:
         )
         for component, transfer in transfers:
             component_canonical = canonical_full
-            if phase == ExternalLinkerLoadPhase.COMMIT:
+            if (
+                phase == ExternalLinkerLoadPhase.COMMIT
+                and transfer.name != PoolName.MAMBA
+            ):
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
@@ -457,6 +530,11 @@ class UnifiedCacheLinkerWrapper:
         return selected, selected_keys
 
     # ---- offload: device -> remote, driven by the write-through chain ----
+
+    def on_request_progress(
+        self, req: Req, processed_tokens: int, *, finished: bool
+    ) -> None:
+        self.cache_linker.on_request_progress(req, processed_tokens, finished=finished)
 
     def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
         """Persist a write-through chain, skipping nodes already in the store."""
@@ -543,6 +621,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self.private_loads.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -565,6 +644,10 @@ class UnifiedCacheLinkerWrapper:
         if self.cache_linker.cancel_queued_load(rid):
             node_id, lock_params = self.pending_loads.pop(rid)
             self.cache.dec_lock_ref(node_id, lock_params)
+        private = self.private_loads.pop(rid, None)
+        if private is not None and not private[0].kv.holds_kv:
+            # No request row exists yet; the normal abort path cannot free it.
+            self.cache.token_to_kv_pool_allocator.free(private[1])
 
     def close(self) -> None:
         self.cache_linker.close()
