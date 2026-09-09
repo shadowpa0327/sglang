@@ -103,7 +103,7 @@ session and case IDs. It never slices a shared event file to attribute requests.
 Legacy in-process mode RPCs can reset only the already configured mode; switching
 modes requires another server. Opening or closing a frontend session has no engine effect.
 
-The asynchronous evaluator and optional server runner live in `kv-compress/src/kvcompress`.
+The asynchronous evaluator and optional server runner live in `src/kvcompress`.
 Fixed-prefix runs prepare sources, await completion, freeze once, score targets,
 and restore writes. Growing protocols do not freeze between tasks.
 
