@@ -244,8 +244,8 @@ adds memory/work, so keep it separate from performance measurements.
 
 - [Configuration and usage](README.md)
 - [CompressionLinker and NativePoolAdapter](linker.py)
-- [BlockStore and StoredBlock](store.py)
-- [Payload interface and built-in codecs](plugin.py)
+- `kvcompress.store`: BlockStore and StoredBlock
+- `kvcompress.api`: payload interface; external numerical codecs live in the parent workspace
 - [RoPE conversion](pre_rope.py)
 - [Provenance audit](audit.py)
 - [UnifiedCacheLinkerWrapper](../unified_cache/unified_cache_linker.py)

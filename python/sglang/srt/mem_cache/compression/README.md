@@ -35,7 +35,7 @@ write-through never touch the store.
   `NativePoolAdapter` (slots <-> plugin tensors, recurrent state copies).
 - `kvcompress.store` - engine-independent `BlockStore`.
 - `kvcompress.api` - `KVCompressionPlugin` / `CompressedPayload`; `kvcompress.loader`
-  loads external Python codec files. Local `store.py` and `plugin.py` are import shims.
+  loads external Python codec files. Import these APIs directly from `kvcompress`.
 - `pre_rope.py` - optional key space: de-rotate keys with the model's own RoPE
   table before `compress`, re-rotate after `decompress`.
 - `audit.py` - opt-in byte-level provenance (source round trip, poisoned source
