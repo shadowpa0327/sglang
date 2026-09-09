@@ -5,8 +5,8 @@ import torch
 
 from sglang.srt.mem_cache.compression.audit import CompressionAudit
 from sglang.srt.mem_cache.compression.linker import NativePoolAdapter
-from sglang.srt.mem_cache.compression.plugin import load_plugin
-from sglang.srt.mem_cache.compression.store import BlockStore
+from kvcompress.loader import load_plugin
+from kvcompress.store import BlockStore
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 
 

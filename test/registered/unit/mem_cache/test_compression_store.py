@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.mem_cache.compression import BlockStore, load_plugin
+from kvcompress.loader import load_plugin
+from kvcompress.store import BlockStore
 from sglang.srt.mem_cache.compression.linker import (
     CompletedBatchCounter,
     CompressionLinker,

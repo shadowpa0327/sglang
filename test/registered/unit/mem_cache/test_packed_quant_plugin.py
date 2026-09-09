@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.srt.mem_cache.compression import BlockStore, load_plugin
+from kvcompress.loader import load_plugin
+from kvcompress.store import BlockStore
 
 PLUGIN = (
     Path(__file__).resolve().parents[4]

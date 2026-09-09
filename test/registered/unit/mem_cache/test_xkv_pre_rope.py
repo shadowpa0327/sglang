@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-from sglang.srt.mem_cache.compression import BlockStore, load_plugin
+from kvcompress.loader import load_plugin
+from kvcompress.store import BlockStore
 from sglang.srt.mem_cache.compression.pre_rope import (
     NativeRoPEDecodePlugin,
     PreRoPETransform,
