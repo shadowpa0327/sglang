@@ -898,7 +898,11 @@ def _flash_attn_fwd(
 
     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
     use_dedicated_hd256_kernel = (
-        arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+        arch // 10 in [10, 11]
+        and head_dim == 256
+        and head_dim_v == 256
+        and seqused_q is None
+        and seqused_k is None
     )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
