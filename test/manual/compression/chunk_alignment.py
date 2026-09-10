@@ -12,6 +12,7 @@ restore does not cover the expected prefix.
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -118,7 +119,12 @@ def main():
             stored = by_rid("compress", rid_a)
             skipped = by_rid("block_skipped_no_state", rid_a)
             restores = by_rid("private_restore", rid_b)
-            expected_restore = (n - 1) // block_tokens * block_tokens
+            checkpoint_tokens = (
+                math.lcm(block_tokens, args.chunked_prefill_size)
+                if args.hybrid
+                else block_tokens
+            )
+            expected_restore = (n - 1) // checkpoint_tokens * checkpoint_tokens
             matched = restores[0]["matched_tokens"] if restores else 0
             entry = {
                 "prompt": i,
@@ -140,8 +146,14 @@ def main():
                 failures.append(
                     f"prompt {i}: stored {len(stored)} of {expected} block(s)"
                 )
-            if args.hybrid and any(e["state_bytes"] <= 0 for e in stored):
-                failures.append(f"prompt {i}: a block was stored without state")
+            if args.hybrid and expected_restore and not any(
+                e["state_bytes"] > 0
+                and (e["block"] + 1) * block_tokens == expected_restore
+                for e in stored
+            ):
+                failures.append(
+                    f"prompt {i}: no recurrent checkpoint at {expected_restore}"
+                )
             if len(restores) != 1 or matched != expected_restore:
                 failures.append(
                     f"prompt {i}: restore matched {matched}, "

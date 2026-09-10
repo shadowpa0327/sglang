@@ -56,17 +56,15 @@ admission ---- match_prefix ---> linker.match -> lookup(block keys)
           ---- init_load_back -> _load_private -> load / start_layer_wise_loading
 ```
 
-`processed` counts prompt tokens whose KV sits in the request's slots. For a
-hybrid model a block is stored only when a chunk ends exactly at the block end
-and no decode step has run, because that is the only moment its recurrent state
-exists; `block_pages * page_size` must therefore be a multiple of
-`chunked_prefill_size`. The linker also publishes `prefill_boundary_tokens`
-(= `block_pages * page_size`), and with chunked prefill the scheduler's
-`PrefillAdder` caps every chunk of every request at the next absolute multiple
-of it (`len(prefix_indices) + extend`), so a batch that shares its chunk budget,
-or a request resuming after a restored prefix, still ends a chunk on every block
-end. This holds in every mode and for full-attention models too, so chunk
-boundaries are aligned across separate cache-mode runs.
+`processed` counts prompt tokens whose KV sits in the request's slots. A chunk
+may contain several compression blocks: each completed KV block is stored, while
+a hybrid recurrent checkpoint is attached only to the final block at a chunk
+boundary. Lookup therefore returns the longest contiguous prefix ending at a
+block with a checkpoint. The linker publishes `prefill_boundary_tokens` as the
+least common multiple of the block and chunk sizes, so the scheduler periodically
+lands on a boundary that is valid for both. This permits, for example, 4K
+compression blocks with 8K prefill chunks without inventing intermediate
+recurrent states.
 
 ## Configuration
 
@@ -104,13 +102,13 @@ Legacy in-process mode RPCs can reset only the already configured mode; switchin
 modes requires another server. Opening or closing a frontend session has no engine effect.
 
 The asynchronous evaluator and optional server runner live in `src/kvcompress`.
-Fixed-prefix runs prepare sources, await completion, freeze once, score targets,
-and restore writes. Growing protocols do not freeze between tasks.
+Each case caches its reusable prefix once and then evaluates its requests with
+writes enabled. The bounded store evicts least-recently-used prefix tails.
 
 ## Events
 
-`compress` (per block: key, tokens, payload/metadata/state bytes, ratio),
-`block_skipped_no_state`, `lookup` (hit pages), `private_restore`, `decompress`
+`compress` (per block: key, tokens, payload/metadata/state bytes, ratio and latency),
+`state_checkpoint`, `lookup` (hit pages), `private_restore`, `decompress`
 (blocks, tokens, latency), `load_batch`, `trial_mode`, `frozen`, and the
 `audit_*` records when auditing.
 

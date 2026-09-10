@@ -41,7 +41,7 @@ def make_adapter(hybrid=False, slots=64):
     return adapter
 
 
-def make_linker(adapter, plugin=None, store_bytes=1 << 20):
+def make_linker(adapter, plugin=None, store_bytes=1 << 20, *, preallocate=True):
     linker = CompressionLinker.__new__(CompressionLinker)
     linker.adapter = adapter
     linker.page_size, linker.block_pages, linker.block_tokens = PAGE, BLOCK_PAGES, BLOCK
@@ -57,6 +57,10 @@ def make_linker(adapter, plugin=None, store_bytes=1 << 20):
     linker.request_events = {}
     linker.events = []
     linker.record = linker.events.append
+    if preallocate:
+        sample = adapter.gather_kv(torch.arange(BLOCK))
+        state = adapter.gather_state(0) if adapter.hybrid else None
+        linker.store.allocate(sample, context=adapter.context(), state=state)
     return linker
 
 
@@ -92,6 +96,8 @@ def test_blocks_complete_chunk_by_chunk_and_tail_is_never_stored():
     assert [linker.store.blocks[k].parent for k in stored] == [None, stored[0]]
     record = linker.store.blocks[stored[0]].record
     assert record["tokens"] == BLOCK and record["compression_ratio"] < 1  # identity + metadata
+    event = next(e for e in linker.events if e["event"] == "compress")
+    assert event["latency_ms"] >= 0 and event["timer"] == "wall_sync"
 
 
 def test_shared_prefix_compresses_only_new_blocks_with_prefix_closed_keys():
@@ -158,19 +164,41 @@ def test_restore_scatters_whole_blocks_and_state_into_private_slots(hybrid):
     assert decompress["blocks"] == 2 and decompress["tokens"] == 8
 
 
-def test_hybrid_state_is_captured_only_at_a_block_end_before_decode():
+def test_hybrid_chunk_can_store_multiple_blocks_with_one_checkpoint():
     adapter = make_adapter(hybrid=True)
     linker = make_linker(adapter)
     req = make_req(adapter, "a", range(12), row=0, first_slot=0, mamba_slot=1)
-    # A chunk that overshoots block 0's end cannot provide its state.
+    # One 8-token chunk contains two 4-token blocks. Both KV blocks are useful;
+    # only the chunk-ending block owns the recurrent checkpoint.
     linker.on_request_progress(req, 8, finished=False)
     events = [(e["event"], e.get("block")) for e in linker.events]
-    assert events == [("block_skipped_no_state", 0), ("compress", 1)]
+    assert events == [("compress", 0), ("compress", 1)]
+    keys = block_keys(req.origin_input_ids, 2)
+    assert linker.store.state(keys[0]) is None
+    assert linker.store.state(keys[1]) is not None
+    pages = get_hash_str(req.origin_input_ids, None, page_size=PAGE)
+    kv = [PoolTransfer(name=PoolName.KV, keys=pages)]
+    assert linker.lookup("whole", kv) == [4]
+    assert linker.lookup("half", [PoolTransfer(name=PoolName.KV, keys=pages[:2])]) == []
     # After a decode step the state has moved past every prompt boundary.
     req.output_ids = [7, 7]
     linker.on_request_progress(req, 12, finished=True)
-    assert [e["event"] for e in linker.events[2:]] == ["block_skipped_no_state"]
-    assert linker.store.state(block_keys(req.origin_input_ids, 2)[-1]) is not None
+    assert [e["event"] for e in linker.events[4:]] == ["compress"]
+    assert linker.store.state(block_keys(req.origin_input_ids, 3)[-1]) is None
+
+
+def test_hybrid_existing_kv_block_can_gain_a_later_checkpoint():
+    adapter = make_adapter(hybrid=True)
+    linker = make_linker(adapter)
+    long = make_req(adapter, "long", range(8), row=0, first_slot=0, mamba_slot=1)
+    linker.on_request_progress(long, 8, finished=False)
+    key = block_keys(long.origin_input_ids, 1)[0]
+    assert linker.store.state(key) is None
+
+    short = make_req(adapter, "short", range(4), row=1, first_slot=20, mamba_slot=2)
+    linker.on_request_progress(short, 4, finished=False)
+    assert linker.store.state(key) is not None
+    assert linker.events[-1]["event"] == "state_checkpoint"
 
 
 def test_frozen_store_and_unadmitted_requests_write_nothing():
@@ -314,7 +342,7 @@ def test_full_pool_evicts_and_records_at_the_linker():
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_startup_probe_reserves_the_pool_for_real_blocks(hybrid):
     adapter = make_adapter(hybrid=hybrid)
-    linker = make_linker(adapter, store_bytes=4096)
+    linker = make_linker(adapter, store_bytes=4096, preallocate=False)
     pool = linker._allocate_store()
     assert pool["capacity_blocks"] == 4096 // pool["bytes_per_block"] >= 1
     assert (pool["state_bytes_per_block"] > 0) == hybrid

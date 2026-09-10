@@ -116,15 +116,15 @@ progress, including prefill completion and request completion before slots are
 freed. It is not triggered by memory pressure, radix-node splitting, eviction, or
 tree write-through. Generated continuation tokens are excluded from this store.
 
-For hybrid models, the live recurrent checkpoint must correspond exactly to the
-block endpoint before decode advances it. Block size must align with the prefill
-chunk size, and actual observed progress must reach that endpoint. Missing state
-causes a `block_skipped_no_state` event. To make that progress reach every block
-end even when several requests share one chunk budget, the linker exposes
-`prefill_boundary_tokens` and `UnifiedRadixCache.prefill_boundary_tokens()`
-hands it to the scheduler's `PrefillAdder`, which never lets a prefill chunk
-cross an absolute multiple of the block size (a chunk may end early; the next
-one is capped at the same boundary). The linker-side check remains the safety net.
+For hybrid models, the live recurrent checkpoint must correspond exactly to a
+block endpoint before decode advances it. A chunk may contain several blocks:
+all completed KV blocks are stored, but only the final block at a chunk boundary
+receives the recurrent checkpoint. Lookup returns the longest contiguous prefix
+whose final block has a checkpoint. The linker exposes the least common multiple
+of the block and chunk sizes through `prefill_boundary_tokens`, and
+`UnifiedRadixCache.prefill_boundary_tokens()` hands it to the scheduler's
+`PrefillAdder`. This lets an 8K chunk store two 4K blocks while keeping a valid
+checkpoint at 8K.
 
 Compression copies a representation into the store; it does not free the active
 source's KV. On normal request completion, its native slots become reusable,

@@ -11,6 +11,8 @@ queued request is restored before its forward batch can read KV.
 import hashlib
 import json
 import logging
+import math
+import time
 from collections import deque
 from pathlib import Path
 
@@ -182,18 +184,15 @@ class CompressionLinker(UnifiedCacheLinker):
         if type(self.block_pages) is not int or self.block_pages < 1:
             raise ValueError("block_pages must be a positive page count")
         self.block_tokens = self.block_pages * self.page_size
-        # The scheduler caps every prefill chunk at the next block end, so chunk
-        # ends coincide with block ends for every request of a batch.
-        self.prefill_boundary_tokens = self.block_tokens
         chunk = server_args.chunked_prefill_size
-        if self.adapter.hybrid and chunk is not None and chunk > 0:
-            # The recurrent state is only observed at chunk ends, so every block
-            # end must coincide with one for its checkpoint to exist.
-            if self.block_tokens % chunk:
-                raise ValueError(
-                    "Hybrid models need block_pages * page_size to be a multiple of "
-                    f"chunked_prefill_size ({self.block_tokens} vs {chunk})"
-                )
+        # A chunk may contain several compression blocks. KV is stored for each
+        # block; a hybrid recurrent checkpoint is needed only at a restorable
+        # prefix boundary shared by both grids.
+        self.prefill_boundary_tokens = (
+            math.lcm(self.block_tokens, chunk)
+            if chunk is not None and chunk > 0
+            else self.block_tokens
+        )
         plugin, description = load_plugin(
             config.get("plugin", "identity"), config.get("parameters")
         )
@@ -339,6 +338,18 @@ class CompressionLinker(UnifiedCacheLinker):
         if complete <= done:
             return
         state_valid = len(req.output_ids) <= 1
+        checkpoint_index = (
+            complete - 1
+            if self.adapter.hybrid
+            and state_valid
+            and processed == complete * self.block_tokens
+            else None
+        )
+        checkpoint = (
+            self.adapter.gather_state(req.kv.mamba_pool_idx)
+            if checkpoint_index is not None
+            else None
+        )
         start = done * self.block_tokens
         hashes = get_hash_str(
             req.origin_input_ids[start : complete * self.block_tokens],
@@ -349,17 +360,26 @@ class CompressionLinker(UnifiedCacheLinker):
             offset = (index - done + 1) * self.block_pages
             key = hashes[offset - 1]
             parent = hashes[offset - self.block_pages - 1] if index > done else last_hash
-            end = (index + 1) * self.block_tokens
+            state = checkpoint if index == checkpoint_index else None
             if self.store.has(key):
+                if state is not None and self.store.state(key) is None:
+                    record = self.store.attach_state(key, state)
+                    self.record(
+                        {
+                            "event": "state_checkpoint",
+                            "rid": req.rid,
+                            "block": index,
+                            "key": key,
+                            "state_bytes": record["state_bytes"],
+                        }
+                    )
                 continue
-            if self.adapter.hybrid and (not state_valid or end != processed):
-                self.record({"event": "block_skipped_no_state", "rid": req.rid, "block": index})
-                continue
-            self._compress_block(req, index, key, parent)
+            self._compress_block(req, index, key, parent, state=state)
         if not finished:
             self.progress[req.rid] = (complete * self.block_pages, hashes[-1])
 
-    def _compress_block(self, req, index, key, parent):
+    def _compress_block(self, req, index, key, parent, *, state=None):
+        begin = time.perf_counter_ns()
         start, end = index * self.block_tokens, (index + 1) * self.block_tokens
         slots = self.adapter.slots(req, start, end)
         native = self.adapter.gather_kv(slots)
@@ -387,9 +407,6 @@ class CompressionLinker(UnifiedCacheLinker):
                 ),
             }
             del keys
-        state = (
-            self.adapter.gather_state(req.kv.mamba_pool_idx) if self.adapter.hybrid else None
-        )
         record = self.store.insert(
             key, inputs, context=context, state=state, parent=parent
         )
@@ -405,7 +422,16 @@ class CompressionLinker(UnifiedCacheLinker):
                     "stored_blocks": len(self.store.blocks),
                 }
             )
-        self.record({"event": "compress", "rid": req.rid, "block": index, **record})
+        self.record(
+            {
+                "event": "compress",
+                "rid": req.rid,
+                "block": index,
+                **record,
+                "latency_ms": (time.perf_counter_ns() - begin) / 1e6,
+                "timer": "wall_sync",
+            }
+        )
         if self.audit is not None:
             self.audit.source(slots, sample, key)
 
@@ -417,9 +443,11 @@ class CompressionLinker(UnifiedCacheLinker):
         # to the prompt start, so a misaligned native hit simply finds nothing.
         result = []
         for end in range(self.block_pages, len(full.keys) + 1, self.block_pages):
-            if not self.store.has(full.keys[end - 1]):
+            key = full.keys[end - 1]
+            if not self.store.has(key):
                 break
-            result.append(end)
+            if not self.adapter.hybrid or self.store.state(key) is not None:
+                result.append(end)
         self.record({"event": "lookup", "rid": rid, "hit_pages": result[-1] if result else 0})
         return result
 
