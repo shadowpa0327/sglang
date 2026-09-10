@@ -36,6 +36,7 @@ KNOWN_SETTINGS = {
     "audit",
     "audit_fault",
     "key_space",
+    "store_bytes",
 }
 
 
@@ -245,7 +246,12 @@ class CompressionLinker(UnifiedCacheLinker):
                 "method": "fp32-inverse-rotation-from-model-rope-table",
                 "rope": self.pre_rope.table.description,
             }
-        self.store = BlockStore(plugin, identity, self.block_pages)
+        self.store = BlockStore(
+            plugin,
+            identity,
+            self.block_pages,
+            store_bytes=config.get("store_bytes", 4 << 30),
+        )
         self.layer_done_counter = CompletedBatchCounter()
         if self.adapter.hybrid:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -275,7 +281,29 @@ class CompressionLinker(UnifiedCacheLinker):
             from .audit import CompressionAudit
 
             self.audit = CompressionAudit(self)
-        self.record({"event": "init", "identity": identity, "configuration": config})
+        pool = self._allocate_store()
+        self.record(
+            {"event": "init", "identity": identity, "configuration": config, "store": pool}
+        )
+
+    @torch.no_grad()
+    def _allocate_store(self):
+        """Reserve the pool from one synthetic block; codecs emit a fixed layout."""
+        slots = torch.arange(self.block_tokens, device=self.adapter.device)
+        sample = {
+            name: torch.randn(t.shape, dtype=t.dtype, device=t.device)
+            for name, t in self.adapter.gather_kv(slots).items()
+        }
+        context = {
+            **self.adapter.context(),
+            "token_ids": [0] * self.block_tokens,
+            "start_position": 0,
+            "block_index": 0,
+        }
+        if self.pre_rope is not None:
+            context["key_space"] = "pre_rope"
+        state = self.adapter.gather_state(0) if self.adapter.hybrid else None
+        return self.store.allocate(sample, context=context, state=state)
 
     def record(self, event):
         self.events.append(event)
@@ -320,17 +348,18 @@ class CompressionLinker(UnifiedCacheLinker):
         for index in range(done, complete):
             offset = (index - done + 1) * self.block_pages
             key = hashes[offset - 1]
+            parent = hashes[offset - self.block_pages - 1] if index > done else last_hash
             end = (index + 1) * self.block_tokens
             if self.store.has(key):
                 continue
             if self.adapter.hybrid and (not state_valid or end != processed):
                 self.record({"event": "block_skipped_no_state", "rid": req.rid, "block": index})
                 continue
-            self._compress_block(req, index, key)
+            self._compress_block(req, index, key, parent)
         if not finished:
             self.progress[req.rid] = (complete * self.block_pages, hashes[-1])
 
-    def _compress_block(self, req, index, key):
+    def _compress_block(self, req, index, key, parent):
         start, end = index * self.block_tokens, (index + 1) * self.block_tokens
         slots = self.adapter.slots(req, start, end)
         native = self.adapter.gather_kv(slots)
@@ -361,9 +390,21 @@ class CompressionLinker(UnifiedCacheLinker):
         state = (
             self.adapter.gather_state(req.kv.mamba_pool_idx) if self.adapter.hybrid else None
         )
-        record = self.store.insert(key, inputs, context=context, state=state)
+        record = self.store.insert(
+            key, inputs, context=context, state=state, parent=parent
+        )
         if self.adapter.device.type == "cuda":
             torch.cuda.current_stream(self.adapter.device).synchronize()
+        for evicted in record.pop("evicted"):
+            self.record(
+                {
+                    "event": "evict",
+                    "rid": req.rid,
+                    "key": evicted,
+                    "tokens": self.block_tokens,
+                    "stored_blocks": len(self.store.blocks),
+                }
+            )
         self.record({"event": "compress", "rid": req.rid, "block": index, **record})
         if self.audit is not None:
             self.audit.source(slots, sample, key)

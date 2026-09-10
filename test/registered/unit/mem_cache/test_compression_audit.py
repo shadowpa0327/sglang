@@ -24,7 +24,7 @@ def fixture():
         req_to_token=torch.zeros(1, 32, dtype=torch.int64)
     )
     plugin, identity = load_plugin("int8")
-    store = BlockStore(plugin, identity, 2)
+    store = BlockStore(plugin, identity, 2, store_bytes=1 << 20)
     events = []
     linker = SimpleNamespace(
         adapter=adapter, record=events.append, store=store, compressed_only=True

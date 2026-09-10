@@ -34,7 +34,7 @@ def test_packed_size_exact_codebook_and_constant_rows(bits, dtype):
 def test_grouped_partial_restore_owns_packed_payload_and_bounds_error(bits):
     torch.manual_seed(5)
     plugin, identity = load_plugin(str(PLUGIN), {"bits": bits})
-    store = BlockStore(plugin, identity, 4)
+    store = BlockStore(plugin, identity, 4, store_bytes=1 << 20)
     source = torch.randn(4, 2, 8, 2, 128).bfloat16()
     original = source.clone()
     record = store.insert("k", {"key": source}, context={})

@@ -77,7 +77,7 @@ def test_randomized_solver_rng_isolation_and_partial_group_restoration():
     assert torch.equal(state, torch.random.get_rng_state())
     for name in first.tensors:
         assert torch.equal(first.tensors[name], second.tensors[name])
-    store = BlockStore(plugin, identity, 4)
+    store = BlockStore(plugin, identity, 4, store_bytes=1 << 20)
     record = store.insert("k", tensors, context={})
     assert record["compressed_bytes"] < record["original_bytes"]
     for tensor in tensors.values():
@@ -116,7 +116,7 @@ def test_pre_rope_store_roundtrip_uses_absolute_positions(offset):
     )
     inner, identity = load_plugin("identity")
     wrapper = NativeRoPEDecodePlugin(inner, transform)
-    store = BlockStore(wrapper, identity, 4)
+    store = BlockStore(wrapper, identity, 4, store_bytes=1 << 20)
     native = torch.randn(4, 2, 4, 1, 8).bfloat16()
     pre = transform.derotate(native, start_position=offset, audit=True)
     assert events[-1]["event"] == "audit_pre_rope_roundtrip"
@@ -138,7 +138,7 @@ def test_pre_rope_store_roundtrip_uses_absolute_positions(offset):
     assert (restored.float() - native[:3].float()).abs().max() <= tolerance
     assert torch.equal(decoded.blocks[0]["value"][:3], native[:3])
     # A wrong absolute frame must be visible: claim the keys sit 8 tokens later.
-    shifted = BlockStore(wrapper, identity, 4)
+    shifted = BlockStore(wrapper, identity, 4, store_bytes=1 << 20)
     later = {**context, "start_position": offset + 8}
     shifted.insert("k", tensors, context=later)
     decoded = shifted.reconstruct(["k"])

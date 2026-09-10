@@ -4908,6 +4908,7 @@ class Scheduler(
             "writes_enabled": linker.writes_enabled,
             "block_tokens": linker.block_tokens,
             "stored_blocks": len(linker.store.blocks),
+            "store": linker.store.description(),
             "identity": linker.store.identity,
         })
 
