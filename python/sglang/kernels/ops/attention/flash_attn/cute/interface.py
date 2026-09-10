@@ -865,6 +865,10 @@ def _flash_attn_fwd(
         # The qv kernel has no split-KV variant.
         num_splits = 1
 
+    # The generic Blackwell kernel does not implement SplitKV for wide values.
+    if arch // 10 in [10, 11] and head_dim_v >= 192:
+        num_splits = 1
+
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(
