@@ -768,8 +768,12 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
-        # q_stage=2 hangs on sm100 for qk_blockscaled; force q_stage=1 there.
-        q_stage = 1 if qk_blockscaled else (2 if seqlen_q_packgqa > tile_m else 1)
+        # q_stage=2 hangs for block-scaled QK and exceeds TMEM for hd256.
+        q_stage = (
+            1
+            if qk_blockscaled or head_dim >= 256
+            else (2 if seqlen_q_packgqa > tile_m else 1)
+        )
     else:
         q_stage = 1
 
