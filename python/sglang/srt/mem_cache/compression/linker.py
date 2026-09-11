@@ -196,6 +196,7 @@ class CompressionLinker(UnifiedCacheLinker):
         plugin, description = load_plugin(
             config.get("plugin", "identity"), config.get("parameters")
         )
+        accounting_root = plugin
         identity = {
             "model_path": server_args.model_path,
             "revision": server_args.revision,
@@ -250,6 +251,7 @@ class CompressionLinker(UnifiedCacheLinker):
             identity,
             self.block_pages,
             store_bytes=config.get("store_bytes", 4 << 30),
+            accounting_root=accounting_root,
         )
         self.layer_done_counter = CompletedBatchCounter()
         if self.adapter.hybrid:
