@@ -155,6 +155,41 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
     )
 
 
+def _merge_prefix_compression_results(
+    action: str, results: List[PrefixCompressionReqOutput]
+) -> PrefixCompressionReqOutput:
+    """Fold the per-rank replies of a data-parallel fan-out into one answer.
+
+    Every DP rank owns an independent linker, store and event table, so the
+    first reply is not the authoritative one: a rank that never served the
+    request has nothing to say about it. Returning `results[0]` would report
+    empty events for 1-1/dp_size of all requests.
+
+    Failures win, so a partially busy engine reports 409 rather than a
+    misleading success. Request events concatenate, because exactly one rank
+    holds them. Counts sum, including the two inside the nested `store` block,
+    because a caller asking how much was compressed means across the engine;
+    the rest of `store` describes one store's layout and budget, which is the
+    same on every rank and which summing would turn into nonsense.
+    """
+    failed = [r for r in results if r.status_code != 200]
+    if failed:
+        return failed[0]
+    if action == "events":
+        return PrefixCompressionReqOutput(
+            data={"events": [e for r in results for e in r.data["events"]]}
+        )
+    data = dict(results[0].data)
+    data["idle"] = all(r.data["idle"] for r in results)
+    data["stored_blocks"] = sum(r.data["stored_blocks"] for r in results)
+    data["store"] = dict(data["store"]) | {
+        name: sum(r.data["store"][name] for r in results)
+        for name in ("stored_blocks", "evictions")
+    }
+    data["dp_size"] = len(results)
+    return PrefixCompressionReqOutput(data=data)
+
+
 class TokenizerControlMixin:
     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
     profile, internal state, etc.) -- everything that talks to the scheduler via
@@ -849,7 +884,8 @@ class TokenizerControlMixin:
 
     async def prefix_compression(self, obj: PrefixCompressionReqInput):
         self.auto_create_handle_loop()
-        return (await self.prefix_compression_communicator(obj))[0]
+        results = await self.prefix_compression_communicator(obj)
+        return _merge_prefix_compression_results(obj.action, results)
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()

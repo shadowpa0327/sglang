@@ -11,23 +11,24 @@ prompt (tokens)
 |-- blk0 --|-- blk1 --|-- blk2 --|- tail -|
    stored     stored     stored    never
 
-block = 1 key = 1 codec call = 1 payload (+ 1 raw recurrent state)
+block = 1 key = 1 payload (+ 1 raw recurrent state)
 ```
 
 | | rule |
 | --- | --- |
 | key | chained hash of the block's last page (`get_hash_str`), so equal token prefixes give equal keys |
-| trigger | the request's own prefill: every chunk end stores each newly completed block |
-| KV | `plugin.compress` on `[block_pages, layers, page_tokens, kv_heads, dim]` key/value |
-| Mamba (hybrid) | the live recurrent + conv state at the block end, copied raw |
+| trigger | `scope: block` stores each newly completed block at every chunk end; `scope: prompt` stores all of them when the request finishes |
+| KV | `plugin.compress_prompt` on a list of `[block_pages, layers, page_tokens, kv_heads, dim]` key/value blocks |
+| Mamba (hybrid) | the live recurrent + conv state at a block end, copied raw; sampled during prefill in either scope |
 | hit | whole blocks from the prompt start; stop at the first missing block |
 | restore | decode the hit blocks into request-private slots, copy the last block's state |
 | tail | never stored, always recomputed |
 | native reuse | off in `compressed` mode; the radix tree is a chunk cache |
 
-There is no partial addressing inside a block, no object shared between
-blocks, and nothing tied to radix nodes: node splits, evictions and
-write-through never touch the store.
+There is no partial addressing inside a block and nothing tied to radix nodes:
+node splits, evictions and write-through never touch the store. Blocks are
+independent unless the codec returns a shared table for a prompt, which the
+store reference-counts and merges back into every citing block at restore.
 
 ## Files
 
@@ -66,6 +67,12 @@ lands on a boundary that is valid for both. This permits, for example, 4K
 compression blocks with 8K prefill chunks without inventing intermediate
 recurrent states.
 
+Under `scope: prompt` the same chunk ends carry no KV work; they only sample the
+recurrent checkpoint, since the state at the finish sits one prompt tail past
+the last boundary. Encoding waits for the finish, where the whole prompt's KV is
+still in the request's slots, and every complete block goes to the codec in one
+call. Restorable depth is therefore identical to `scope: block`.
+
 ## Configuration
 
 ```python
@@ -79,8 +86,10 @@ engine = sglang.Engine(
         "plugin": "/abs/path/algorithm.py",   # or "identity" / "int8"
         "parameters": {},
         "cache_mode": "compressed",          # fixed for this server lifetime
+        "scope": "block",                     # or "prompt": encode at request finish
         "block_pages": 32,                    # 8192 tokens at page 256
         "key_space": "auto",                  # follow the plugin; or pre_rope / post_rope
+        "shared_bytes": 2 << 30,              # pool for per-prompt shared tables
         "metrics_path": "/abs/path/events.jsonl",
         "audit": False,
     }),
