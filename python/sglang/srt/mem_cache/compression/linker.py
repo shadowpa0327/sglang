@@ -1,11 +1,21 @@
 """Block-granular compressed prefix store behind the external cache linker.
 
-Compression follows the request, not the radix tree. Each time a prefill chunk
-lands, every newly completed block of `block_pages` pages is gathered from the
-request's own slots, encoded by the plugin, and stored with the raw recurrent
-state at that boundary (hybrid models). Lookups and restores move whole blocks;
-the incomplete tail of a prompt is recomputed. Restores are synchronous: every
-queued request is restored before its forward batch can read KV.
+Compression follows the request, not the radix tree. Lookups and restores move
+whole blocks; the incomplete tail of a prompt is recomputed. Restores are
+synchronous: every queued request is restored before its forward batch can read
+KV.
+
+`scope` picks when the codec sees a block:
+
+    block  : each time a prefill chunk lands, every newly completed block is
+             gathered from the request's own slots and encoded on its own.
+    prompt : nothing is encoded until the request finishes, and then every
+             complete block of its prompt is handed to the codec in one call,
+             so a basis or statistic can be fit over the whole prompt.
+
+Both store the raw recurrent state at a block boundary (hybrid models). Under
+`prompt` that state is still sampled during prefill, because after the prompt's
+last chunk the live state no longer matches any block boundary.
 """
 
 import hashlib
@@ -39,6 +49,8 @@ KNOWN_SETTINGS = {
     "audit_fault",
     "key_space",
     "store_bytes",
+    "scope",
+    "shared_bytes",
 }
 
 
@@ -180,6 +192,9 @@ class CompressionLinker(UnifiedCacheLinker):
             raise ValueError(f"Unknown prefix compression settings: {sorted(unknown)}")
         self.adapter = NativePoolAdapter(params)
         self.page_size = params.page_size
+        self.scope = config.get("scope", "block")
+        if self.scope not in {"block", "prompt"}:
+            raise ValueError("scope must be block or prompt")
         self.block_pages = config.get("block_pages", 16)
         if type(self.block_pages) is not int or self.block_pages < 1:
             raise ValueError("block_pages must be a positive page count")
@@ -246,12 +261,14 @@ class CompressionLinker(UnifiedCacheLinker):
                 "method": "fp32-inverse-rotation-from-model-rope-table",
                 "rope": self.pre_rope.table.description,
             }
+        identity["scope"] = self.scope
         self.store = BlockStore(
             plugin,
             identity,
             self.block_pages,
             store_bytes=config.get("store_bytes", 4 << 30),
             accounting_root=accounting_root,
+            shared_bytes=config.get("shared_bytes", 2 << 30),
         )
         self.layer_done_counter = CompletedBatchCounter()
         if self.adapter.hybrid:
@@ -262,6 +279,8 @@ class CompressionLinker(UnifiedCacheLinker):
         self.completed_loads = deque()
         # rid -> (hashed prompt pages, chained hash of the last hashed page)
         self.progress = {}
+        # Prompt scope only: rid -> (block index, recurrent state at its end)
+        self.checkpoints = {}
         self.cache_mode = config.get("cache_mode", "compressed")
         if self.cache_mode not in {"none", "native", "compressed"}:
             raise ValueError("cache_mode must be none, native or compressed")
@@ -326,12 +345,19 @@ class CompressionLinker(UnifiedCacheLinker):
         `processed_tokens` prompt tokens have KV in the request's slots. For a
         hybrid model the live recurrent state matches that position only before
         the first decode step, so blocks completed later are left to the tail.
+        In prompt scope this call only samples that state until the finish,
+        where every complete block is stored in one codec call.
         """
+        if self.scope == "prompt" and not finished:
+            self._hold_checkpoint(req, processed_tokens)
+            return
+        # Prompt scope leaves `progress` empty, so a finish starts from block 0.
         hashed_pages, last_hash = (
             self.progress.pop(req.rid, (0, None))
             if finished
             else self.progress.get(req.rid, (0, None))
         )
+        held = self.checkpoints.pop(req.rid, None) if finished else None
         if not self.writes_enabled or req.kv.req_pool_idx is None:
             return
         processed = min(processed_tokens, len(req.origin_input_ids))
@@ -352,12 +378,17 @@ class CompressionLinker(UnifiedCacheLinker):
             if checkpoint_index is not None
             else None
         )
+        # Prompt scope reaches the finish with a state one prompt tail past the
+        # last boundary; the one sampled during prefill is the restorable one.
+        if checkpoint is None and held is not None:
+            checkpoint_index, checkpoint = held
         start = done * self.block_tokens
         hashes = get_hash_str(
             req.origin_input_ids[start : complete * self.block_tokens],
             last_hash,
             page_size=self.page_size,
         )
+        blocks = []
         for index in range(done, complete):
             offset = (index - done + 1) * self.block_pages
             key = hashes[offset - 1]
@@ -376,12 +407,31 @@ class CompressionLinker(UnifiedCacheLinker):
                         }
                     )
                 continue
-            self._compress_block(req, index, key, parent, state=state)
+            blocks.append((index, key, parent, state))
+        self._compress(req, blocks)
         if not finished:
             self.progress[req.rid] = (complete * self.block_pages, hashes[-1])
 
-    def _compress_block(self, req, index, key, parent, *, state=None):
-        begin = time.perf_counter_ns()
+    @torch.no_grad()
+    def _hold_checkpoint(self, req, processed_tokens):
+        """Keep the deepest recurrent state that a restore could resume from."""
+        if (
+            not self.adapter.hybrid
+            or not self.writes_enabled
+            or req.kv.req_pool_idx is None
+            or req.output_ids
+        ):
+            return
+        processed = min(processed_tokens, len(req.origin_input_ids))
+        if processed % self.block_tokens:
+            return
+        self.checkpoints[req.rid] = (
+            processed // self.block_tokens - 1,
+            self.adapter.gather_state(req.kv.mamba_pool_idx),
+        )
+
+    def _gather_block(self, req, index):
+        """Codec inputs for one block, in the plugin's declared key space."""
         start, end = index * self.block_tokens, (index + 1) * self.block_tokens
         slots = self.adapter.slots(req, start, end)
         native = self.adapter.gather_kv(slots)
@@ -398,44 +448,56 @@ class CompressionLinker(UnifiedCacheLinker):
             "start_position": start,
             "block_index": index,
         }
-        inputs = native
         if self.pre_rope is not None:
             context["key_space"] = "pre_rope"
             keys = native.pop("key")
-            inputs = {
-                **native,
-                "key": self.pre_rope.derotate(
-                    keys, start_position=start, audit=self.audit is not None
-                ),
-            }
+            native["key"] = self.pre_rope.derotate(
+                keys, start_position=start, audit=self.audit is not None
+            )
             del keys
-        record = self.store.insert(
-            key, inputs, context=context, state=state, parent=parent
+        return native, context, slots, sample
+
+    def _compress(self, req, blocks):
+        """Encode a run of this prompt's blocks; the codec sees all of them."""
+        if not blocks:
+            return
+        begin = time.perf_counter_ns()
+        gathered = [self._gather_block(req, index) for index, *_ in blocks]
+        records = self.store.insert_prompt(
+            [key for _, key, _, _ in blocks],
+            [inputs for inputs, _, _, _ in gathered],
+            contexts=[context for _, context, _, _ in gathered],
+            states=[state for *_, state in blocks],
+            parents=[parent for _, _, parent, _ in blocks],
         )
         if self.adapter.device.type == "cuda":
             torch.cuda.current_stream(self.adapter.device).synchronize()
-        for evicted in record.pop("evicted"):
+        latency = (time.perf_counter_ns() - begin) / 1e6
+        for (index, key, _, _), record in zip(blocks, records):
+            for evicted in record.pop("evicted"):
+                self.record(
+                    {
+                        "event": "evict",
+                        "rid": req.rid,
+                        "key": evicted,
+                        "tokens": self.block_tokens,
+                        "stored_blocks": len(self.store.blocks),
+                    }
+                )
             self.record(
                 {
-                    "event": "evict",
+                    "event": "compress",
                     "rid": req.rid,
-                    "key": evicted,
-                    "tokens": self.block_tokens,
-                    "stored_blocks": len(self.store.blocks),
+                    "block": index,
+                    **record,
+                    "blocks_encoded": len(blocks),
+                    "latency_ms": latency / len(blocks),
+                    "timer": "wall_sync",
                 }
             )
-        self.record(
-            {
-                "event": "compress",
-                "rid": req.rid,
-                "block": index,
-                **record,
-                "latency_ms": (time.perf_counter_ns() - begin) / 1e6,
-                "timer": "wall_sync",
-            }
-        )
         if self.audit is not None:
-            self.audit.source(slots, sample, key)
+            for (_, key, _, _), (_, _, slots, sample) in zip(blocks, gathered):
+                self.audit.source(slots, sample, key)
 
     # ---- target side: whole-block lookup and synchronous restore ----
 
@@ -523,6 +585,7 @@ class CompressionLinker(UnifiedCacheLinker):
         self.queued.clear()
         self.completed_loads.clear()
         self.progress.clear()
+        self.checkpoints.clear()
         self.layer_done_counter.reset()
         self.store.reset()
         self.request_events.clear()
