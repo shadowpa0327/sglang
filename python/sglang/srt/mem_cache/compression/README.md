@@ -1,140 +1,159 @@
-# Block-granular prefix compression
+# Prefix compression
 
-See [Architecture](ARCHITECTURE.md) for Mermaid diagrams, execution flows,
-memory ownership, and mode controls.
-
-SGLang serves; a Python plugin owns the numerics. The unit of everything on the
-token axis is the **block**: `block_pages` consecutive pages of one prompt.
+See [Architecture](ARCHITECTURE.md) for component boundaries and execution
+flows. SGLang owns request/cache mechanics; a Python plugin owns only the
+numerical round trip:
 
 ```text
-prompt (tokens)
-|-- blk0 --|-- blk1 --|-- blk2 --|- tail -|
-   stored     stored     stored    never
-
-block = 1 key = 1 payload (+ 1 raw recurrent state)
+plugin.compress(X) -> opaque payload -> plugin.decompress(...) -> X'
 ```
 
-| | rule |
-| --- | --- |
-| key | chained hash of the block's last page (`get_hash_str`), so equal token prefixes give equal keys |
-| trigger | `scope: block` stores each newly completed block at every chunk end; `scope: prompt` stores all of them when the request finishes |
-| KV | `plugin.compress_prompt` on a list of `[block_pages, layers, page_tokens, kv_heads, dim]` key/value blocks |
-| Mamba (hybrid) | the live recurrent + conv state at a block end, copied raw; sampled during prefill in either scope |
-| hit | whole blocks from the prompt start; stop at the first missing block |
-| restore | decode the hit blocks into request-private slots, copy the last block's state |
-| tail | never stored, always recomputed |
-| native reuse | off in `compressed` mode; the radix tree is a chunk cache |
+The same unit enters compression and leaves decompression. Plugins do not split
+payloads, expose shared tensors, or reconstruct subranges.
 
-There is no partial addressing inside a block and nothing tied to radix nodes:
-node splits, evictions and write-through never touch the store. Blocks are
-independent unless the codec returns a shared table for a prompt, which the
-store reference-counts and merges back into every citing block at restore.
+## Compression units
+
+| `compression_unit` | Write trigger | Stored entry | Hit policy | Eviction |
+| --- | --- | --- | --- | --- |
+| `block` | Completed blocks during request progress | One fixed-size block | Longest consecutive block prefix | Block LRU |
+| `request` | `cache_finished_req()` only | One opaque restorable request span | Exact complete-input identity only | Whole-request LRU |
+
+Request mode is named for its lifecycle trigger. It is not a special “prefill
+finished” hook: an evaluator may submit a preparation request with one output
+token, and SGLang invokes compression when that request is finalized.
+
+```text
+block mode                         request mode
+
+chunk progress                     unfinished chunk (hybrid only)
+   |                                  |
+   v                                  +--> retain deepest recurrent checkpoint
+gather one completed block
+   |                               request finalization
+   v                                  |
+compress/store block                  v
+                                   gather restorable span once
+                                      |
+                                      v
+                                   compress/store opaque request
+```
+
+In request mode the complete original input, `extra_key`, and `cache_salt` form
+the identity. A request that merely shares a prefix cannot hit. The payload can
+cover a shorter restorable span—for example, the deepest valid hybrid recurrent
+checkpoint—but identity still uses the complete input.
 
 ## Files
 
-- `linker.py` - `CompressionLinker` (external-linker backend `compression`) and
-  `NativePoolAdapter` (slots <-> plugin tensors, recurrent state copies).
-- `kvcompress.store` - engine-independent `BlockStore`.
-- `kvcompress.api` - `KVCompressionPlugin` / `CompressedPayload`; `kvcompress.loader`
-  loads external Python codec files. Import these APIs directly from `kvcompress`.
-- `pre_rope.py` - optional key space: de-rotate keys with the model's own RoPE
-  table before `compress`, re-rotate after `decompress`.
-- `audit.py` - opt-in byte-level provenance (source round trip, poisoned source
-  slots, exact scatter, attention-read hashes, no prefix recomputation).
+- `linker.py`: request lifecycle, exact identity, gather/scatter, and store routing.
+- `pre_rope.py`: optional de-rotation before compression and re-rotation after
+  whole-unit decompression.
+- `kvcompress.store.BlockStore`: fixed-layout block storage.
+- `kvcompress.request_store.RequestStore`: variable-size opaque request storage.
+- `kvcompress.api`: the single plugin interface.
+- `audit.py`: block-mode provenance audit. Request mode currently rejects
+  `audit=true`.
 
-Codec implementations live in workspace `codecs/` (identity, row INT8, packed
-INT4/INT2, xKV cross-layer SVD, template); example paths are compatibility symlinks.
-
-## Hooks into SGLang
+## Request-mode flow
 
 ```text
-scheduler ---- chunk done ----> cache_unfinished_req
-          ---- finish -------> cache_finished_req
-                                  |  on_request_progress(req, processed)
-                                  v
-                          CompressionLinker: store new blocks
-admission ---- match_prefix ---> linker.match -> lookup(block keys)
-          ---- init_load_back -> _load_private -> load / start_layer_wise_loading
+cache_finished_req(req)
+    |
+    v
+CompressionLinker.on_request_progress(..., finished=True)
+    |
+    +-- exact key = hash(all original input IDs, extra_key, cache_salt)
+    +-- choose complete page-aligned restorable span
+    +-- gather logical slots once through req_to_token + index_select
+    +-- optionally de-rotate all keys
+    v
+plugin.compress(full span)
+    |
+    v
+RequestStore.insert(exact key, opaque payload, optional recurrent state)
+
+next request admission
+    |
+    +-- exact complete-input key miss -> no compressed hit
+    +-- exact key hit -> allocate the entire stored span
+    v
+plugin.decompress(full payload)
+    |
+    +-- optionally re-rotate all keys
+    +-- scatter full K/V span once
+    +-- restore recurrent checkpoint
 ```
 
-`processed` counts prompt tokens whose KV sits in the request's slots. A chunk
-may contain several compression blocks: each completed KV block is stored, while
-a hybrid recurrent checkpoint is attached only to the final block at a chunk
-boundary. Lookup therefore returns the longest contiguous prefix ending at a
-block with a checkpoint. The linker publishes `prefill_boundary_tokens` as the
-least common multiple of the block and chunk sizes, so the scheduler periodically
-lands on a boundary that is valid for both. This permits, for example, 4K
-compression blocks with 8K prefill chunks without inventing intermediate
-recurrent states.
+The store budget is a logical resident-byte limit, not a custom GPU arena:
 
-Under `scope: prompt` the same chunk ends carry no KV work; they only sample the
-recurrent checkpoint, since the state at the finish sits one prompt tail past
-the last boundary. Encoding waits for the finish, where the whole prompt's KV is
-still in the request's slots, and every complete block goes to the codec in one
-call. Restorable depth is therefore identical to `scope: block`.
+```text
+entry_bytes = owned payload tensor bytes + recurrent-state tensor bytes
+
+while used_bytes + entry_bytes > store_bytes:
+    evict the least-recently-used complete request
+```
+
+Payloads larger than the budget are compressed but not inserted. Plugin-global
+tensors shared across requests remain separate and are reported as
+`global_bytes`.
 
 ## Configuration
 
+Block mode:
+
 ```python
-engine = sglang.Engine(
-    model_path=...,
-    page_size=256,
-    chunked_prefill_size=8192,
-    enable_unified_cache_external_linker=True,
-    unified_cache_external_linker_backend="compression",
-    prefix_compression_config=json.dumps({
-        "plugin": "/abs/path/algorithm.py",   # or "identity" / "int8"
-        "parameters": {},
-        "cache_mode": "compressed",          # fixed for this server lifetime
-        "scope": "block",                     # or "prompt": encode at request finish
-        "block_pages": 32,                    # 8192 tokens at page 256
-        "key_space": "auto",                  # follow the plugin; or pre_rope / post_rope
-        "shared_bytes": 2 << 30,              # pool for per-prompt shared tables
-        "metrics_path": "/abs/path/events.jsonl",
-        "audit": False,
-    }),
-)
+prefix_compression_config=json.dumps({
+    "plugin": "/abs/path/algorithm.py",
+    "parameters": {},
+    "cache_mode": "compressed",
+    "compression_unit": "block",
+    "block_pages": 32,
+    "store_bytes": 10 << 30,
+    "key_space": "auto",
+    "metrics_path": "/abs/path/events.jsonl",
+    "audit": False,
+})
 ```
 
-The persistent HTTP server exposes:
+Request mode:
 
-| endpoint | effect |
-| --- | --- |
-| `GET /prefix_compression/status` | resolved codec identity, mode, block size, idle/write state |
-| `POST /prefix_compression/control` with `{"action":"reset"}` | idle-only run reset, preserve fixed mode, restore writes |
-| same endpoint with `frozen` / `unfreeze` | idle-only global compressed storage write control |
-| `GET /prefix_compression/events/{request_id}` | collect and consume events for that request, including shared batch events |
-
-The evaluator supplies `rid` on `/generate` and joins the response/events to run,
-session and case IDs. It never slices a shared event file to attribute requests.
-Legacy in-process mode RPCs can reset only the already configured mode; switching
-modes requires another server. Opening or closing a frontend session has no engine effect.
-
-The asynchronous evaluator and optional server runner live in `src/kvcompress`.
-Each case caches its reusable prefix once and then evaluates its requests with
-writes enabled. The bounded store evicts least-recently-used prefix tails.
-
-## Events
-
-`compress` (per block: key, tokens, payload/metadata/state bytes, ratio and latency),
-`state_checkpoint`, `lookup` (hit pages), `private_restore`, `decompress`
-(blocks, tokens, latency), `load_batch`, `trial_mode`, `frozen`, and the
-`audit_*` records when auditing.
-
-## Smoke test
-
-```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python .venv/bin/python test/manual/compression/smoke.py \
-  --model /path/to/Llama-3.1-8B-Instruct --output /tmp/smoke --plugin identity --mixed --overlap
-# hybrid: add --hybrid and point --model at Qwen3.5-9B
+```python
+prefix_compression_config=json.dumps({
+    "plugin": "/abs/path/algorithm.py",
+    "parameters": {},
+    "cache_mode": "compressed",
+    "compression_unit": "request",
+    "store_bytes": 10 << 30,
+    "key_space": "auto",
+    "metrics_path": "/abs/path/events.jsonl",
+})
 ```
 
-Unit tests: `test/registered/unit/mem_cache/test_compression_*.py`,
-`test_xkv_pre_rope.py`, `test_packed_quant_plugin.py`.
+`compression_unit` defaults to `block`. The old `scope` setting is rejected;
+there is no `prompt` alias. `block_pages` applies only to block mode.
 
-## Scope
+## Status and events
 
-One GPU, BF16/FP16 `MHATokenToKVPool` (the full-attention pool of a hybrid
-model), synchronous compression on the scheduler thread, blocks completed
-during decode are not stored. Not covered: TP/PP, LoRA, speculative decoding,
-ReplaySSM ring state, int8 recurrent checkpoints, quantized active KV.
+`GET /prefix_compression/status` reports `compression_unit` and the selected
+store description. `restoration_boundary_tokens` is the block/chunk common
+boundary in block mode, the chunk/page common checkpoint boundary for hybrid
+request mode, and one page for non-hybrid request mode. Block stores report
+`stored_blocks`; request stores report `stored_requests`, logical
+used/free/peak bytes, whole-request evictions, and cumulative compression byte
+counters.
+
+Request mode emits one `compress` event per stored request, exact-hit `lookup`
+events, one `decompress` event per restored request, and whole-request `evict`
+events. Block event shapes remain unchanged.
+
+## Current limits
+
+One GPU, BF16/FP16 ordinary full-attention KV, synchronous compression, and no
+LoRA/speculative decoding/ReplaySSM/int8 recurrent checkpoints. Request mode
+does not support partial-prefix hits or byte-level audit. Its dynamic tensor
+allocations honor the logical store budget but do not preallocate a physical
+GPU arena. A hybrid request also needs an unfinished chunk boundary before its
+final prefill chunk; a short or unchunked hybrid request has no earlier
+restorable recurrent state and emits `compress_skipped` instead of being stored.
+Requests with raw input embeddings or positional embedding overrides are also
+skipped because token IDs alone are not an exact KV identity for them.

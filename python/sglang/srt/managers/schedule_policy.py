@@ -811,8 +811,8 @@ class PrefillAdder:
         return -(-tokens // self.page_size) * self.page_size
 
     def _cap_extend_at_boundary(self, prefix_len: int, extend_len: int) -> int:
-        # The compression linker stores a block only when a chunk ends exactly at
-        # the block end, so no chunk may straddle an absolute k * boundary position.
+        # The compression linker may require exact block or recurrent-checkpoint
+        # endpoints, so no chunk may straddle an absolute k * boundary position.
         boundary = self.prefill_boundary_tokens
         # DLLM sizes its own blocks; without chunking there is nothing to cap.
         if (

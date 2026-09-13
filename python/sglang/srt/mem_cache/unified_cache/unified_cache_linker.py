@@ -67,6 +67,16 @@ class UnifiedCacheLinker(ABC):
         Local to this rank; the tree intersects the sets across ranks.
         """
 
+    def lookup_request(
+        self,
+        req: Req,
+        transfers: list[PoolTransfer],
+        *,
+        device_hit_pages: int = 0,
+    ) -> list[int]:
+        """Request-aware lookup hook; ordinary backends remain rid-only."""
+        return self.lookup(req.rid, transfers)
+
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a load into the given device indices.
@@ -198,7 +208,11 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            self.cache_linker.lookup_request(
+                req,
+                lookup_transfers,
+                device_hit_pages=device_hit_len // page,
+            ),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )

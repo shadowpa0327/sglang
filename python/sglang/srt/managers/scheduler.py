@@ -4902,13 +4902,17 @@ class Scheduler(
             else:
                 linker.writes_enabled = linker.cache_mode == "compressed"
                 linker.record({"event": "unfreeze"})
+        store = linker.store.description()
         return PrefixCompressionReqOutput(data={
             "idle": self.is_fully_idle(),
             "cache_mode": linker.cache_mode,
+            "compression_unit": linker.compression_unit,
             "writes_enabled": linker.writes_enabled,
             "block_tokens": linker.block_tokens,
-            "stored_blocks": len(linker.store.blocks),
-            "store": linker.store.description(),
+            "restoration_boundary_tokens": linker.restoration_boundary_tokens,
+            "stored_blocks": store.get("stored_blocks", 0),
+            "stored_requests": store.get("stored_requests", 0),
+            "store": store,
             "identity": linker.store.identity,
         })
 

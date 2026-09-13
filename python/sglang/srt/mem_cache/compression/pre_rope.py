@@ -16,7 +16,7 @@ against the native key with a bound of two ulps of the largest channel.
 
 import torch
 
-from kvcompress.api import CompressedPayload, KVCompressionPlugin, PromptEncoding
+from kvcompress.api import CompressedPayload, KVCompressionPlugin
 
 KEY_SPACES = ("pre_rope", "post_rope")
 
@@ -328,25 +328,16 @@ class NativeRoPEDecodePlugin(KVCompressionPlugin):
         }
 
     def compress(self, tensors, *, context):
-        return self.compress_prompt([tensors], contexts=[context]).payloads[0]
-
-    def compress_prompt(self, blocks, *, contexts):
-        if any(context.get("key_space") != "pre_rope" for context in contexts):
+        if context.get("key_space") != "pre_rope":
             raise ValueError("Pre-RoPE codec must receive de-rotated keys")
-        encoding = self.inner.compress_prompt(blocks, contexts=contexts)
-        return PromptEncoding(
-            [
-                CompressedPayload(
-                    payload.tensors,
-                    {
-                        "inner": payload.metadata,
-                        "start_position": context["start_position"],
-                        "layer_ids": context["layer_ids"],
-                    },
-                )
-                for payload, context in zip(encoding.payloads, contexts)
-            ],
-            encoding.shared,
+        payload = self.inner.compress(tensors, context=context)
+        return CompressedPayload(
+            payload.tensors,
+            {
+                "inner": payload.metadata,
+                "start_position": context["start_position"],
+                "layer_ids": context["layer_ids"],
+            },
         )
 
     def prepare_decompression(self, payload, *, out):

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from kvcompress.loader import load_plugin
+from kvcompress.request_store import RequestStore
 from kvcompress.store import BlockStore
 from sglang.srt.mem_cache.compression.linker import (
     CompletedBatchCounter,
@@ -41,15 +42,35 @@ def make_adapter(hybrid=False, slots=64):
     return adapter
 
 
-def make_linker(adapter, plugin=None, store_bytes=1 << 20, *, preallocate=True):
+def make_linker(
+    adapter,
+    plugin=None,
+    store_bytes=1 << 20,
+    *,
+    preallocate=True,
+    compression_unit="block",
+):
     linker = CompressionLinker.__new__(CompressionLinker)
     linker.adapter = adapter
-    linker.page_size, linker.block_pages, linker.block_tokens = PAGE, BLOCK_PAGES, BLOCK
-    linker.store = BlockStore(
-        plugin or IdentityPlugin(), {}, BLOCK_PAGES, store_bytes=store_bytes
+    linker.page_size = PAGE
+    linker.block_pages = BLOCK_PAGES if compression_unit == "block" else None
+    linker.block_tokens = BLOCK if compression_unit == "block" else None
+    linker.compression_unit = compression_unit
+    linker.store = (
+        BlockStore(
+            plugin or IdentityPlugin(),
+            {},
+            BLOCK_PAGES,
+            store_bytes=store_bytes,
+        )
+        if compression_unit == "block"
+        else RequestStore(
+            plugin or IdentityPlugin(), {}, store_bytes=store_bytes
+        )
     )
     linker.pre_rope = linker.audit = linker.audit_fault = None
-    linker.progress, linker.queued = {}, {}
+    linker.progress, linker.checkpoints, linker.queued = {}, {}, {}
+    linker.request_pages, linker.request_hits = {}, {}
     linker.completed_loads = deque()
     linker.layer_done_counter = CompletedBatchCounter()
     linker.writes_enabled, linker.compressed_only = True, True
@@ -57,7 +78,7 @@ def make_linker(adapter, plugin=None, store_bytes=1 << 20, *, preallocate=True):
     linker.request_events = {}
     linker.events = []
     linker.record = linker.events.append
-    if preallocate:
+    if preallocate and compression_unit == "block":
         sample = adapter.gather_kv(torch.arange(BLOCK))
         state = adapter.gather_state(0) if adapter.hybrid else None
         linker.store.allocate(sample, context=adapter.context(), state=state)
@@ -98,6 +119,102 @@ def test_blocks_complete_chunk_by_chunk_and_tail_is_never_stored():
     assert record["tokens"] == BLOCK and record["compression_ratio"] < 1  # identity + metadata
     event = next(e for e in linker.events if e["event"] == "compress")
     assert event["latency_ms"] >= 0 and event["timer"] == "wall_sync"
+
+
+def test_request_unit_gathers_one_restorable_span_only_at_finish():
+    adapter = make_adapter()
+    linker = make_linker(adapter, compression_unit="request")
+    gathered = []
+    gather_kv = adapter.gather_kv
+
+    def record_gather(slots):
+        gathered.append(slots.clone())
+        return gather_kv(slots)
+
+    adapter.gather_kv = record_gather
+    req = make_req(adapter, "a", range(10), row=0, first_slot=10)
+    linker.on_request_progress(req, 8, finished=False)
+    assert gathered == []
+    linker.on_request_progress(req, 10, finished=True)
+    assert len(gathered) == 1
+    assert torch.equal(gathered[0], torch.arange(10, 18))
+    assert len(linker.store.requests) == 1
+    event = next(event for event in linker.events if event["event"] == "compress")
+    assert event["compression_unit"] == "request"
+    assert event["restorable_tokens"] == 8
+    assert event["pages"] == 4
+
+
+def test_request_unit_requires_the_complete_input_identity():
+    adapter = make_adapter()
+    linker = make_linker(adapter, compression_unit="request")
+    stored = make_req(adapter, "stored", [1, 2, 3, 4, 5, 6, 7, 8, 9], row=0, first_slot=0)
+    linker.on_request_progress(stored, 9, finished=True)
+    keys = get_hash_str(stored.origin_input_ids[:8], None, page_size=PAGE)
+    transfers = [PoolTransfer(name=PoolName.KV, keys=keys)]
+
+    exact = make_req(adapter, "exact", stored.origin_input_ids, row=1, first_slot=20)
+    assert linker.lookup_request(exact, transfers, device_hit_pages=1) == []
+    assert linker.events[-1]["reason"] == "native_prefix_present"
+    assert linker.store.description()["pinned_requests"] == 0
+    assert linker.lookup_request(exact, transfers) == [4]
+    assert linker.store.description()["pinned_requests"] == 1
+    changed_tail = make_req(
+        adapter,
+        "changed",
+        [1, 2, 3, 4, 5, 6, 7, 8, 99],
+        row=2,
+        first_slot=30,
+    )
+    assert linker.lookup_request(changed_tail, transfers) == []
+    assert linker.events[-1]["exact_request_hit"] is False
+    namespaced = make_req(
+        adapter, "namespaced", stored.origin_input_ids, row=3, first_slot=40
+    )
+    namespaced.cache_salt = "different-tenant"
+    assert linker.lookup_request(namespaced, transfers) == []
+    embedded = make_req(
+        adapter, "embedded", stored.origin_input_ids, row=3, first_slot=40
+    )
+    embedded.input_embeds = torch.randn(9, 8)
+    assert linker.lookup_request(embedded, transfers) == []
+    assert linker.events[-1]["reason"] == "custom_input_embeddings"
+    linker._release_request_hit(exact.rid)
+    assert linker.store.description()["pinned_requests"] == 0
+
+
+def test_request_larger_than_the_budget_is_reported_without_failing_the_request():
+    adapter = make_adapter()
+    linker = make_linker(
+        adapter, store_bytes=64, compression_unit="request"
+    )
+    req = make_req(adapter, "large", range(9), row=0, first_slot=0)
+
+    linker.on_request_progress(req, 9, finished=True)
+
+    assert not linker.store.requests
+    assert linker.events == [
+        {
+            "event": "compress_rejected",
+            "rid": "large",
+            "key": linker._request_key(req),
+            "compression_unit": "request",
+            "restorable_tokens": 8,
+            "reason": "Request needs 512 bytes but store_bytes=64",
+        }
+    ]
+
+
+def test_request_unit_does_not_store_token_ambiguous_embedding_inputs():
+    adapter = make_adapter()
+    linker = make_linker(adapter, compression_unit="request")
+    req = make_req(adapter, "embedded", range(9), row=0, first_slot=0)
+    req.positional_embed_overrides = object()
+
+    linker.on_request_progress(req, 9, finished=True)
+
+    assert not linker.store.requests
+    assert linker.events[-1]["reason"] == "custom_input_embeddings"
 
 
 def test_shared_prefix_compresses_only_new_blocks_with_prefix_closed_keys():
@@ -162,6 +279,124 @@ def test_restore_scatters_whole_blocks_and_state_into_private_slots(hybrid):
     assert linker.pop_completed_load() == ["t"]
     decompress = next(e for e in linker.events if e["event"] == "decompress")
     assert decompress["blocks"] == 2 and decompress["tokens"] == 8
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_request_unit_reconstructs_and_scatters_the_whole_stored_span(hybrid):
+    adapter = make_adapter(hybrid=hybrid)
+    linker = make_linker(adapter, compression_unit="request")
+    source = make_req(
+        adapter,
+        "source",
+        range(9),
+        row=0,
+        first_slot=0,
+        mamba_slot=2 if hybrid else None,
+    )
+    expected = adapter.gather_kv(torch.arange(8))
+    expected_state = adapter.gather_state(2) if hybrid else None
+    if hybrid:
+        linker.on_request_progress(source, 8, finished=False)
+        source.output_ids = [17]
+    linker.on_request_progress(source, 9, finished=True)
+
+    target = make_req(
+        adapter,
+        "target",
+        range(9),
+        row=1,
+        first_slot=30,
+        mamba_slot=5 if hybrid else None,
+    )
+    pages = get_hash_str(list(range(8)), None, page_size=PAGE)
+    transfers = [
+        PoolTransfer(
+            name=PoolName.KV,
+            keys=pages,
+            device_indices=torch.arange(30, 38),
+        )
+    ]
+    if hybrid:
+        transfers.append(
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=pages[-1:],
+                device_indices=torch.tensor([5]),
+            )
+        )
+    assert linker.lookup_request(target, transfers) == [4]
+    assert linker.store.description()["pinned_requests"] == 1
+    assert linker.load(target.rid, transfers)
+    assert linker.start_layer_wise_loading() == 0
+    assert linker.store.description()["pinned_requests"] == 0
+    restored = adapter.gather_kv(torch.arange(30, 38))
+    for name in expected:
+        assert torch.equal(restored[name], expected[name])
+    if hybrid:
+        for name, tensor in adapter.gather_state(5).items():
+            assert torch.equal(tensor, expected_state[name])
+    event = next(event for event in linker.events if event["event"] == "decompress")
+    assert event["compression_unit"] == "request"
+    assert event["requests"] == 1 and event["tokens"] == 8
+
+
+def test_request_unit_unfinished_callbacks_only_keep_deepest_hybrid_checkpoint():
+    adapter = make_adapter(hybrid=True)
+    linker = make_linker(adapter, compression_unit="request")
+    req = make_req(adapter, "a", range(13), row=0, first_slot=0, mamba_slot=2)
+    gathered = []
+    gather_kv = adapter.gather_kv
+
+    def record_gather(slots):
+        gathered.append(slots.clone())
+        return gather_kv(slots)
+
+    adapter.gather_kv = record_gather
+    linker.on_request_progress(req, 4, finished=False)
+    linker.on_request_progress(req, 8, finished=False)
+    assert linker.checkpoints[req.rid][0] == 8
+    assert gathered == []
+    req.output_ids = [17]
+    linker.on_request_progress(req, 13, finished=True)
+    assert len(gathered) == 1
+    assert torch.equal(gathered[0], torch.arange(8))
+    assert next(iter(linker.store.requests.values())).record["tokens"] == 8
+
+
+def test_request_unit_does_not_recompress_or_skip_an_exact_existing_entry():
+    adapter = make_adapter(hybrid=True)
+    linker = make_linker(adapter, compression_unit="request")
+    source = make_req(adapter, "source", range(9), row=0, first_slot=0, mamba_slot=2)
+    linker.on_request_progress(source, 8, finished=False)
+    source.output_ids = [17]
+    linker.on_request_progress(source, 9, finished=True)
+
+    replay = make_req(adapter, "replay", range(9), row=1, first_slot=20, mamba_slot=3)
+    replay.output_ids = [17, 18]
+    before = len(linker.events)
+    linker.on_request_progress(replay, 9, finished=True)
+
+    assert len(linker.events) == before
+    assert linker.store.description()["requests_compressed"] == 1
+
+
+def test_short_hybrid_request_without_an_earlier_checkpoint_is_not_stored():
+    adapter = make_adapter(hybrid=True)
+    linker = make_linker(adapter, compression_unit="request")
+    req = make_req(adapter, "short", range(5), row=0, first_slot=0, mamba_slot=2)
+    req.output_ids = [17]
+
+    linker.on_request_progress(req, 5, finished=True)
+
+    assert not linker.store.requests
+    assert linker.events == [
+        {
+            "event": "compress_skipped",
+            "rid": "short",
+            "compression_unit": "request",
+            "reason": "no_restorable_recurrent_checkpoint",
+        }
+    ]
 
 
 def test_hybrid_chunk_can_store_multiple_blocks_with_one_checkpoint():

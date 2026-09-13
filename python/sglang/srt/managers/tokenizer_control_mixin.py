@@ -167,10 +167,8 @@ def _merge_prefix_compression_results(
 
     Failures win, so a partially busy engine reports 409 rather than a
     misleading success. Request events concatenate, because exactly one rank
-    holds them. Counts sum, including the two inside the nested `store` block,
-    because a caller asking how much was compressed means across the engine;
-    the rest of `store` describes one store's layout and budget, which is the
-    same on every rank and which summing would turn into nonsense.
+    holds them. Capacity, residency, eviction, and cumulative byte counters sum
+    across ranks; fixed per-entry layout fields retain the first rank's value.
     """
     failed = [r for r in results if r.status_code != 200]
     if failed:
@@ -182,10 +180,32 @@ def _merge_prefix_compression_results(
     data = dict(results[0].data)
     data["idle"] = all(r.data["idle"] for r in results)
     data["stored_blocks"] = sum(r.data["stored_blocks"] for r in results)
-    data["store"] = dict(data["store"]) | {
-        name: sum(r.data["store"][name] for r in results)
-        for name in ("stored_blocks", "evictions")
-    }
+    data["stored_requests"] = sum(
+        r.data.get("stored_requests", 0) for r in results
+    )
+    store = dict(data["store"])
+    aggregate_fields = (
+        (
+            "stored_requests",
+            "evictions",
+            "store_bytes",
+            "free_bytes",
+            "used_bytes",
+            "peak_used_bytes",
+            "requests_compressed",
+            "original_bytes_compressed",
+            "payload_bytes_compressed",
+            "state_bytes_compressed",
+            "metadata_bytes_compressed",
+            "global_bytes",
+        )
+        if store.get("storage_unit") == "request"
+        else ("stored_blocks", "evictions")
+    )
+    for name in aggregate_fields:
+        if all(name in result.data["store"] for result in results):
+            store[name] = sum(result.data["store"][name] for result in results)
+    data["store"] = store
     data["dp_size"] = len(results)
     return PrefixCompressionReqOutput(data=data)
 

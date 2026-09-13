@@ -344,7 +344,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def prefill_boundary_tokens(self) -> Optional[int]:
         """Absolute token boundary that prefill chunks must not straddle, when
-        the attached linker declares one (compression blocks); else None."""
+        the attached linker declares one (compression/checkpoint units); else None."""
         if self.linker is None:
             return None
         return getattr(self.linker.cache_linker, "prefill_boundary_tokens", None)

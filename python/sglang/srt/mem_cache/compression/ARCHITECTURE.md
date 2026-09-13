@@ -1,259 +1,184 @@
-# SGLang prefix compression linker architecture
+# SGLang prefix compression architecture
 
-This document describes the experimental implementation in this checkout. The
-compression linker connects SGLang's request/cache lifecycle to a GPU-resident
-compressed block store. It uses the external-cache interface, but its payloads
-stay on the local GPU; there is no CPU or remote storage tier in this backend.
+The compression backend has two storage paths behind one numerical plugin API.
+The paths share native-pool gathering, optional RoPE conversion, and the
+external-linker wrapper; they do not share storage semantics.
 
-The diagrams show the explicit `compressed` / `frozen` experiment path, where
-native cross-request prefix reuse is disabled. The engine still uses ordinary
-native KV for attention and retains each active request's own KV across chunks
-and decoding steps.
-
-## Component architecture
-
-```mermaid
-flowchart TB
-    S["Scheduler<br/>request admission, prefill, completion"]
-    R["UnifiedRadixCache<br/>cache lifecycle and prefix matching"]
-    W["UnifiedCacheLinkerWrapper<br/>hit markers, destination slots, load ownership"]
-    C["CompressionLinker<br/>block boundaries, hashing, lookup, queued restores"]
-
-    S --> R
-    R --> W
-    W --> C
-
-    C --> A["NativePoolAdapter<br/>gather / scatter KV and recurrent state"]
-    A <--> N["Native GPU pools<br/>preallocated BF16/FP16 KV<br/>and active recurrent state"]
-
-    C --> B["BlockStore<br/>prefix hash to StoredBlock<br/>dynamic GPU allocations"]
-    B --> O["Codec interface<br/>optional NativeRoPEDecodePlugin wrapper"]
-    O --> P["Compression plugin<br/>identity / INT8 / packed INT4 or INT2 / SVD"]
-
-    N --> F["Model forward<br/>suffix prefill and decode"]
-```
-
-Arrows above describe calls and access relationships, rather than a single
-chronological data flow. The source and target paths below show execution order.
-
-| Component | Responsibility |
-| --- | --- |
-| `UnifiedRadixCache` | Receives normal cache hooks. In compressed-only mode, bypasses native/session prefix matching. |
-| `UnifiedCacheLinkerWrapper` | Converts matches into scheduler-visible hits, allocates destination slots, and manages pending/private loads. |
-| `CompressionLinker` | Identifies completed blocks, looks up available blocks, and coordinates storage and restoration. |
-| `NativePoolAdapter` | Gathers physical KV slots into plugin tensors and scatters reconstructed tensors back; also copies hybrid state. |
-| `BlockStore` | Owns payloads, original shapes/dtypes, optional checkpoints, and byte accounting. |
-| Compression plugin | Implements numerical encoding, scratch preparation, and reconstruction. |
-| Optional RoPE adapter/wrapper | De-rotates native keys before compression and reapplies the model's RoPE after reconstruction. |
-
-## Compression unit and stored entry
-
-One block contains `block_pages * page_size` consecutive prompt tokens. With
-`block_pages=16` and `page_size=256`, a block contains 4,096 tokens. Its lookup key
-is the chained prefix hash at its final page. Matching requires the same preceding
-token prefix, and identical prefixes share stored blocks.
+## Components
 
 ```text
-Prompt:  [ block 0 ][ block 1 ][ block 2 ][ incomplete tail ]
-Store:   [payload 0][payload 1][payload 2][     nothing     ]
-
-store.blocks[prefix_hash]
-    StoredBlock
-    +-- payload
-    |   +-- tensors: dict[str, GPU Tensor]
-    |   +-- metadata: JSON-compatible dictionary
-    +-- specification: original K/V shapes and dtypes
-    +-- state: raw temporal/conv checkpoint, or None
-    +-- record: byte counts and compression ratio
-    +-- metadata_json: serialized identity, context, and specifications
+Scheduler / UnifiedRadixCache
+             |
+             v
+UnifiedCacheLinkerWrapper
+  - passes the Req to request-aware lookup
+  - allocates private restore destinations
+             |
+             v
+CompressionLinker
+  |                         |
+  | unit=block              | unit=request
+  v                         v
+BlockStore                  RequestStore
+fixed slots                 variable opaque payloads
+block hash lookup           exact full-input lookup
+block LRU                   whole-request LRU
+  |                         |
+  +------------+------------+
+               v
+       one KVCompressionPlugin API
+               |
+               v
+NativePoolAdapter <----> native KV and recurrent pools
 ```
 
-The codec receives separate K/V tensors shaped
-`[block_pages, attention_layers, page_size, kv_heads, head_dim]`. For hybrid
-models, these are the full-attention layers; recurrent state is stored separately.
-
-Each block is one plugin call and one independent payload. INT8 and packed
-INT4/INT2 quantize rows along the head dimension. SVD groups layers within the
-block, factorizing matrices shaped
-`[block_tokens, group_layers * kv_heads * head_dim]`. Numerical layer grouping
-does not change the block's storage or lookup granularity.
-
-Lookup restores consecutive whole blocks and stops at the first miss. There is
-no partial-block restoration. SGLang normally leaves at least one input token
-for forward computation, so a fully available prompt of length `N` generally
-has a compressed hit bounded by `floor((N - 1) / block_tokens) * block_tokens`.
-
-## Source path: compute, compress, store
+The plugin contract is unit-symmetric:
 
 ```text
-Model computes a prefill chunk into native GPU KV
-    |
-    v
-cache_unfinished_req() / cache_finished_req()
-    |
-    v
-CompressionLinker.on_request_progress()
-    |
-    v
-Find newly completed prompt blocks; skip existing keys
-    |
-    v
-NativePoolAdapter.gather_kv(request slots)
-    |
-    v
-Optional: de-rotate keys into pre-RoPE space
-    |
-    v
-BlockStore.insert()
-    +-- plugin.compress(K, V)
-    +-- clone payload tensors into store-owned GPU storage
-    +-- copy raw recurrent checkpoint, if hybrid
-    +-- record original/payload/metadata/state bytes
+compress(X) -> payload
+decompress(payload) -> reconstruction shaped like X
 ```
 
-Compression runs synchronously on the scheduler path. It is triggered by request
-progress, including prefill completion and request completion before slots are
-freed. It is not triggered by memory pressure, radix-node splitting, eviction, or
-tree write-through. Generated continuation tokens are excluded from this store.
+`X` is one block in block mode and one complete restorable request span in
+request mode. The plugin never sees block keys, request identities, eviction,
+payload partitions, or partial reconstruction.
 
-For hybrid models, the live recurrent checkpoint must correspond exactly to a
-block endpoint before decode advances it. A chunk may contain several blocks:
-all completed KV blocks are stored, but only the final block at a chunk boundary
-receives the recurrent checkpoint. Lookup returns the longest contiguous prefix
-whose final block has a checkpoint. The linker exposes the least common multiple
-of the block and chunk sizes through `prefill_boundary_tokens`, and
-`UnifiedRadixCache.prefill_boundary_tokens()` hands it to the scheduler's
-`PrefillAdder`. This lets an 8K chunk store two 4K blocks while keeping a valid
-checkpoint at 8K.
-
-Compression copies a representation into the store; it does not free the active
-source's KV. On normal request completion, its native slots become reusable,
-while the compressed payload survives until store reset.
-
-## Target path: match, reconstruct, execute
-
-```mermaid
-sequenceDiagram
-    participant S as Scheduler / Cache
-    participant W as Linker Wrapper
-    participant C as CompressionLinker
-    participant B as BlockStore / Plugin
-    participant N as Native GPU Pools
-
-    S->>W: match_prefix(request)
-    W->>C: lookup(chained page hashes)
-    C->>B: Check consecutive whole blocks
-    B-->>C: Available blocks
-    C-->>W: Restorable prefix lengths
-    W-->>S: Report hit length
-
-    S->>W: init_load_back(request)
-    W->>N: Allocate request-private slots
-    W->>C: load(request ID, destination slots)
-    Note over C: Queue only; no reconstruction yet
-
-    S->>C: start_layer_wise_loading() via cache and wrapper
-    C->>B: reconstruct(block keys)
-    B->>B: Allocate outputs and scratch
-    B->>B: Decompress; optionally reapply RoPE
-    B-->>C: Native-dtype K/V tensors
-    C->>N: Scatter KV; restore final recurrent checkpoint
-    C->>C: Synchronize GPU work; publish completion
-    C-->>S: Load batch complete
-    S->>N: Forward reads restored prefix
-```
-
-Despite the name `start_layer_wise_loading`, the compression backend restores
-queued requests synchronously before forward execution. It does not stream
-decompression layer by layer alongside attention.
-
-Every target gets private destination slots, including duplicate requests in a
-batch. Restored KV is not inserted into the native radix tree in compressed-only
-mode. A hybrid target restores the checkpoint from the last matched block.
-
-The wrapper tracks hit markers, pending loads, and private destinations. This
-keeps ownership explicit when admission is deferred or a request is cancelled.
-Normal request completion returns active slots to their allocators.
-
-## Memory ownership and measurements
-
-| Category | Lifetime and allocation |
-| --- | --- |
-| Native GPU KV backing | Sized during engine initialization and retained; allocating/freeing request slots does not shrink the backing tensors. |
-| Compressed payloads | Dynamically allocated per stored block; store-owned copies survive request completion until reset. |
-| Raw hybrid checkpoints | Dynamically copied per stored block. |
-| Reconstruction outputs | Full native-dtype outputs allocated for all requested blocks on each reconstruction, then scattered into native destinations. |
-| Codec scratch | Allocated before decompression timing; SVD reuses compatible scratch across layer groups within a block. |
-| PyTorch allocator reserve | May retain freed allocation segments for reuse. |
-
-The compressed store has no fixed-capacity preallocation, byte budget, or
-eviction policy. It consumes GPU memory outside the native slot allocator's
-capacity accounting.
-
-A hit temporarily involves compressed payloads, reconstruction outputs/scratch,
-and native destination slots. Thus payload compression ratio does not directly
-equal process GPU-memory reduction.
-
-Current per-block accounting is:
+## Block path
 
 ```text
-original_bytes    = original K/V tensor bytes
-payload_bytes     = owned encoded tensor storage bytes, including scales/factors
-metadata_bytes    = serialized metadata size
-state_bytes       = raw recurrent checkpoint bytes
-compressed_bytes  = payload_bytes + metadata_bytes
-compression_ratio = original_bytes / compressed_bytes
+cache_unfinished_req / cache_finished_req
+    |
+    v
+find newly completed block boundaries
+    |
+    v
+for each missing block hash
+    gather -> optional de-RoPE -> compress -> fixed BlockStore slot
+
+lookup: consecutive block hashes
+restore: decode each block -> scatter each block -> final checkpoint
 ```
 
-For a pure payload ratio, use `sum(original_bytes) / sum(payload_bytes)` over the
-live, unique blocks. To include unchanged recurrent state, compare
-`sum(original_bytes + state_bytes)` against
-`sum(payload_bytes + state_bytes)`. Report serialized host metadata separately or
-add it to the latter denominator for an accounted representation ratio.
+One block has `block_pages * page_size` tokens. Prefix sharing and recurrent
+checkpoint availability determine the longest restorable sequence of blocks.
+This path preserves the original block-level lookup and eviction behavior.
 
-Decompression timing excludes output/scratch allocation, scatter, and recurrent
-state restoration. It includes RoPE reapplication when enabled. Measure full
-restoration latency and allocated/reserved GPU memory separately inside the
-scheduler worker.
+## Request write path
 
-## Mode controls
+```text
+unfinished callback
+    |
+    +-- non-hybrid: no work
+    +-- hybrid: retain deepest page-aligned recurrent checkpoint only
 
-| Mode | Compression writes | Cross-request reuse | Clears existing cache |
-| --- | --- | --- | --- |
-| `no_reuse` | Off | None | Yes |
-| `native` | Off | Native radix prefixes | Yes |
-| `compressed` | On | Compressed blocks restored into private slots | Yes |
-| `frozen` | Off; existing blocks retained | Compressed blocks restored into private slots | No |
-
-Controls require an idle engine. `frozen` requires an existing compressed mode.
-Backend initialization alone leaves writes enabled and native reuse available;
-explicitly enter `compressed` mode for the private-restoration path above.
-
-```python
-engine.collective_rpc("prefix_compression_control", action="compressed")
-# Run source requests to populate blocks.
-engine.collective_rpc("prefix_compression_control", action="frozen")
-# Run target requests to measure independent reconstruction and quality.
+cache_finished_req
+    |
+    v
+key = SHA256(version, complete original token IDs, extra_key, cache_salt)
+    |
+    v
+choose restorable_end
+    +-- non-hybrid: largest complete page before the final input token
+    +-- hybrid: deepest retained checkpoint not beyond that limit
+    |
+    v
+req_to_token[request row, 0:restorable_end]
+    |
+    v
+one gather across every full-attention layer
+    |
+    v
+optional de-RoPE -> plugin.compress(full span)
+    |
+    v
+RequestStore.insert(key, opaque payload, checkpoint)
 ```
 
-Audit is optional instrumentation for source encoding, scatter correctness,
-attention reads, and prefix recomputation. It requires CUDA graphs disabled and
-adds memory/work, so keep it separate from performance measurements.
+The final token is excluded because SGLang keeps at least one input token for
+logit computation during normal prefix matching. Generated tokens never enter
+the stored artifact. Consequently, a hybrid request needs an earlier unfinished
+chunk checkpoint. If no such checkpoint exists (for example, a short unchunked
+prompt), request compression is skipped because the final recurrent state is
+newer than the largest restorable KV prefix.
 
-## Code map
+## Request lookup and restore
 
-- [Configuration and usage](README.md)
-- [CompressionLinker and NativePoolAdapter](linker.py)
-- `kvcompress.store`: BlockStore and StoredBlock
-- `kvcompress.api`: payload interface; external numerical codecs live in the parent workspace
-- [RoPE conversion](pre_rope.py)
-- [Provenance audit](audit.py)
-- [UnifiedCacheLinkerWrapper](../unified_cache/unified_cache_linker.py)
-- [UnifiedRadixCache hooks](../unified_radix_cache.py)
-- [Scheduler mode controls](../../managers/scheduler.py)
-- [Native GPU pools](../memory_pool.py)
+```text
+match_prefix(req)
+    |
+    v
+UnifiedCacheLinkerWrapper.match(key, req, native_result)
+    |
+    v
+CompressionLinker.lookup_request(req, transfers)
+    |
+    +-- recompute exact complete-input identity
+    +-- require one live RequestStore entry
+    +-- require the transfer to cover the whole stored span
+    v
+report exactly stored_pages (or zero)
+    |
+    +-- pin the matched request entry against LRU eviction
+    |
+    v
+allocate private destination slots
+    |
+    v
+RequestStore.reconstruct(exact key)       one plugin call
+    |
+    v
+optional re-RoPE -> scatter entire span   one linker operation
+    |
+    +-- unpin the entry after reconstruction or cancellation
+    |
+    v
+restore request checkpoint, then run suffix prefill/decode
+```
 
-The adapter currently supports one GPU with ordinary BF16/FP16 full-attention KV,
-including the full-attention pool of supported hybrid recurrent models. TP/PP,
-attention context parallelism, LoRA, speculative decoding, quantized active KV,
-ReplaySSM ring state, and int8 recurrent checkpoints are outside its current scope.
+The base linker API keeps `lookup(rid, transfers)` for existing backends and
+adds a default `lookup_request(req, transfers)` adapter. Existing backends use
+the default; request compression overrides it because exact identity requires
+the complete `Req`.
+
+There are no prefix-hash probes in request mode. A longer, shorter, or
+same-prefix/different-tail input is a miss. The stored payload may cover less
+than the full input only when that exact request's deepest restorable boundary
+is earlier.
+
+## Memory ownership
+
+| Owner | Block mode | Request mode |
+| --- | --- | --- |
+| Native pools | Active request K/V and recurrent state | Same |
+| Compression store | Preallocated fixed block slots | Owned variable-size payload tensors |
+| Codec globals | `global_bytes`, once per server/rank | Same |
+| Reconstruction | One or more block outputs | One complete stored request output |
+
+RequestStore maintains a logical byte budget:
+
+```text
+resident request bytes = payload tensor bytes + recurrent checkpoint bytes
+used_bytes <= store_bytes
+```
+
+It evicts complete LRU entries until a new request fits. CPU metadata is
+reported but does not consume the GPU tensor budget. `global_bytes` stays
+outside `store_bytes` because it is shared across all requests by the plugin.
+
+## RoPE boundary
+
+When `key_space=pre_rope`, the linker de-rotates exactly the selected input unit.
+`NativeRoPEDecodePlugin` stores that unit's `start_position` and layer IDs in its
+ordinary payload metadata. Decompression reconstructs the same complete unit
+and reapplies RoPE once. No context rebinding or post-compression partitioning
+is required.
+
+## Controls and observability
+
+`cache_mode=compressed` disables native cross-request reuse and restores into
+request-private slots. `frozen` stops new writes while retaining existing
+entries. Reset clears either store and all linker-side progress/hit maps.
+
+Request-mode status exposes exact logical budget usage and cumulative encoded
+bytes. Request-mode events are request-granular; block-mode events remain
+block-granular. Byte-level provenance audit remains block-only for now.

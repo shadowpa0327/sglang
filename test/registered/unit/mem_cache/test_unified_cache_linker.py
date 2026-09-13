@@ -3,8 +3,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -109,6 +110,50 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.tree_core.enable_external_cache_linker
     assert cache.write_through_threshold == 1
     assert cache.linker.layer_done_counter is linker.layer_done_counter
+
+
+def test_request_aware_lookup_defaults_to_the_existing_rid_contract():
+    linker = _FakeLinker()
+    linker.restorable = [2, 4]
+
+    assert linker.lookup_request(SimpleNamespace(rid="request-a"), []) == [2, 4]
+
+
+def test_wrapper_passes_the_complete_request_to_request_aware_lookup():
+    seen = []
+
+    class _RequestAware(_FakeLinker):
+        def lookup_request(self, req, transfers, *, device_hit_pages=0):
+            seen.append((req, transfers, device_hit_pages))
+            return [2]
+
+    component = SimpleNamespace(
+        build_external_linker_transfer=lambda phase, node, keys: PoolTransfer(
+            name=PoolName.KV, keys=keys
+        )
+    )
+    cache = _cache_for_wrapper(
+        page_size=2,
+        _components_tuple=(component,),
+        _all_reduce_attn_groups=lambda mask, op: None,
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _RequestAware())
+    wrapper._tail_hashes = lambda key, result, device_hit_len: ["p0", "p1"]
+    req = SimpleNamespace(rid="request-a", kv=SimpleNamespace(holds_mamba=False))
+    empty = MatchResult(torch.empty(0, dtype=torch.int64), 0, 0, 0)
+
+    result = wrapper.match(RadixKey([1, 2, 3, 4]), req, empty)
+
+    assert seen and seen[0][0] is req
+    assert seen[0][2] == 0
+    assert result.host_hit_length == 4
+
+    wrapper.match(
+        RadixKey([1, 2, 3, 4]),
+        req,
+        MatchResult(torch.arange(2), 0, 0, 0),
+    )
+    assert seen[-1][2] == 1
 
 
 def test_restorable_prefix_intersects_sparse_rank_results():

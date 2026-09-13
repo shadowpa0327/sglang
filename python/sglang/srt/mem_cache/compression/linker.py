@@ -1,21 +1,18 @@
-"""Block-granular compressed prefix store behind the external cache linker.
+"""Compressed KV storage behind SGLang's external-cache linker.
 
-Compression follows the request, not the radix tree. Lookups and restores move
-whole blocks; the incomplete tail of a prompt is recomputed. Restores are
-synchronous: every queued request is restored before its forward batch can read
-KV.
+``compression_unit`` selects one of two independent paths:
 
-`scope` picks when the codec sees a block:
+``block``
+    Compress completed fixed-size blocks incrementally. Lookup, eviction, and
+    reconstruction are block-granular.
 
-    block  : each time a prefill chunk lands, every newly completed block is
-             gathered from the request's own slots and encoded on its own.
-    prompt : nothing is encoded until the request finishes, and then every
-             complete block of its prompt is handed to the codec in one call,
-             so a basis or statistic can be fit over the whole prompt.
+``request``
+    Compress one complete restorable span when SGLang finalizes the request.
+    The payload stays opaque and is reconstructed and evicted as one unit. Only
+    an exact match of the complete original input can restore it.
 
-Both store the raw recurrent state at a block boundary (hybrid models). Under
-`prompt` that state is still sampled during prefill, because after the prompt's
-last chunk the live state no longer matches any block boundary.
+Restores are synchronous: every queued request is reconstructed before its
+forward batch can read KV.
 """
 
 import hashlib
@@ -35,6 +32,7 @@ from sglang.srt.mem_cache.utils import get_hash_str
 
 from kvcompress.api import canonical_json
 from kvcompress.loader import load_plugin
+from kvcompress.request_store import RequestStore, RequestStoreFull, RequestTooLarge
 from kvcompress.store import BlockStore
 
 logger = logging.getLogger(__name__)
@@ -49,8 +47,7 @@ KNOWN_SETTINGS = {
     "audit_fault",
     "key_space",
     "store_bytes",
-    "scope",
-    "shared_bytes",
+    "compression_unit",
 }
 
 
@@ -187,26 +184,53 @@ class CompressionLinker(UnifiedCacheLinker):
                 "LoRA and speculative decoding need separate compression identity adapters"
             )
         config = json.loads(server_args.prefix_compression_config or "{}")
+        if "scope" in config:
+            raise ValueError(
+                "scope is no longer supported; use compression_unit=block or request"
+            )
         unknown = set(config) - KNOWN_SETTINGS
         if unknown:
             raise ValueError(f"Unknown prefix compression settings: {sorted(unknown)}")
         self.adapter = NativePoolAdapter(params)
         self.page_size = params.page_size
-        self.scope = config.get("scope", "block")
-        if self.scope not in {"block", "prompt"}:
-            raise ValueError("scope must be block or prompt")
-        self.block_pages = config.get("block_pages", 16)
-        if type(self.block_pages) is not int or self.block_pages < 1:
+        self.compression_unit = config.get("compression_unit", "block")
+        if self.compression_unit not in {"block", "request"}:
+            raise ValueError("compression_unit must be block or request")
+        if self.compression_unit == "request" and "block_pages" in config:
+            raise ValueError("block_pages only applies to compression_unit=block")
+        self.block_pages = (
+            config.get("block_pages", 16)
+            if self.compression_unit == "block"
+            else None
+        )
+        if self.block_pages is not None and (
+            type(self.block_pages) is not int or self.block_pages < 1
+        ):
             raise ValueError("block_pages must be a positive page count")
-        self.block_tokens = self.block_pages * self.page_size
+        self.block_tokens = (
+            self.block_pages * self.page_size
+            if self.block_pages is not None
+            else None
+        )
         chunk = server_args.chunked_prefill_size
-        # A chunk may contain several compression blocks. KV is stored for each
-        # block; a hybrid recurrent checkpoint is needed only at a restorable
-        # prefix boundary shared by both grids.
+        if self.compression_unit == "block":
+            self.restoration_boundary_tokens = (
+                math.lcm(self.block_tokens, chunk)
+                if chunk is not None and chunk > 0
+                else self.block_tokens
+            )
+        else:
+            self.restoration_boundary_tokens = (
+                math.lcm(self.page_size, chunk)
+                if self.adapter.hybrid and chunk is not None and chunk > 0
+                else self.page_size
+            )
+        # Hybrid request mode needs callbacks at exact recurrent checkpoints;
+        # non-hybrid request mode does no work at unfinished callbacks.
         self.prefill_boundary_tokens = (
-            math.lcm(self.block_tokens, chunk)
-            if chunk is not None and chunk > 0
-            else self.block_tokens
+            self.restoration_boundary_tokens
+            if self.compression_unit == "block" or self.adapter.hybrid
+            else None
         )
         plugin, description = load_plugin(
             config.get("plugin", "identity"), config.get("parameters")
@@ -219,6 +243,7 @@ class CompressionLinker(UnifiedCacheLinker):
             "dtype": str(self.adapter.kv.dtype),
             "page_size": self.page_size,
             "block_pages": self.block_pages,
+            "restoration_boundary_tokens": self.restoration_boundary_tokens,
             "plugin": description,
         }
         # Store is process-local and reset on weight changes. Retain the resolved
@@ -261,14 +286,23 @@ class CompressionLinker(UnifiedCacheLinker):
                 "method": "fp32-inverse-rotation-from-model-rope-table",
                 "rope": self.pre_rope.table.description,
             }
-        identity["scope"] = self.scope
-        self.store = BlockStore(
-            plugin,
-            identity,
-            self.block_pages,
-            store_bytes=config.get("store_bytes", 4 << 30),
-            accounting_root=accounting_root,
-            shared_bytes=config.get("shared_bytes", 2 << 30),
+        identity["compression_unit"] = self.compression_unit
+        store_bytes = config.get("store_bytes", 4 << 30)
+        self.store = (
+            BlockStore(
+                plugin,
+                identity,
+                self.block_pages,
+                store_bytes=store_bytes,
+                accounting_root=accounting_root,
+            )
+            if self.compression_unit == "block"
+            else RequestStore(
+                plugin,
+                identity,
+                store_bytes=store_bytes,
+                accounting_root=accounting_root,
+            )
         )
         self.layer_done_counter = CompletedBatchCounter()
         if self.adapter.hybrid:
@@ -277,10 +311,13 @@ class CompressionLinker(UnifiedCacheLinker):
             )
         self.queued = {}
         self.completed_loads = deque()
-        # rid -> (hashed prompt pages, chained hash of the last hashed page)
+        # Block mode: rid -> (hashed pages, chained hash of the last page).
         self.progress = {}
-        # Prompt scope only: rid -> (block index, recurrent state at its end)
+        # Request mode: rid -> (restorable token count, recurrent checkpoint).
         self.checkpoints = {}
+        # Request mode: exact key -> restorable page count, and rid -> matched key.
+        self.request_pages = {}
+        self.request_hits = {}
         self.cache_mode = config.get("cache_mode", "compressed")
         if self.cache_mode not in {"none", "native", "compressed"}:
             raise ValueError("cache_mode must be none, native or compressed")
@@ -291,6 +328,8 @@ class CompressionLinker(UnifiedCacheLinker):
         self.request_events = {}
         self.audit = None
         self.audit_fault = config.get("audit_fault")
+        if self.compression_unit == "request" and config.get("audit"):
+            raise ValueError("audit=true is not supported with compression_unit=request")
         if self.audit_fault not in (None, "skip_scatter") or (
             self.audit_fault and not config.get("audit")
         ):
@@ -301,7 +340,11 @@ class CompressionLinker(UnifiedCacheLinker):
             from .audit import CompressionAudit
 
             self.audit = CompressionAudit(self)
-        pool = self._allocate_store()
+        pool = (
+            self._allocate_store()
+            if self.compression_unit == "block"
+            else self.store.description()
+        )
         self.record(
             {"event": "init", "identity": identity, "configuration": config, "store": pool}
         )
@@ -309,6 +352,8 @@ class CompressionLinker(UnifiedCacheLinker):
     @torch.no_grad()
     def _allocate_store(self):
         """Reserve the pool from one synthetic block; codecs emit a fixed layout."""
+        if self.compression_unit != "block":
+            raise RuntimeError("Only block compression preallocates a fixed layout")
         slots = torch.arange(self.block_tokens, device=self.adapter.device)
         sample = {
             name: torch.randn(t.shape, dtype=t.dtype, device=t.device)
@@ -336,28 +381,23 @@ class CompressionLinker(UnifiedCacheLinker):
             with path.open("a") as stream:
                 stream.write(canonical_json(event) + "\n")
 
-    # ---- source side: compress blocks as the request's prefill completes them ----
+    # ---- source side: gather from live request slots, then compress ----
 
     @torch.no_grad()
     def on_request_progress(self, req, processed_tokens, *, finished):
-        """Store every newly completed block of this request's prompt.
-
-        `processed_tokens` prompt tokens have KV in the request's slots. For a
-        hybrid model the live recurrent state matches that position only before
-        the first decode step, so blocks completed later are left to the tail.
-        In prompt scope this call only samples that state until the finish,
-        where every complete block is stored in one codec call.
-        """
-        if self.scope == "prompt" and not finished:
-            self._hold_checkpoint(req, processed_tokens)
+        """Observe live KV progress and persist according to the configured unit."""
+        if self.compression_unit == "request":
+            self._on_request_progress(req, processed_tokens, finished=finished)
             return
-        # Prompt scope leaves `progress` empty, so a finish starts from block 0.
+        self._on_block_progress(req, processed_tokens, finished=finished)
+
+    def _on_block_progress(self, req, processed_tokens, *, finished):
+        """Compress each newly completed block independently."""
         hashed_pages, last_hash = (
             self.progress.pop(req.rid, (0, None))
             if finished
             else self.progress.get(req.rid, (0, None))
         )
-        held = self.checkpoints.pop(req.rid, None) if finished else None
         if not self.writes_enabled or req.kv.req_pool_idx is None:
             return
         processed = min(processed_tokens, len(req.origin_input_ids))
@@ -378,22 +418,19 @@ class CompressionLinker(UnifiedCacheLinker):
             if checkpoint_index is not None
             else None
         )
-        # Prompt scope reaches the finish with a state one prompt tail past the
-        # last boundary; the one sampled during prefill is the restorable one.
-        if checkpoint is None and held is not None:
-            checkpoint_index, checkpoint = held
         start = done * self.block_tokens
         hashes = get_hash_str(
             req.origin_input_ids[start : complete * self.block_tokens],
             last_hash,
             page_size=self.page_size,
         )
-        blocks = []
+        missing = []
         for index in range(done, complete):
             offset = (index - done + 1) * self.block_pages
             key = hashes[offset - 1]
             parent = hashes[offset - self.block_pages - 1] if index > done else last_hash
             state = checkpoint if index == checkpoint_index else None
+            block = (index, key, parent, state)
             if self.store.has(key):
                 if state is not None and self.store.state(key) is None:
                     record = self.store.attach_state(key, state)
@@ -406,15 +443,110 @@ class CompressionLinker(UnifiedCacheLinker):
                             "state_bytes": record["state_bytes"],
                         }
                     )
-                continue
-            blocks.append((index, key, parent, state))
-        self._compress(req, blocks)
+            else:
+                missing.append(block)
+        self._gather_and_commit_blocks(req, missing)
         if not finished:
             self.progress[req.rid] = (complete * self.block_pages, hashes[-1])
 
     @torch.no_grad()
-    def _hold_checkpoint(self, req, processed_tokens):
-        """Keep the deepest recurrent state that a restore could resume from."""
+    def _on_request_progress(self, req, processed_tokens, *, finished):
+        """Keep a hybrid checkpoint during prefill; encode only at finalization."""
+        if not self._request_is_keyable(req):
+            self.checkpoints.pop(req.rid, None)
+            if finished:
+                self.record(
+                    {
+                        "event": "compress_skipped",
+                        "rid": req.rid,
+                        "compression_unit": "request",
+                        "reason": "custom_input_embeddings",
+                    }
+                )
+            return
+        if not finished:
+            self._hold_request_checkpoint(req, processed_tokens)
+            return
+        held = self.checkpoints.pop(req.rid, None)
+        if not self.writes_enabled or req.kv.req_pool_idx is None:
+            return
+        key = self._request_key(req)
+        if self.store.has(key):
+            return
+
+        max_end = self._request_cacheable_end(req, processed_tokens)
+        if self.adapter.hybrid:
+            if held is not None and held[0] <= max_end:
+                end, state = held
+            elif not req.output_ids and max_end == processed_tokens:
+                end = max_end
+                state = self.adapter.gather_state(req.kv.mamba_pool_idx)
+            else:
+                self.record(
+                    {
+                        "event": "compress_skipped",
+                        "rid": req.rid,
+                        "compression_unit": "request",
+                        "reason": "no_restorable_recurrent_checkpoint",
+                    }
+                )
+                return
+        else:
+            end, state = max_end, None
+        if end <= 0:
+            return
+
+        begin = time.perf_counter_ns()
+        tensors, context, _, _ = self._gather_span(req, 0, end)
+        try:
+            record = self.store.insert(
+                key, tensors, context=context, state=state
+            )
+        except (RequestTooLarge, RequestStoreFull) as error:
+            self.record(
+                {
+                    "event": "compress_rejected",
+                    "rid": req.rid,
+                    "key": key,
+                    "compression_unit": "request",
+                    "restorable_tokens": end,
+                    "reason": str(error),
+                }
+            )
+            return
+        if self.adapter.device.type == "cuda":
+            torch.cuda.current_stream(self.adapter.device).synchronize()
+        latency = (time.perf_counter_ns() - begin) / 1e6
+        event_record = dict(record)
+        for evicted in event_record.pop("evicted"):
+            evicted_pages = self.request_pages.pop(evicted, 0)
+            self.record(
+                {
+                    "event": "evict",
+                    "rid": req.rid,
+                    "key": evicted,
+                    "compression_unit": "request",
+                    "tokens": evicted_pages * self.page_size,
+                    "stored_requests": len(self.store.requests),
+                }
+            )
+        self.request_pages[key] = record["pages"]
+        self.record(
+            {
+                "event": "compress",
+                "rid": req.rid,
+                "key": key,
+                "compression_unit": "request",
+                "restorable_tokens": end,
+                **event_record,
+                "latency_ms": latency,
+                "timer": "wall_sync",
+            }
+        )
+
+    @torch.no_grad()
+    def _hold_request_checkpoint(self, req, processed_tokens):
+        """Retain the deepest exact recurrent boundary seen before decode."""
         if (
             not self.adapter.hybrid
             or not self.writes_enabled
@@ -423,57 +555,92 @@ class CompressionLinker(UnifiedCacheLinker):
         ):
             return
         processed = min(processed_tokens, len(req.origin_input_ids))
-        if processed % self.block_tokens:
+        if (
+            processed <= 0
+            or processed % self.page_size
+            or processed > self._request_cacheable_end(req, processed_tokens)
+        ):
             return
         self.checkpoints[req.rid] = (
-            processed // self.block_tokens - 1,
+            processed,
             self.adapter.gather_state(req.kv.mamba_pool_idx),
         )
 
-    def _gather_block(self, req, index):
-        """Codec inputs for one block, in the plugin's declared key space."""
-        start, end = index * self.block_tokens, (index + 1) * self.block_tokens
-        slots = self.adapter.slots(req, start, end)
-        native = self.adapter.gather_kv(slots)
-        # The audit compares one page; keep only that page so the post-RoPE keys
-        # can be released once de-rotated.
-        sample = (
-            {name: t[:1].clone() for name, t in native.items()}
-            if self.audit is not None
-            else None
+    def _request_cacheable_end(self, req, processed_tokens):
+        """Largest page-aligned prefix an ordinary admission can restore."""
+        processed = min(processed_tokens, len(req.origin_input_ids))
+        # SGLang always recomputes at least the final input token for logits.
+        limit = min(processed, max(len(req.origin_input_ids) - 1, 0))
+        return limit // self.page_size * self.page_size
+
+    @staticmethod
+    def _request_key(req):
+        """Exact complete-input identity, including SGLang's cache namespace."""
+        encoded = canonical_json(
+            {
+                "version": 1,
+                "token_ids": list(req.origin_input_ids),
+                "extra_key": getattr(req, "extra_key", None),
+                "cache_salt": getattr(req, "cache_salt", None),
+            }
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _request_is_keyable(req):
+        """Token identity is insufficient when callers replace token embeddings."""
+        return (
+            getattr(req, "input_embeds", None) is None
+            and getattr(req, "positional_embed_overrides", None) is None
         )
+
+    def _context(self, req, start, end, *, block_index=None):
         context = {
             **self.adapter.context(),
             "token_ids": list(req.origin_input_ids[start:end]),
             "start_position": start,
-            "block_index": index,
         }
+        if block_index is not None:
+            context["block_index"] = block_index
         if self.pre_rope is not None:
             context["key_space"] = "pre_rope"
+        return context
+
+    def _gather_span(self, req, start, end, *, sample_blocks=()):
+        """Gather one logical request span, regardless of its physical KV slots."""
+        slots = self.adapter.slots(req, start, end)
+        native = self.adapter.gather_kv(slots)
+        start_page = start // self.page_size
+        samples = {}
+        for index in sample_blocks:
+            first_page = index * self.block_pages - start_page
+            samples[index] = {
+                name: tensor[first_page : first_page + 1].clone()
+                for name, tensor in native.items()
+            }
+        if self.pre_rope is not None:
             keys = native.pop("key")
             native["key"] = self.pre_rope.derotate(
                 keys, start_position=start, audit=self.audit is not None
             )
             del keys
-        return native, context, slots, sample
+        return native, self._context(req, start, end), slots, samples
 
-    def _compress(self, req, blocks):
-        """Encode a run of this prompt's blocks; the codec sees all of them."""
-        if not blocks:
-            return
-        begin = time.perf_counter_ns()
-        gathered = [self._gather_block(req, index) for index, *_ in blocks]
-        records = self.store.insert_prompt(
-            [key for _, key, _, _ in blocks],
-            [inputs for inputs, _, _, _ in gathered],
-            contexts=[context for _, context, _, _ in gathered],
-            states=[state for *_, state in blocks],
-            parents=[parent for _, _, parent, _ in blocks],
+    def _gather_block(self, req, index):
+        """Gather one block for the independent block-compression path."""
+        start, end = index * self.block_tokens, (index + 1) * self.block_tokens
+        native, context, slots, samples = self._gather_span(
+            req,
+            start,
+            end,
+            sample_blocks=(index,) if self.audit is not None else (),
         )
-        if self.adapter.device.type == "cuda":
-            torch.cuda.current_stream(self.adapter.device).synchronize()
-        latency = (time.perf_counter_ns() - begin) / 1e6
-        for (index, key, _, _), record in zip(blocks, records):
+        context["block_index"] = index
+        return native, context, slots, samples.get(index)
+
+    def _record_compression(self, req, encoded, latency, *, blocks_encoded):
+        """Publish records for independently compressed blocks."""
+        for (index, key, _, _), record in encoded:
             for evicted in record.pop("evicted"):
                 self.record(
                     {
@@ -490,18 +657,42 @@ class CompressionLinker(UnifiedCacheLinker):
                     "rid": req.rid,
                     "block": index,
                     **record,
-                    "blocks_encoded": len(blocks),
-                    "latency_ms": latency / len(blocks),
+                    "blocks_encoded": blocks_encoded,
+                    "latency_ms": latency / len(encoded),
                     "timer": "wall_sync",
                 }
             )
+
+    def _gather_and_commit_blocks(self, req, blocks):
+        """Gather and compress each missing block independently."""
+        if not blocks:
+            return
+        begin = time.perf_counter_ns()
+        gathered = [self._gather_block(req, index) for index, *_ in blocks]
+        records = [
+            self.store.insert(
+                key, inputs, context=context, state=state, parent=parent
+            )
+            for (index, key, parent, state), (inputs, context, _, _) in zip(
+                blocks, gathered
+            )
+        ]
+        if self.adapter.device.type == "cuda":
+            torch.cuda.current_stream(self.adapter.device).synchronize()
+        latency = (time.perf_counter_ns() - begin) / 1e6
+        self._record_compression(
+            req, list(zip(blocks, records)), latency, blocks_encoded=1
+        )
         if self.audit is not None:
             for (_, key, _, _), (_, _, slots, sample) in zip(blocks, gathered):
                 self.audit.source(slots, sample, key)
 
-    # ---- target side: whole-block lookup and synchronous restore ----
+    # ---- target side: exact lookup and synchronous restore ----
 
     def lookup(self, rid, transfers):
+        """Block-mode lookup retained for generic linker compatibility."""
+        if self.compression_unit != "block":
+            raise RuntimeError("Request compression requires request-aware lookup")
         full = next(t for t in transfers if t.name == PoolName.KV)
         # Page 0 of the transfer is the first uncached page; blocks are aligned
         # to the prompt start, so a misaligned native hit simply finds nothing.
@@ -515,6 +706,70 @@ class CompressionLinker(UnifiedCacheLinker):
         self.record({"event": "lookup", "rid": rid, "hit_pages": result[-1] if result else 0})
         return result
 
+    def lookup_request(self, req, transfers, *, device_hit_pages=0):
+        if self.compression_unit == "block":
+            return self.lookup(req.rid, transfers)
+        full = next(t for t in transfers if t.name == PoolName.KV)
+        key = self._request_key(req)
+        if device_hit_pages:
+            self._release_request_hit(req.rid)
+            self.record(
+                {
+                    "event": "lookup",
+                    "rid": req.rid,
+                    "key": key,
+                    "compression_unit": "request",
+                    "exact_request_hit": False,
+                    "hit_pages": 0,
+                    "hit_tokens": 0,
+                    "reason": "native_prefix_present",
+                }
+            )
+            return []
+        if not self._request_is_keyable(req):
+            self._release_request_hit(req.rid)
+            self.record(
+                {
+                    "event": "lookup",
+                    "rid": req.rid,
+                    "key": key,
+                    "compression_unit": "request",
+                    "exact_request_hit": False,
+                    "hit_pages": 0,
+                    "hit_tokens": 0,
+                    "reason": "custom_input_embeddings",
+                }
+            )
+            return []
+        pages = self.request_pages.get(key, 0)
+        previous = self.request_hits.get(req.rid)
+        eligible = pages > 0 and pages <= len(full.keys)
+        if not eligible:
+            self._release_request_hit(req.rid)
+            hit = False
+        elif previous == key:
+            hit = True
+        else:
+            self._release_request_hit(req.rid)
+            hit = self.store.pin(key)
+            if hit:
+                self.request_hits[req.rid] = key
+        if hit and self.adapter.hybrid and self.store.state(key) is None:
+            self._release_request_hit(req.rid)
+            hit = False
+        self.record(
+            {
+                "event": "lookup",
+                "rid": req.rid,
+                "key": key,
+                "compression_unit": "request",
+                "exact_request_hit": hit,
+                "hit_pages": pages if hit else 0,
+                "hit_tokens": pages * self.page_size if hit else 0,
+            }
+        )
+        return [pages] if hit else []
+
     def offload(self, transfers):
         # Tree write-through is not a compression trigger; nothing is queued.
         return False
@@ -522,6 +777,8 @@ class CompressionLinker(UnifiedCacheLinker):
     def load(self, rid, transfers):
         if rid in self.queued:
             raise ValueError(f"Duplicate queued load: {rid}")
+        if self.compression_unit == "request" and rid not in self.request_hits:
+            raise ValueError(f"No exact request hit recorded for rid={rid!r}")
         self.queued[rid] = transfers
         return True
 
@@ -531,26 +788,10 @@ class CompressionLinker(UnifiedCacheLinker):
             return -1
         rids = list(self.queued)
         for rid, transfers in self.queued.items():
-            kv = next(t for t in transfers if t.name == PoolName.KV)
-            if len(kv.keys) % self.block_pages:
-                raise ValueError("Restore request is not a sequence of whole blocks")
-            block_keys = kv.keys[self.block_pages - 1 :: self.block_pages]
-            restored = self.store.reconstruct(block_keys)
-            self.record({"event": "decompress", "rid": rid, **restored.measurement})
-            if self.audit_fault != "skip_scatter":
-                slots = kv.device_indices.to(device=self.adapter.device, dtype=torch.int64)
-                for i, block in enumerate(restored.blocks):
-                    self.adapter.scatter_kv(
-                        slots[i * self.block_tokens : (i + 1) * self.block_tokens], block
-                    )
-                for transfer in transfers:
-                    if transfer.name == PoolName.MAMBA:
-                        state = self.store.state(block_keys[-1])
-                        if state is None:
-                            raise RuntimeError("Block has no recurrent state for a hybrid restore")
-                        self.adapter.scatter_state(transfer.device_indices[0], state)
-            if self.audit is not None:
-                self.audit.verify_scatter(rid, kv, restored)
+            if self.compression_unit == "request":
+                self._restore_request(rid, transfers)
+            else:
+                self._restore_blocks(rid, transfers)
         if self.adapter.device.type == "cuda":
             torch.cuda.current_stream(self.adapter.device).synchronize()
         self.layer_done_counter.producer_index += 1
@@ -559,10 +800,74 @@ class CompressionLinker(UnifiedCacheLinker):
         self.record({"event": "load_batch", "request_ids": rids, "batch_size": len(rids)})
         return self.layer_done_counter.producer_index
 
+    def _restore_blocks(self, rid, transfers):
+        kv = next(t for t in transfers if t.name == PoolName.KV)
+        if len(kv.keys) % self.block_pages:
+            raise ValueError("Restore request is not a sequence of whole blocks")
+        block_keys = kv.keys[self.block_pages - 1 :: self.block_pages]
+        restored = self.store.reconstruct(block_keys)
+        self.record({"event": "decompress", "rid": rid, **restored.measurement})
+        if self.audit_fault != "skip_scatter":
+            slots = kv.device_indices.to(device=self.adapter.device, dtype=torch.int64)
+            for i, block in enumerate(restored.blocks):
+                self.adapter.scatter_kv(
+                    slots[i * self.block_tokens : (i + 1) * self.block_tokens], block
+                )
+            for transfer in transfers:
+                if transfer.name == PoolName.MAMBA:
+                    state = self.store.state(block_keys[-1])
+                    if state is None:
+                        raise RuntimeError("Block has no recurrent state for a hybrid restore")
+                    self.adapter.scatter_state(transfer.device_indices[0], state)
+        if self.audit is not None:
+            self.audit.verify_scatter(rid, kv, restored)
+
+    def _restore_request(self, rid, transfers):
+        key = self.request_hits.pop(rid)
+        try:
+            kv = next(t for t in transfers if t.name == PoolName.KV)
+            expected_pages = self.request_pages[key]
+            if len(kv.keys) != expected_pages:
+                raise ValueError("Request restore destination does not cover the stored span")
+            restored = self.store.reconstruct(key)
+            self.record(
+                {
+                    "event": "decompress",
+                    "rid": rid,
+                    "key": key,
+                    "compression_unit": "request",
+                    **restored.measurement,
+                }
+            )
+            slots = kv.device_indices.to(device=self.adapter.device, dtype=torch.int64)
+            if slots.numel() != restored.measurement["tokens"]:
+                raise ValueError("Request restore slot count does not match decoded payload")
+            self.adapter.scatter_kv(slots, restored.tensors)
+            for transfer in transfers:
+                if transfer.name == PoolName.MAMBA:
+                    state = self.store.state(key)
+                    if state is None:
+                        raise RuntimeError(
+                            "Request has no recurrent state for a hybrid restore"
+                        )
+                    self.adapter.scatter_state(transfer.device_indices[0], state)
+        finally:
+            self.store.unpin(key)
+
+    def _release_request_hit(self, rid):
+        hits = getattr(self, "request_hits", None)
+        if hits is None:
+            return
+        key = hits.pop(rid, None)
+        if key is not None:
+            self.store.unpin(key)
+
     def cancel_queued_load(self, rid):
         if self.compressed_only and rid in self.queued:
             del self.queued[rid]
+            self._release_request_hit(rid)
             return True
+        self._release_request_hit(rid)
         # The wrapper has already published destinations into the radix tree.
         # Finish those loads even if a request is cancelled, to keep them valid.
         return False
@@ -586,6 +891,8 @@ class CompressionLinker(UnifiedCacheLinker):
         self.completed_loads.clear()
         self.progress.clear()
         self.checkpoints.clear()
+        self.request_pages.clear()
+        self.request_hits.clear()
         self.layer_done_counter.reset()
         self.store.reset()
         self.request_events.clear()

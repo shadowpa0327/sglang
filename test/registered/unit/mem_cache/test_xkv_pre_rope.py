@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from kvcompress.loader import load_plugin
+from kvcompress.request_store import RequestStore
 from kvcompress.store import BlockStore
 from sglang.srt.mem_cache.compression.pre_rope import (
     NativeRoPEDecodePlugin,
@@ -144,6 +145,33 @@ def test_pre_rope_store_roundtrip_uses_absolute_positions(offset):
     decoded = shifted.reconstruct(["k"])
     wrong = decoded.blocks[0]["key"][:3]
     assert (wrong.float() - native[:3].float()).abs().max() > 10 * tolerance
+
+
+def test_request_store_roundtrip_rerotates_one_complete_span():
+    torch.manual_seed(4)
+    transform = PreRoPETransform(
+        RotaryTable(make_rope(), CPU), layers=2, page_size=4
+    )
+    inner, identity = load_plugin("identity")
+    wrapper = NativeRoPEDecodePlugin(inner, transform)
+    store = RequestStore(wrapper, identity, store_bytes=1 << 20)
+    offset = 512
+    native = torch.randn(4, 2, 4, 1, 8).bfloat16()
+    pre = transform.derotate(native, start_position=offset)
+    store.insert(
+        "request-key",
+        {"key": pre, "value": native.clone()},
+        context={
+            "key_space": "pre_rope",
+            "page_size": 4,
+            "start_position": offset,
+            "token_ids": list(range(16)),
+            "layer_ids": [0, 1],
+        },
+    )
+    restored = store.reconstruct("request-key").tensors["key"]
+    tolerance = 2 * torch.finfo(torch.bfloat16).eps * native.float().abs().max()
+    assert (restored.float() - native.float()).abs().max() <= tolerance
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused RoPE needs CUDA")
