@@ -43,3 +43,29 @@ def test_request_store_status_sums_residency_and_cumulative_counts_across_dp():
     assert merged["store"]["store_bytes"] == 2000
     assert merged["store"]["free_bytes"] == 1700
     assert merged["dp_size"] == 2
+
+
+def test_block_store_status_sums_cumulative_metadata_across_dp():
+    def status(metadata):
+        return PrefixCompressionReqOutput(
+            data={
+                "idle": True,
+                "stored_blocks": 1,
+                "stored_requests": 0,
+                "store": {
+                    "storage_unit": "block",
+                    "stored_blocks": 1,
+                    "evictions": 2,
+                    "metadata_bytes_compressed": metadata,
+                },
+            }
+        )
+
+    merged = _merge_prefix_compression_results(
+        "status", [status(11), status(17)]
+    ).data
+
+    assert merged["stored_blocks"] == 2
+    assert merged["store"]["stored_blocks"] == 2
+    assert merged["store"]["evictions"] == 4
+    assert merged["store"]["metadata_bytes_compressed"] == 28

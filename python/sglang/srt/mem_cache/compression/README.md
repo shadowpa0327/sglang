@@ -109,7 +109,6 @@ prefix_compression_config=json.dumps({
     "compression_unit": "block",
     "block_pages": 32,
     "store_bytes": 10 << 30,
-    "key_space": "auto",
     "metrics_path": "/abs/path/events.jsonl",
     "audit": False,
 })
@@ -124,7 +123,6 @@ prefix_compression_config=json.dumps({
     "cache_mode": "compressed",
     "compression_unit": "request",
     "store_bytes": 10 << 30,
-    "key_space": "auto",
     "metrics_path": "/abs/path/events.jsonl",
 })
 ```

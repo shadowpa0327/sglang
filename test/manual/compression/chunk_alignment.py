@@ -77,7 +77,6 @@ def main():
                 "plugin": args.plugin,
                 "block_pages": args.block_pages,
                 "metrics_path": str(metrics),
-                "key_space": "auto",
             }
         ),
     )
@@ -146,10 +145,14 @@ def main():
                 failures.append(
                     f"prompt {i}: stored {len(stored)} of {expected} block(s)"
                 )
-            if args.hybrid and expected_restore and not any(
-                e["state_bytes"] > 0
-                and (e["block"] + 1) * block_tokens == expected_restore
-                for e in stored
+            if (
+                args.hybrid
+                and expected_restore
+                and not any(
+                    e["state_bytes"] > 0
+                    and (e["block"] + 1) * block_tokens == expected_restore
+                    for e in stored
+                )
             ):
                 failures.append(
                     f"prompt {i}: no recurrent checkpoint at {expected_restore}"

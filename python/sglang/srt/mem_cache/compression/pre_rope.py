@@ -18,8 +18,6 @@ import torch
 
 from kvcompress.api import CompressedPayload, KVCompressionPlugin
 
-KEY_SPACES = ("pre_rope", "post_rope")
-
 
 def _fused_rope_kernel():
     """The kernel RotaryEmbedding.forward_cuda uses; None without CUDA support."""
@@ -30,27 +28,6 @@ def _fused_rope_kernel():
     except ImportError:
         return None
     return apply_rope_with_cos_sin_cache_inplace
-
-
-def resolve_key_space(configured, declared):
-    """Pick the key space from config (auto/None, pre_rope, post_rope) and the plugin.
-
-    Returns (key_space, source). An explicit config value wins over the plugin's
-    declaration and is reported as "config_override" so the log makes it visible.
-    """
-    if declared is not None and declared not in KEY_SPACES:
-        raise ValueError(
-            f"Plugin key_space must be one of {KEY_SPACES}, got {declared!r}"
-        )
-    if configured in (None, "auto"):
-        if declared is None:
-            return "post_rope", "default"
-        return declared, "plugin"
-    if configured not in KEY_SPACES:
-        raise ValueError("key_space must be auto, pre_rope or post_rope")
-    if declared is not None and declared != configured:
-        return configured, "config_override"
-    return configured, "config"
 
 
 class RotaryTable:
@@ -79,17 +56,20 @@ class RotaryTable:
             or cache.shape[-1] != self.rotary_dim
         ):
             raise ValueError("Unexpected rotary table layout")
-        # [max_pos, rotary_dim] = [cos | sin]; the conjugate table encodes R(-p).
+        # [max_pos, rotary_dim] = [cos | sin].  Keep the model's forward table
+        # only; R(-p) is S R(p) S, where S negates the second member of every
+        # rotary pair.  A separate conjugate table would retain hundreds of MiB
+        # for long-context models such as Gemma4.
         self.forward_table = (
             cache.detach().to(device=device, dtype=torch.float32).contiguous()
         )
         self.cos, self.sin = self.forward_table.chunk(2, dim=-1)
-        self.inverse_table = torch.cat([self.cos, -self.sin], dim=-1).contiguous()
         self.fused = _fused_rope_kernel() if device.type == "cuda" else None
         self.description = {
             "class": type(rope).__name__,
             "head_size": self.head_size,
             "rotary_dim": self.rotary_dim,
+            "base": float(rope.base),
             "is_neox_style": self.is_neox_style,
             "positions": int(self.cos.shape[0]),
             "table_dtype": "float32",
@@ -117,13 +97,23 @@ class RotaryTable:
         Uses the model kernel; query is a same-dtype [tokens, 1, head_size] zero
         buffer the kernel rotates alongside.
         """
+        key_rotary = key[..., : self.rotary_dim]
+        paired_second = (
+            key_rotary[..., self.rotary_dim // 2 :]
+            if self.is_neox_style
+            else key_rotary[..., 1::2]
+        )
+        if inverse:
+            paired_second.neg_()
         self.fused(
             positions=positions,
             q=query[..., : self.rotary_dim],
-            k=key[..., : self.rotary_dim],
-            cos_sin_cache=self.inverse_table if inverse else self.forward_table,
+            k=key_rotary,
+            cos_sin_cache=self.forward_table,
             is_neox=self.is_neox_style,
         )
+        if inverse:
+            paired_second.neg_()
 
     def rotate(self, x, cos, sin, *, inverse, out, scratch):
         """out = R(+p) x, or R(-p) x when inverse.
@@ -163,25 +153,65 @@ class PreRoPETransform:
         self.record = record
 
     @classmethod
-    def from_model_ropes(cls, adapter, record=None):
-        """Use the process-wide RoPE cache populated while the model was built."""
+    def from_model_ropes(
+        cls,
+        adapter,
+        record=None,
+        *,
+        allow_no_rope=False,
+        component="full",
+        selector=None,
+    ):
+        """Use the process-wide RoPE cache populated while the model was built.
+
+        Models such as Nemotron-H have no rotary table. ``allow_no_rope``
+        treats that case as an identity transform; multiple matching tables
+        remain ambiguous and fail closed.
+        """
         from sglang.srt.layers.rotary_embedding import factory
         from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
-        head_dim = int(adapter.kv.head_dim)
+        if component == "full":
+            pool, layer_ids = adapter.kv, adapter.layer_ids
+        elif component == "swa":
+            pool, layer_ids = adapter.swa_kv, adapter.swa_layer_ids
+        else:
+            raise ValueError(f"Unknown RoPE component: {component}")
+        head_dim = int(pool.head_dim)
         candidates = []
         for key in list(factory._ROPE_DICT):
             rope = factory._get_live_rope_cache_entry(key)
             if isinstance(rope, RotaryEmbedding) and rope.head_size == head_dim:
                 candidates.append(rope)
+        if selector is not None:
+            if "base" in selector:
+                candidates = [
+                    rope
+                    for rope in candidates
+                    if float(rope.base) == float(selector["base"])
+                ]
+            if "rotary_dim" in selector:
+                candidates = [
+                    rope
+                    for rope in candidates
+                    if int(rope.rotary_dim) == int(selector["rotary_dim"])
+                ]
+            if "class" in selector:
+                candidates = [
+                    rope
+                    for rope in candidates
+                    if type(rope).__name__ == selector["class"]
+                ]
+        if not candidates and allow_no_rope:
+            return None
         if len(candidates) != 1:
             raise ValueError(
                 "Pre-RoPE inversion needs exactly one live RotaryEmbedding with "
-                f"head_size={head_dim}; found {len(candidates)}"
+                f"head_size={head_dim} for {component}; found {len(candidates)}"
             )
         return cls(
             RotaryTable(candidates[0], device=adapter.device),
-            layers=len(adapter.layer_ids),
+            layers=len(layer_ids),
             page_size=adapter.page_size,
             record=record,
         )
@@ -306,15 +336,19 @@ class PreRoPETransform:
 
 
 class NativeRoPEDecodePlugin(KVCompressionPlugin):
-    """Wrap any numerical codec: pre-RoPE input -> ordinary post-RoPE output.
+    """Wrap a codec: canonical pre-RoPE keys -> native post-RoPE keys.
 
     RoPE is model-owned infrastructure, not an algorithm's responsibility. The
-    forward rotation runs inside the reconstruction timer; its positions and
-    FP32 workspace are allocated in prepare_decompression.
+    wrapper accepts one transform for the full ``key`` tensor, or a mapping for
+    both ``key`` and ``swa_key``. Forward rotations run inside the reconstruction
+    timer; positions and FP32 workspaces are allocated in prepare_decompression.
     """
 
     def __init__(self, inner, transform):
-        self.inner, self.transform = inner, transform
+        self.inner = inner
+        self.transforms = (
+            dict(transform) if isinstance(transform, dict) else {"key": transform}
+        )
 
     @property
     def configuration(self):
@@ -324,6 +358,7 @@ class NativeRoPEDecodePlugin(KVCompressionPlugin):
             "input_key_space": "pre_rope",
             "output_key_space": "post_rope",
             "rope": "fp32-model-table-inverse",
+            "key_tensors": sorted(self.transforms),
             "inner": self.inner.configuration,
         }
 
@@ -331,29 +366,58 @@ class NativeRoPEDecodePlugin(KVCompressionPlugin):
         if context.get("key_space") != "pre_rope":
             raise ValueError("Pre-RoPE codec must receive de-rotated keys")
         payload = self.inner.compress(tensors, context=context)
+        positions = {}
+        specs = context.get("tensor_specs", {})
+        for name in self.transforms:
+            if name not in tensors:
+                continue
+            spec = specs.get(name, {})
+            start = (
+                context.get("start_position")
+                if name == "key"
+                else spec.get("start_position")
+            )
+            if start is None:
+                raise ValueError(f"Missing absolute start position for {name}")
+            positions[name] = {
+                "start_position": int(start),
+                "layer_ids": list(spec.get("layer_ids", context.get("layer_ids", ()))),
+            }
         return CompressedPayload(
             payload.tensors,
             {
                 "inner": payload.metadata,
-                "start_position": context["start_position"],
-                "layer_ids": context["layer_ids"],
+                "key_positions": positions,
             },
+            payload.tensor_roles,
         )
 
     def prepare_decompression(self, payload, *, out):
-        inner = CompressedPayload(payload.tensors, payload.metadata["inner"])
-        if len(payload.metadata["layer_ids"]) != out["key"].shape[1]:
-            raise ValueError("Layer metadata does not match the reconstruction")
+        inner = CompressedPayload(
+            payload.tensors, payload.metadata["inner"], payload.tensor_roles
+        )
+        rope = {}
+        for name, transform in self.transforms.items():
+            if name not in out:
+                continue
+            position = payload.metadata["key_positions"][name]
+            if len(position["layer_ids"]) != out[name].shape[1]:
+                raise ValueError(
+                    f"Layer metadata for {name} does not match the reconstruction"
+                )
+            rope[name] = transform.prepare_rerotation(
+                out[name], start_position=position["start_position"]
+            )
         return {
             "inner_payload": inner,
             "inner": self.inner.prepare_decompression(inner, out=out),
-            "rope": self.transform.prepare_rerotation(
-                out["key"], start_position=payload.metadata["start_position"]
-            ),
+            "rope": rope,
         }
 
     def decompress(self, payload, *, out, scratch):
         self.inner.decompress(
             scratch["inner_payload"], out=out, scratch=scratch["inner"]
         )
-        self.transform.rerotate_(out["key"], scratch["rope"])
+        for name, transform in self.transforms.items():
+            if name in out:
+                transform.rerotate_(out[name], scratch["rope"][name])

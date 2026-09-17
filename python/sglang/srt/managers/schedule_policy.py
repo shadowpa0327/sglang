@@ -1357,7 +1357,16 @@ class PrefillAdder:
                 req.host_loaded_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                req.kv.cache_protected_len = prefix_len
+                linker = getattr(self.tree_cache, "linker", None)
+                request_owned = (
+                    linker is not None
+                    and linker.is_request_owned_load(req.rid) is True
+                )
+                # Compression-only loads bypass the radix tree. Their FULL and
+                # SWA slots belong to the request and must remain releasable;
+                # marking the restored prefix tree-protected would advance the
+                # SWA eviction cursor without freeing its restored window.
+                req.kv.cache_protected_len = 0 if request_owned else prefix_len
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

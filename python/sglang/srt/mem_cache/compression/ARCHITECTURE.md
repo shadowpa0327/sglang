@@ -167,7 +167,7 @@ outside `store_bytes` because it is shared across all requests by the plugin.
 
 ## RoPE boundary
 
-When `key_space=pre_rope`, the linker de-rotates exactly the selected input unit.
+The linker always de-rotates each key tensor in the selected input unit to pre-RoPE space.
 `NativeRoPEDecodePlugin` stores that unit's `start_position` and layer IDs in its
 ordinary payload metadata. Decompression reconstructs the same complete unit
 and reapplies RoPE once. No context rebinding or post-compression partitioning

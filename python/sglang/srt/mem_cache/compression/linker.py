@@ -17,7 +17,6 @@ forward batch can read KV.
 
 import hashlib
 import json
-import logging
 import math
 import time
 from collections import deque
@@ -35,8 +34,6 @@ from kvcompress.loader import load_plugin
 from kvcompress.request_store import RequestStore, RequestStoreFull, RequestTooLarge
 from kvcompress.store import BlockStore
 
-logger = logging.getLogger(__name__)
-
 KNOWN_SETTINGS = {
     "cache_mode",
     "plugin",
@@ -45,7 +42,6 @@ KNOWN_SETTINGS = {
     "metrics_path",
     "audit",
     "audit_fault",
-    "key_space",
     "store_bytes",
     "compression_unit",
 }
@@ -78,76 +74,284 @@ class NativePoolAdapter:
             HybridLinearKVPool,
             MHATokenToKVPool,
         )
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
 
         self.page_size = params.page_size
         self.req_pool = params.req_to_token_pool
-        kv = params.token_to_kv_pool_allocator.get_kvcache()
-        self.hybrid = isinstance(kv, HybridLinearKVPool)
+        self.allocator = params.token_to_kv_pool_allocator
+        pool = self.allocator.get_kvcache()
+        self.has_swa = isinstance(pool, SWAKVPool)
+        self.hybrid = (
+            isinstance(pool, HybridLinearKVPool)
+            or getattr(self.req_pool, "mamba_pool", None) is not None
+        )
         # `pool` is what the model runner holds; `kv` is its full-attention part.
-        self.pool = kv
-        self.kv = kv.full_kv_pool if self.hybrid else kv
+        self.pool = pool
+        self.kv = (
+            pool.full_kv_pool
+            if isinstance(pool, (HybridLinearKVPool, SWAKVPool))
+            else pool
+        )
+        self.swa_kv = pool.swa_kv_pool if self.has_swa else None
         # Alternate page-major / packed / quantized layouts require adapters.
-        if (
-            type(self.kv) is not MHATokenToKVPool
-            or self.kv.dtype not in (torch.float16, torch.bfloat16)
-            or self.kv.is_quantized_kv_cache
-        ):
-            raise ValueError(
-                "Compression currently requires ordinary BF16/FP16 MHATokenToKVPool"
+        for name, kv_pool in (("full", self.kv), ("swa", self.swa_kv)):
+            if kv_pool is None:
+                continue
+            if (
+                not isinstance(kv_pool, MHATokenToKVPool)
+                or (
+                    type(kv_pool) is not MHATokenToKVPool
+                    and not isinstance(kv_pool, UnifiedMHATokenToKVPool)
+                )
+                or kv_pool.dtype not in (torch.float16, torch.bfloat16)
+                or kv_pool.is_quantized_kv_cache
+            ):
+                raise ValueError(
+                    "Compression currently requires ordinary BF16/FP16 MHA "
+                    f"storage for the {name} pool"
+                )
+        if self.has_swa:
+            full = sorted(
+                (local, global_id)
+                for global_id, (local, is_swa) in pool.layers_mapping.items()
+                if not is_swa
             )
-        self.layer_ids = (
-            list(kv.full_attention_layer_id_mapping)
-            if self.hybrid
-            else list(
+            swa = sorted(
+                (local, global_id)
+                for global_id, (local, is_swa) in pool.layers_mapping.items()
+                if is_swa
+            )
+            self.layer_ids = [global_id for _, global_id in full]
+            self.swa_layer_ids = [global_id for _, global_id in swa]
+        elif isinstance(pool, HybridLinearKVPool):
+            self.layer_ids = list(pool.full_attention_layer_id_mapping)
+            self.swa_layer_ids = []
+        else:
+            self.layer_ids = list(
                 range(self.kv.start_layer, self.kv.start_layer + self.kv.layer_num)
             )
+            self.swa_layer_ids = []
+        self.sliding_window_size = (
+            int(params.sliding_window_size) if self.has_swa else None
         )
+        self.swa_window_pages = (
+            math.ceil(self.sliding_window_size / self.page_size) if self.has_swa else 0
+        )
+        self.temporal_layer_ids = (
+            list(self.req_pool.mamba_pool.mamba_layer_ids) if self.hybrid else []
+        )
+        self.temporal_kind = None
         self.device = self.kv.k_buffer[0].device
         if self.hybrid and getattr(self.req_pool, "mamba_ckpt_pool", None) is not None:
-            raise ValueError("Compression stores raw recurrent state; disable int8 checkpoints")
+            raise ValueError(
+                "External compression requires native recurrent checkpoints; "
+                "disable the engine int8 checkpoint pool"
+            )
         if self.hybrid and any(
             getattr(self.req_pool.mamba_pool.mamba_cache, name, None) is not None
             for name in ("replayssm_d", "replayssm_k", "replayssm_g")
         ):
-            raise ValueError("ReplaySSM ring state needs a separate compression adapter")
+            raise ValueError(
+                "ReplaySSM ring state needs a separate compression adapter"
+            )
 
     def context(self):
+        specs = {
+            "key": {
+                "component": "full_attention",
+                "layout": "pages,layers,tokens,heads,dim",
+                "layer_ids": self.layer_ids,
+                "extent": "span",
+                "dtype": str(self.kv.k_buffer[0].dtype).removeprefix("torch."),
+                "key_space": "pre_rope",
+            },
+            "value": {
+                "component": "full_attention",
+                "layout": "pages,layers,tokens,heads,dim",
+                "layer_ids": self.layer_ids,
+                "extent": "span",
+                "dtype": str(self.kv.v_buffer[0].dtype).removeprefix("torch."),
+            },
+        }
+        if self.has_swa:
+            specs.update(
+                {
+                    "swa_key": {
+                        "component": "sliding_attention",
+                        "layout": "pages,layers,tokens,heads,dim",
+                        "layer_ids": self.swa_layer_ids,
+                        "extent": "window",
+                        "dtype": str(self.swa_kv.k_buffer[0].dtype).removeprefix(
+                            "torch."
+                        ),
+                        "window_tokens": self.sliding_window_size,
+                        "stored_window_tokens": self.swa_window_pages * self.page_size,
+                        "key_space": "pre_rope",
+                    },
+                    "swa_value": {
+                        "component": "sliding_attention",
+                        "layout": "pages,layers,tokens,heads,dim",
+                        "layer_ids": self.swa_layer_ids,
+                        "extent": "window",
+                        "dtype": str(self.swa_kv.v_buffer[0].dtype).removeprefix(
+                            "torch."
+                        ),
+                        "window_tokens": self.sliding_window_size,
+                        "stored_window_tokens": self.swa_window_pages * self.page_size,
+                    },
+                }
+            )
+        if self.hybrid:
+            temporal_kind = getattr(self, "temporal_kind", None) or "recurrent"
+            temporal_layer_ids = getattr(self, "temporal_layer_ids", None)
+            if temporal_layer_ids is None:
+                temporal_layer_ids = list(
+                    range(self._state_buffers()["temporal"].shape[0])
+                )
+            specs["temporal"] = {
+                "component": "recurrent",
+                "layout": (
+                    "layers,value_heads,value_dim,key_dim"
+                    if temporal_kind in {"gdn", "kda", "lightning"}
+                    else "layers,heads,head_dim,state_dim"
+                ),
+                "layer_ids": temporal_layer_ids,
+                "extent": "endpoint",
+                "kind": temporal_kind,
+                "dtype": str(
+                    self._state_buffers()["temporal"].dtype
+                ).removeprefix("torch."),
+            }
         return {
             "layout": "pages,layers,tokens,heads,dim",
             "layer_ids": self.layer_ids,
             "page_size": self.page_size,
-            "key_space": "post_rope",
+            "key_space": "pre_rope",
+            "tensor_specs": specs,
         }
 
     def slots(self, req, start, end):
         row = self.req_pool.req_to_token[req.kv.req_pool_idx, start:end]
         return row.to(device=self.device, dtype=torch.int64)
 
+    def _full_buffer_slots(self, slots):
+        """Translate request-row ids when unified memory uses virtual slots."""
+        if getattr(self.kv, "kv_cache_layout", None) == "page_major":
+            return self.allocator.translate_kv_loc_for_kernel(slots)
+        return slots
+
+    @staticmethod
+    def _gather_buffers(buffers, slots, *, pages, page_size):
+        return torch.stack(
+            [
+                buffer.index_select(0, slots).reshape(
+                    pages, page_size, *buffer.shape[1:]
+                )
+                for buffer in buffers
+            ],
+            dim=1,
+        )
+
     def gather_kv(self, slots):
         """[pages, layers, page_tokens, heads, dim] for key and value."""
         if slots.numel() % self.page_size:
             raise ValueError("Slots are not a sequence of complete pages")
         pages = slots.numel() // self.page_size
+        slots = self._full_buffer_slots(slots)
         return {
-            name: torch.stack(
-                [
-                    b.index_select(0, slots).reshape(pages, self.page_size, *b.shape[1:])
-                    for b in buffers
-                ],
-                dim=1,
+            name: self._gather_buffers(
+                buffers, slots, pages=pages, page_size=self.page_size
             )
-            for name, buffers in (("key", self.kv.k_buffer), ("value", self.kv.v_buffer))
+            for name, buffers in (
+                ("key", self.kv.k_buffer),
+                ("value", self.kv.v_buffer),
+            )
         }
 
     def scatter_kv(self, slots, block):
+        slots = self._full_buffer_slots(slots)
         for name, buffers in (("key", self.kv.k_buffer), ("value", self.kv.v_buffer)):
             for layer, buffer in enumerate(buffers):
                 rows = block[name][:, layer].reshape(-1, *buffer.shape[1:])
                 buffer.index_copy_(0, slots, rows)
 
+    def gather_swa(self, full_slots):
+        """Gather a live trailing window addressed by its full-pool slots."""
+        if not self.has_swa:
+            return {}
+        if full_slots.numel() % self.page_size:
+            raise ValueError("SWA slots are not a sequence of complete pages")
+        slots = self.pool.translate_loc_from_full_to_swa(full_slots)
+        if bool((slots <= 0).any().item()):
+            raise RuntimeError("Trailing SWA window contains an unmapped cache page")
+        pages = full_slots.numel() // self.page_size
+        return {
+            name: self._gather_buffers(
+                buffers, slots, pages=pages, page_size=self.page_size
+            )
+            for name, buffers in (
+                ("swa_key", self.swa_kv.k_buffer),
+                ("swa_value", self.swa_kv.v_buffer),
+            )
+        }
+
+    def _new_swa(self, factory):
+        if not self.has_swa:
+            return {}
+        pages = self.swa_window_pages
+        return {
+            name: factory(
+                (pages, len(buffers), self.page_size, *buffers[0].shape[1:]),
+                dtype=buffers[0].dtype,
+                device=buffers[0].device,
+            )
+            for name, buffers in (
+                ("swa_key", self.swa_kv.k_buffer),
+                ("swa_value", self.swa_kv.v_buffer),
+            )
+        }
+
+    def empty_swa(self):
+        """One fixed-shape placeholder for an absent block checkpoint."""
+        return self._new_swa(torch.zeros)
+
+    def sample_swa(self):
+        """One allocation-safe random layout probe (no preceding zero tensor)."""
+        return self._new_swa(torch.randn)
+
+    def pad_swa(self, tensors):
+        """Left-align a short early-prefix window in the fixed block schema."""
+        if not tensors or tensors["swa_key"].shape[0] == self.swa_window_pages:
+            return tensors
+        padded = self.empty_swa()
+        pages = tensors["swa_key"].shape[0]
+        for name, tensor in tensors.items():
+            padded[name][:pages].copy_(tensor)
+        return padded
+
+    def scatter_swa(self, slots, block, *, indices_from_full=False):
+        # Static PoolName.SWA transfers already carry SWA-physical ids. Unified
+        # transfers deliberately reuse FULL virtual ids and mark that fact; only
+        # those ids need the full->SWA kernel-space translation here.
+        if indices_from_full:
+            slots = self.allocator.translate_loc_from_full_to_swa(slots)
+        for name, buffers in (
+            ("swa_key", self.swa_kv.k_buffer),
+            ("swa_value", self.swa_kv.v_buffer),
+        ):
+            pages = slots.numel() // self.page_size
+            tensor = block[name][:pages]
+            for layer, buffer in enumerate(buffers):
+                rows = tensor[:, layer].reshape(-1, *buffer.shape[1:])
+                buffer.index_copy_(0, slots, rows)
+
     def _state_buffers(self):
         state = self.req_pool.mamba_pool.mamba_cache
-        return {"temporal": state.temporal, **{f"conv_{i}": t for i, t in enumerate(state.conv)}}
+        return {
+            "temporal": state.temporal,
+            **{f"conv_{i}": t for i, t in enumerate(state.conv)},
+        }
 
     def _physical_state_slot(self, slot):
         virtual = torch.as_tensor(slot, device=self.device).reshape(1)
@@ -161,6 +365,22 @@ class NativePoolAdapter:
             for name, tensor in self._state_buffers().items()
         }
 
+    def split_state(self, state):
+        if state is None:
+            return None, None
+        return state["temporal"], {
+            name: tensor for name, tensor in state.items() if name != "temporal"
+        }
+
+    def empty_temporal(self):
+        """One transient zero checkpoint with the plugin-visible shape."""
+        temporal = self._state_buffers()["temporal"]
+        return torch.zeros(
+            (temporal.shape[0], *temporal.shape[2:]),
+            dtype=temporal.dtype,
+            device=temporal.device,
+        )
+
     def scatter_state(self, slot, state):
         phys = self._physical_state_slot(slot)
         for name, buffer in self._state_buffers().items():
@@ -168,10 +388,43 @@ class NativePoolAdapter:
 
 
 class CompressionLinker(UnifiedCacheLinker):
+    @staticmethod
+    def _rope_selector(model_config, layer_ids, head_dim):
+        """Resolve per-component RoPE parameters for mixed FULL/SWA models."""
+        config = model_config.hf_text_config
+        layer_types = getattr(config, "layer_types", None)
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if not layer_types or not isinstance(rope_parameters, dict):
+            return None
+        kinds = {layer_types[layer_id] for layer_id in layer_ids}
+        if len(kinds) != 1:
+            return None
+        parameters = rope_parameters.get(next(iter(kinds)))
+        if not isinstance(parameters, dict):
+            return None
+        rope_type = parameters.get("rope_type", parameters.get("type", "default"))
+        selector = {"base": parameters.get("rope_theta", 10000.0)}
+        if rope_type == "proportional":
+            selector["class"] = "Gemma4RotaryEmbedding"
+            # Gemma4 records the partial width in ``rope_angles`` but exposes
+            # a padded, cross-mixed table whose public rotary_dim is head_dim.
+            selector["rotary_dim"] = int(head_dim)
+        elif rope_type == "default":
+            selector["class"] = "RotaryEmbedding"
+            selector["rotary_dim"] = int(
+                head_dim * parameters.get("partial_rotary_factor", 1.0)
+            )
+        return selector
+
     def __init__(self, server_args, params, *, components):
-        if not set(components) <= {ComponentType.FULL, ComponentType.MAMBA}:
+        if not set(components) <= {
+            ComponentType.FULL,
+            ComponentType.SWA,
+            ComponentType.MAMBA,
+        }:
             raise ValueError(
-                "Compression substrate supports full attention and hybrid recurrent models"
+                "Compression substrate supports full attention, sliding-window "
+                "attention, and hybrid recurrent models"
             )
         if server_args.tp_size != 1 or params.pp_size != 1 or params.attn_cp_size != 1:
             raise ValueError("Compression experiments currently use one GPU")
@@ -199,18 +452,14 @@ class CompressionLinker(UnifiedCacheLinker):
         if self.compression_unit == "request" and "block_pages" in config:
             raise ValueError("block_pages only applies to compression_unit=block")
         self.block_pages = (
-            config.get("block_pages", 16)
-            if self.compression_unit == "block"
-            else None
+            config.get("block_pages", 16) if self.compression_unit == "block" else None
         )
         if self.block_pages is not None and (
             type(self.block_pages) is not int or self.block_pages < 1
         ):
             raise ValueError("block_pages must be a positive page count")
         self.block_tokens = (
-            self.block_pages * self.page_size
-            if self.block_pages is not None
-            else None
+            self.block_pages * self.page_size if self.block_pages is not None else None
         )
         chunk = server_args.chunked_prefill_size
         if self.compression_unit == "block":
@@ -222,14 +471,18 @@ class CompressionLinker(UnifiedCacheLinker):
         else:
             self.restoration_boundary_tokens = (
                 math.lcm(self.page_size, chunk)
-                if self.adapter.hybrid and chunk is not None and chunk > 0
+                if (self.adapter.hybrid or self.adapter.has_swa)
+                and chunk is not None
+                and chunk > 0
                 else self.page_size
             )
-        # Hybrid request mode needs callbacks at exact recurrent checkpoints;
-        # non-hybrid request mode does no work at unfinished callbacks.
+        # Stateful request mode needs callbacks at exact recurrent/SWA
+        # checkpoints; plain full-attention request mode does no unfinished work.
         self.prefill_boundary_tokens = (
             self.restoration_boundary_tokens
-            if self.compression_unit == "block" or self.adapter.hybrid
+            if self.compression_unit == "block"
+            or self.adapter.hybrid
+            or self.adapter.has_swa
             else None
         )
         plugin, description = load_plugin(
@@ -252,41 +505,97 @@ class CompressionLinker(UnifiedCacheLinker):
 
         model_config = ModelConfig.from_server_args(server_args)
         model_json = model_config.hf_config.to_json_string()
-        identity["model_config_sha256"] = hashlib.sha256(model_json.encode()).hexdigest()
+        identity["model_config_sha256"] = hashlib.sha256(
+            model_json.encode()
+        ).hexdigest()
         identity["model_config"] = json.loads(model_json)
-        self.pre_rope = None
-        from .pre_rope import resolve_key_space
+        if self.adapter.hybrid:
+            from sglang.srt.configs.hybrid_arch import (
+                hybrid_gdn_config,
+                hybrid_lightning_config,
+                kimi_linear_config,
+            )
 
-        key_space, key_space_source = resolve_key_space(
-            config.get("key_space"), plugin.key_space
+            if hybrid_gdn_config(model_config) is not None:
+                self.adapter.temporal_kind = "gdn"
+            elif kimi_linear_config(model_config) is not None:
+                self.adapter.temporal_kind = "kda"
+            elif hybrid_lightning_config(model_config) is not None:
+                self.adapter.temporal_kind = "lightning"
+            else:
+                self.adapter.temporal_kind = "mamba2"
+
+        from .pre_rope import NativeRoPEDecodePlugin, PreRoPETransform
+
+        # Compression has one canonical key space. Invert the model's own
+        # rotary table at the unit boundary; a model with no RoPE uses identity.
+        text_config = model_config.hf_text_config
+        allow_no_rope = not any(
+            getattr(text_config, name, None)
+            for name in ("rope_parameters", "rope_scaling", "rope_theta")
         )
-        identity["key_space"] = key_space
-        identity["key_space_source"] = key_space_source
-        identity["plugin_key_space"] = plugin.key_space
-        if key_space_source == "config_override":
-            logger.warning(
-                "prefix_compression_config key_space=%s overrides the plugin's %s",
-                key_space,
-                plugin.key_space,
+        full_selector = self._rope_selector(
+            model_config, self.adapter.layer_ids, self.adapter.kv.head_dim
+        )
+        self.pre_rope = PreRoPETransform.from_model_ropes(
+            self.adapter,
+            record=self.record,
+            allow_no_rope=allow_no_rope,
+            component="full",
+            selector=full_selector,
+        )
+        self.swa_pre_rope = None
+        if self.adapter.has_swa:
+            swa_selector = self._rope_selector(
+                model_config,
+                self.adapter.swa_layer_ids,
+                self.adapter.swa_kv.head_dim,
             )
-        if key_space == "pre_rope":
-            from .pre_rope import NativeRoPEDecodePlugin, PreRoPETransform
-
-            # Invert the model's own rotary table at the block boundary. No
-            # forward hook, no shadow buffers, CUDA graphs stay enabled.
-            self.pre_rope = PreRoPETransform.from_model_ropes(
-                self.adapter, record=self.record
+            self.swa_pre_rope = PreRoPETransform.from_model_ropes(
+                self.adapter,
+                record=self.record,
+                allow_no_rope=allow_no_rope,
+                component="swa",
+                selector=swa_selector,
             )
-            plugin = NativeRoPEDecodePlugin(plugin, self.pre_rope)
+        identity["key_space"] = "pre_rope"
+        transforms = {
+            name: transform
+            for name, transform in (
+                ("key", self.pre_rope),
+                ("swa_key", self.swa_pre_rope),
+            )
+            if transform is not None
+        }
+        if transforms:
+            plugin = NativeRoPEDecodePlugin(plugin, transforms)
+            ropes = {
+                name: transform.table.description
+                for name, transform in transforms.items()
+            }
             identity["pre_rope_adapter"] = {
-                "version": 2,
+                "version": 3,
                 "source_sha256": hashlib.sha256(
                     Path(__file__).with_name("pre_rope.py").read_bytes()
                 ).hexdigest(),
                 "method": "fp32-inverse-rotation-from-model-rope-table",
-                "rope": self.pre_rope.table.description,
+                "rope": ropes.get("key"),
+                "ropes": ropes,
+            }
+        else:
+            identity["pre_rope_adapter"] = {
+                "version": 3,
+                "method": "identity-no-rope",
             }
         identity["compression_unit"] = self.compression_unit
+        self.cache_mode = config.get("cache_mode", "compressed")
+        if self.cache_mode not in {"none", "native", "compressed"}:
+            raise ValueError("cache_mode must be none, native or compressed")
+        self.writes_enabled = self.cache_mode == "compressed"
+        self.compressed_only = self.cache_mode == "compressed"
+        # Native mode still relies on the tree's ordinary SWA recovery. Only
+        # compressed-only loads restore SWA from this backend.
+        self.restores_swa = self.adapter.has_swa and self.compressed_only
         store_bytes = config.get("store_bytes", 4 << 30)
         self.store = (
             BlockStore(
@@ -318,18 +627,15 @@ class CompressionLinker(UnifiedCacheLinker):
         # Request mode: exact key -> restorable page count, and rid -> matched key.
         self.request_pages = {}
         self.request_hits = {}
-        self.cache_mode = config.get("cache_mode", "compressed")
-        if self.cache_mode not in {"none", "native", "compressed"}:
-            raise ValueError("cache_mode must be none, native or compressed")
-        self.writes_enabled = self.cache_mode == "compressed"
-        self.compressed_only = self.cache_mode == "compressed"
         self.metrics_path = config.get("metrics_path")
         self.events = deque(maxlen=10000)
         self.request_events = {}
         self.audit = None
         self.audit_fault = config.get("audit_fault")
         if self.compression_unit == "request" and config.get("audit"):
-            raise ValueError("audit=true is not supported with compression_unit=request")
+            raise ValueError(
+                "audit=true is not supported with compression_unit=request"
+            )
         if self.audit_fault not in (None, "skip_scatter") or (
             self.audit_fault and not config.get("audit")
         ):
@@ -340,14 +646,94 @@ class CompressionLinker(UnifiedCacheLinker):
             from .audit import CompressionAudit
 
             self.audit = CompressionAudit(self)
-        pool = (
-            self._allocate_store()
-            if self.compression_unit == "block"
-            else self.store.description()
-        )
+        pool = self._initialize_store()
         self.record(
-            {"event": "init", "identity": identity, "configuration": config, "store": pool}
+            {
+                "event": "init",
+                "identity": identity,
+                "configuration": config,
+                "store": pool,
+            }
         )
+
+    def _initialize_store(self):
+        if self.compression_unit == "block" and self.writes_enabled:
+            return self._allocate_store()
+        return self.store.description()
+
+    def _add_temporal(
+        self,
+        tensors,
+        context,
+        state,
+        *,
+        checkpoint_position,
+        placeholder=None,
+    ):
+        """Expose temporal to the plugin and retain convolution state losslessly."""
+        if not self.adapter.hybrid:
+            return tensors, context, None
+        temporal, conv = self.adapter.split_state(state)
+        valid = temporal is not None
+        if temporal is None:
+            temporal = placeholder
+            if temporal is None:
+                temporal = self.adapter.empty_temporal()
+        tensors["temporal"] = temporal
+        context["temporal_valid"] = valid
+        context["tensor_specs"]["temporal"]["checkpoint_position"] = (
+            checkpoint_position if valid else None
+        )
+        return tensors, context, conv
+
+    def _add_swa(
+        self,
+        tensors,
+        context,
+        swa,
+        *,
+        checkpoint_position,
+        start_position=None,
+        fixed_layout=False,
+        placeholder=None,
+    ):
+        """Expose a trailing SWA checkpoint, padding only block-store entries."""
+        if not self.adapter.has_swa:
+            return tensors, context
+        valid = swa is not None
+        valid_pages = swa["swa_key"].shape[0] if valid else 0
+        if swa is None:
+            swa = placeholder if placeholder is not None else self.adapter.empty_swa()
+        elif fixed_layout:
+            swa = self.adapter.pad_swa(swa)
+        tensors.update(swa)
+        if start_position is None:
+            start_position = max(
+                0,
+                checkpoint_position - self.adapter.swa_window_pages * self.page_size,
+            )
+        context["swa_valid"] = valid
+        for name in ("swa_key", "swa_value"):
+            context["tensor_specs"][name].update(
+                {
+                    "checkpoint_position": checkpoint_position if valid else None,
+                    "start_position": start_position,
+                    "valid_pages": valid_pages,
+                }
+            )
+        return tensors, context
+
+    def _gather_swa_checkpoint(self, req, end):
+        """Copy the live, page-aligned SWA window ending at ``end``."""
+        start = max(0, end - self.adapter.swa_window_pages * self.adapter.page_size)
+        full_slots = self.adapter.slots(req, start, end)
+        tensors = self.adapter.gather_swa(full_slots)
+        if getattr(self, "swa_pre_rope", None) is not None:
+            native = tensors.pop("swa_key")
+            tensors["swa_key"] = self.swa_pre_rope.derotate(
+                native, start_position=start, audit=self.audit is not None
+            )
+        return tensors, start
 
     @torch.no_grad()
     def _allocate_store(self):
@@ -365,10 +751,26 @@ class CompressionLinker(UnifiedCacheLinker):
             "start_position": 0,
             "block_index": 0,
         }
-        if self.pre_rope is not None:
-            context["key_space"] = "pre_rope"
+        if self.adapter.has_swa:
+            sample, context = self._add_swa(
+                sample,
+                context,
+                None,
+                checkpoint_position=0,
+                start_position=0,
+                fixed_layout=True,
+                placeholder=self.adapter.sample_swa(),
+            )
         state = self.adapter.gather_state(0) if self.adapter.hybrid else None
-        return self.store.allocate(sample, context=context, state=state)
+        sample, context, conv = self._add_temporal(
+            sample, context, state, checkpoint_position=0
+        )
+        # The first call is a layout probe, never a restorable checkpoint.
+        context["temporal_valid"] = False
+        context["tensor_specs"].get("temporal", {}).update(
+            {"checkpoint_position": None}
+        )
+        return self.store.allocate(sample, context=context, state=conv)
 
     def record(self, event):
         self.events.append(event)
@@ -408,14 +810,14 @@ class CompressionLinker(UnifiedCacheLinker):
         state_valid = len(req.output_ids) <= 1
         checkpoint_index = (
             complete - 1
-            if self.adapter.hybrid
+            if (self.adapter.hybrid or self.adapter.has_swa)
             and state_valid
             and processed == complete * self.block_tokens
             else None
         )
         checkpoint = (
             self.adapter.gather_state(req.kv.mamba_pool_idx)
-            if checkpoint_index is not None
+            if checkpoint_index is not None and self.adapter.hybrid
             else None
         )
         start = done * self.block_tokens
@@ -428,19 +830,40 @@ class CompressionLinker(UnifiedCacheLinker):
         for index in range(done, complete):
             offset = (index - done + 1) * self.block_pages
             key = hashes[offset - 1]
-            parent = hashes[offset - self.block_pages - 1] if index > done else last_hash
+            parent = (
+                hashes[offset - self.block_pages - 1] if index > done else last_hash
+            )
             state = checkpoint if index == checkpoint_index else None
-            block = (index, key, parent, state)
+            swa_valid = self.adapter.has_swa and index == checkpoint_index
+            block = (index, key, parent, state, swa_valid)
             if self.store.has(key):
-                if state is not None and self.store.state(key) is None:
-                    record = self.store.attach_state(key, state)
+                needs_upgrade = (
+                    state is not None and not self.store.has_checkpoint(key)
+                ) or (swa_valid and not self.store.has_swa(key))
+                if needs_upgrade:
+                    begin = time.perf_counter_ns()
+                    inputs, context, _, _ = self._gather_block(
+                        req, index, swa_checkpoint=swa_valid
+                    )
+                    inputs, context, conv = self._add_temporal(
+                        inputs,
+                        context,
+                        state,
+                        checkpoint_position=(index + 1) * self.block_tokens,
+                    )
+                    record = self.store.upgrade(
+                        key, inputs, context=context, state=conv
+                    )
+                    if self.adapter.device.type == "cuda":
+                        torch.cuda.current_stream(self.adapter.device).synchronize()
                     self.record(
                         {
                             "event": "state_checkpoint",
                             "rid": req.rid,
                             "block": index,
-                            "key": key,
-                            "state_bytes": record["state_bytes"],
+                            **record,
+                            "latency_ms": (time.perf_counter_ns() - begin) / 1e6,
+                            "recompressed": True,
                         }
                     )
             else:
@@ -451,7 +874,7 @@ class CompressionLinker(UnifiedCacheLinker):
 
     @torch.no_grad()
     def _on_request_progress(self, req, processed_tokens, *, finished):
-        """Keep a hybrid checkpoint during prefill; encode only at finalization."""
+        """Keep stateful checkpoints during prefill; encode only at finalization."""
         if not self._request_is_keyable(req):
             self.checkpoints.pop(req.rid, None)
             if finished:
@@ -475,33 +898,54 @@ class CompressionLinker(UnifiedCacheLinker):
             return
 
         max_end = self._request_cacheable_end(req, processed_tokens)
-        if self.adapter.hybrid:
+        if self.adapter.hybrid or self.adapter.has_swa:
             if held is not None and held[0] <= max_end:
-                end, state = held
+                end, state, swa, swa_start = held
             elif not req.output_ids and max_end == processed_tokens:
                 end = max_end
-                state = self.adapter.gather_state(req.kv.mamba_pool_idx)
+                state = (
+                    self.adapter.gather_state(req.kv.mamba_pool_idx)
+                    if self.adapter.hybrid
+                    else None
+                )
+                swa, swa_start = (
+                    self._gather_swa_checkpoint(req, end)
+                    if self.adapter.has_swa
+                    else (None, None)
+                )
             else:
                 self.record(
                     {
                         "event": "compress_skipped",
                         "rid": req.rid,
                         "compression_unit": "request",
-                        "reason": "no_restorable_recurrent_checkpoint",
+                        "reason": (
+                            "no_restorable_recurrent_checkpoint"
+                            if self.adapter.hybrid
+                            else "no_restorable_swa_checkpoint"
+                        ),
                     }
                 )
                 return
         else:
-            end, state = max_end, None
+            end, state, swa, swa_start = max_end, None, None, None
         if end <= 0:
             return
 
         begin = time.perf_counter_ns()
         tensors, context, _, _ = self._gather_span(req, 0, end)
+        tensors, context = self._add_swa(
+            tensors,
+            context,
+            swa,
+            checkpoint_position=end,
+            start_position=swa_start,
+        )
+        tensors, context, conv = self._add_temporal(
+            tensors, context, state, checkpoint_position=end
+        )
         try:
-            record = self.store.insert(
-                key, tensors, context=context, state=state
-            )
+            record = self.store.insert(key, tensors, context=context, state=conv)
         except (RequestTooLarge, RequestStoreFull) as error:
             self.record(
                 {
@@ -546,9 +990,9 @@ class CompressionLinker(UnifiedCacheLinker):
 
     @torch.no_grad()
     def _hold_request_checkpoint(self, req, processed_tokens):
-        """Retain the deepest exact recurrent boundary seen before decode."""
+        """Retain the deepest exact recurrent/SWA boundary seen before decode."""
         if (
-            not self.adapter.hybrid
+            not (self.adapter.hybrid or self.adapter.has_swa)
             or not self.writes_enabled
             or req.kv.req_pool_idx is None
             or req.output_ids
@@ -561,10 +1005,17 @@ class CompressionLinker(UnifiedCacheLinker):
             or processed > self._request_cacheable_end(req, processed_tokens)
         ):
             return
-        self.checkpoints[req.rid] = (
-            processed,
-            self.adapter.gather_state(req.kv.mamba_pool_idx),
+        state = (
+            self.adapter.gather_state(req.kv.mamba_pool_idx)
+            if self.adapter.hybrid
+            else None
         )
+        swa, swa_start = (
+            self._gather_swa_checkpoint(req, processed)
+            if self.adapter.has_swa
+            else (None, None)
+        )
+        self.checkpoints[req.rid] = (processed, state, swa, swa_start)
 
     def _request_cacheable_end(self, req, processed_tokens):
         """Largest page-aligned prefix an ordinary admission can restore."""
@@ -602,8 +1053,6 @@ class CompressionLinker(UnifiedCacheLinker):
         }
         if block_index is not None:
             context["block_index"] = block_index
-        if self.pre_rope is not None:
-            context["key_space"] = "pre_rope"
         return context
 
     def _gather_span(self, req, start, end, *, sample_blocks=()):
@@ -626,7 +1075,7 @@ class CompressionLinker(UnifiedCacheLinker):
             del keys
         return native, self._context(req, start, end), slots, samples
 
-    def _gather_block(self, req, index):
+    def _gather_block(self, req, index, *, swa_checkpoint=False, swa_placeholder=None):
         """Gather one block for the independent block-compression path."""
         start, end = index * self.block_tokens, (index + 1) * self.block_tokens
         native, context, slots, samples = self._gather_span(
@@ -636,11 +1085,23 @@ class CompressionLinker(UnifiedCacheLinker):
             sample_blocks=(index,) if self.audit is not None else (),
         )
         context["block_index"] = index
+        swa, swa_start = (
+            self._gather_swa_checkpoint(req, end) if swa_checkpoint else (None, None)
+        )
+        native, context = self._add_swa(
+            native,
+            context,
+            swa,
+            checkpoint_position=end,
+            start_position=swa_start,
+            fixed_layout=True,
+            placeholder=swa_placeholder,
+        )
         return native, context, slots, samples.get(index)
 
     def _record_compression(self, req, encoded, latency, *, blocks_encoded):
         """Publish records for independently compressed blocks."""
-        for (index, key, _, _), record in encoded:
+        for (index, key, _, _, _), record in encoded:
             for evicted in record.pop("evicted"):
                 self.record(
                     {
@@ -668,13 +1129,42 @@ class CompressionLinker(UnifiedCacheLinker):
         if not blocks:
             return
         begin = time.perf_counter_ns()
-        gathered = [self._gather_block(req, index) for index, *_ in blocks]
-        records = [
-            self.store.insert(
-                key, inputs, context=context, state=state, parent=parent
+        swa_placeholder = (
+            self.adapter.empty_swa()
+            if self.adapter.has_swa and any(not block[-1] for block in blocks)
+            else None
+        )
+        gathered = [
+            self._gather_block(
+                req,
+                index,
+                swa_checkpoint=swa_valid,
+                swa_placeholder=swa_placeholder,
             )
-            for (index, key, parent, state), (inputs, context, _, _) in zip(
-                blocks, gathered
+            for index, _, _, _, swa_valid in blocks
+        ]
+        placeholder = (
+            self.adapter.empty_temporal()
+            if self.adapter.hybrid
+            and any(state is None for _, _, _, state, _ in blocks)
+            else None
+        )
+        prepared = []
+        for (index, _, _, state, _), (inputs, context, slots, sample) in zip(
+            blocks, gathered
+        ):
+            inputs, context, conv = self._add_temporal(
+                inputs,
+                context,
+                state,
+                checkpoint_position=(index + 1) * self.block_tokens,
+                placeholder=placeholder,
+            )
+            prepared.append((inputs, context, slots, sample, conv))
+        records = [
+            self.store.insert(key, inputs, context=context, state=conv, parent=parent)
+            for (_, key, parent, _, _), (inputs, context, _, _, conv) in zip(
+                blocks, prepared
             )
         ]
         if self.adapter.device.type == "cuda":
@@ -684,7 +1174,7 @@ class CompressionLinker(UnifiedCacheLinker):
             req, list(zip(blocks, records)), latency, blocks_encoded=1
         )
         if self.audit is not None:
-            for (_, key, _, _), (_, _, slots, sample) in zip(blocks, gathered):
+            for (_, key, _, _, _), (_, _, slots, sample, _) in zip(blocks, prepared):
                 self.audit.source(slots, sample, key)
 
     # ---- target side: exact lookup and synchronous restore ----
@@ -701,9 +1191,13 @@ class CompressionLinker(UnifiedCacheLinker):
             key = full.keys[end - 1]
             if not self.store.has(key):
                 break
-            if not self.adapter.hybrid or self.store.state(key) is not None:
+            has_state = not self.adapter.hybrid or self.store.has_checkpoint(key)
+            has_swa = not self.adapter.has_swa or self.store.has_swa(key)
+            if has_state and has_swa:
                 result.append(end)
-        self.record({"event": "lookup", "rid": rid, "hit_pages": result[-1] if result else 0})
+        self.record(
+            {"event": "lookup", "rid": rid, "hit_pages": result[-1] if result else 0}
+        )
         return result
 
     def lookup_request(self, req, transfers, *, device_hit_pages=0):
@@ -754,7 +1248,10 @@ class CompressionLinker(UnifiedCacheLinker):
             hit = self.store.pin(key)
             if hit:
                 self.request_hits[req.rid] = key
-        if hit and self.adapter.hybrid and self.store.state(key) is None:
+        if hit and self.adapter.hybrid and not self.store.has_checkpoint(key):
+            self._release_request_hit(req.rid)
+            hit = False
+        if hit and self.adapter.has_swa and not self.store.has_swa(key):
             self._release_request_hit(req.rid)
             hit = False
         self.record(
@@ -797,7 +1294,9 @@ class CompressionLinker(UnifiedCacheLinker):
         self.layer_done_counter.producer_index += 1
         self.completed_loads.append(rids)
         self.queued.clear()
-        self.record({"event": "load_batch", "request_ids": rids, "batch_size": len(rids)})
+        self.record(
+            {"event": "load_batch", "request_ids": rids, "batch_size": len(rids)}
+        )
         return self.layer_done_counter.producer_index
 
     def _restore_blocks(self, rid, transfers):
@@ -814,11 +1313,30 @@ class CompressionLinker(UnifiedCacheLinker):
                     slots[i * self.block_tokens : (i + 1) * self.block_tokens], block
                 )
             for transfer in transfers:
+                if transfer.name == PoolName.SWA:
+                    if not self.store.has_swa(block_keys[-1]):
+                        raise RuntimeError(
+                            "Block has no sliding-window state for an SWA restore"
+                        )
+                    self.adapter.scatter_swa(
+                        transfer.device_indices,
+                        restored.blocks[-1],
+                        indices_from_full=transfer.indices_from_pool == PoolName.KV,
+                    )
                 if transfer.name == PoolName.MAMBA:
-                    state = self.store.state(block_keys[-1])
-                    if state is None:
-                        raise RuntimeError("Block has no recurrent state for a hybrid restore")
-                    self.adapter.scatter_state(transfer.device_indices[0], state)
+                    conv = self.store.state(block_keys[-1])
+                    temporal = restored.blocks[-1].get("temporal")
+                    if (
+                        not self.store.has_checkpoint(block_keys[-1])
+                        or temporal is None
+                    ):
+                        raise RuntimeError(
+                            "Block has no recurrent state for a hybrid restore"
+                        )
+                    self.adapter.scatter_state(
+                        transfer.device_indices[0],
+                        {"temporal": temporal, **(conv or {})},
+                    )
         if self.audit is not None:
             self.audit.verify_scatter(rid, kv, restored)
 
@@ -828,7 +1346,9 @@ class CompressionLinker(UnifiedCacheLinker):
             kv = next(t for t in transfers if t.name == PoolName.KV)
             expected_pages = self.request_pages[key]
             if len(kv.keys) != expected_pages:
-                raise ValueError("Request restore destination does not cover the stored span")
+                raise ValueError(
+                    "Request restore destination does not cover the stored span"
+                )
             restored = self.store.reconstruct(key)
             self.record(
                 {
@@ -841,16 +1361,32 @@ class CompressionLinker(UnifiedCacheLinker):
             )
             slots = kv.device_indices.to(device=self.adapter.device, dtype=torch.int64)
             if slots.numel() != restored.measurement["tokens"]:
-                raise ValueError("Request restore slot count does not match decoded payload")
+                raise ValueError(
+                    "Request restore slot count does not match decoded payload"
+                )
             self.adapter.scatter_kv(slots, restored.tensors)
             for transfer in transfers:
+                if transfer.name == PoolName.SWA:
+                    if not self.store.has_swa(key):
+                        raise RuntimeError(
+                            "Request has no sliding-window state for an SWA restore"
+                        )
+                    self.adapter.scatter_swa(
+                        transfer.device_indices,
+                        restored.tensors,
+                        indices_from_full=transfer.indices_from_pool == PoolName.KV,
+                    )
                 if transfer.name == PoolName.MAMBA:
-                    state = self.store.state(key)
-                    if state is None:
+                    conv = self.store.state(key)
+                    temporal = restored.tensors.get("temporal")
+                    if not self.store.has_checkpoint(key) or temporal is None:
                         raise RuntimeError(
                             "Request has no recurrent state for a hybrid restore"
                         )
-                    self.adapter.scatter_state(transfer.device_indices[0], state)
+                    self.adapter.scatter_state(
+                        transfer.device_indices[0],
+                        {"temporal": temporal, **(conv or {})},
+                    )
         finally:
             self.store.unpin(key)
 

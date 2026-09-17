@@ -3108,9 +3108,16 @@ class UnifiedRadixCache(BasePrefixCache):
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring
         (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
+        layout, and for an external linker that restores SWA itself.
         """
         swa = self.components.get(ComponentType.SWA)
+        if (
+            swa is not None
+            and self.linker is not None
+            and getattr(self.linker.cache_linker, "restores_swa", False)
+            and getattr(self.linker.cache_linker, "compressed_only", False)
+        ):
+            return 0
         unified_compress_only_hicache = (
             self.cache_controller is not None
             and swa is not None

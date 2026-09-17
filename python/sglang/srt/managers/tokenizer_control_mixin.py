@@ -200,7 +200,7 @@ def _merge_prefix_compression_results(
             "global_bytes",
         )
         if store.get("storage_unit") == "request"
-        else ("stored_blocks", "evictions")
+        else ("stored_blocks", "evictions", "metadata_bytes_compressed")
     )
     for name in aggregate_fields:
         if all(name in result.data["store"] for result in results):

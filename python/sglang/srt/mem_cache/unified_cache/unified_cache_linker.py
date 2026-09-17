@@ -174,6 +174,10 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers or rid in self.private_loads
 
+    def is_request_owned_load(self, rid: str) -> bool:
+        """Whether a completed external load lives only in the request's row."""
+        return rid in self.private_loads
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -299,7 +303,9 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
-        # Build per-component linker transfers.
+        # Build and prepare in component order. Unified tri-pools need SWA's
+        # physical pages bound before the Mamba component consumes the other
+        # end of the shared byte buffer.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
         for component in cache._components_tuple:
             transfer = component.build_external_linker_transfer(
@@ -313,16 +319,18 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                 )
                 return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
-
-        full_transfer = component_transfers[0][1]
-        assert full_transfer.name == PoolName.KV
-        self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
+            if not component_transfers:
+                assert transfer.name == PoolName.KV
+                full_transfer = transfer
+            prepared = component.update_external_linker_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                full_transfer,
+                transfer,
+                prefix_len,
+            )
+            if prepared is not None:
+                component_transfers.append((component, prepared))
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
@@ -397,17 +405,16 @@ class UnifiedCacheLinkerWrapper:
             return empty.device_indices, empty.last_device_node
         assert hit.device_hit_len == 0
         transfers = []
+        prefix_len = len(hit.prefix_key)
         for component in cache._components_tuple:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.LOAD, None, hit.tail_hashes
             )
             if transfer is None:
                 self._update_load(
-                    ExternalLinkerLoadPhase.ABORT, req, transfers, len(hit.prefix_key)
+                    ExternalLinkerLoadPhase.ABORT, req, transfers, prefix_len
                 )
                 return empty.device_indices, empty.last_device_node
-            transfers.append((component, transfer))
-        for _, transfer in transfers:
             if transfer.name == PoolName.MAMBA:
                 if req.kv.holds_mamba:
                     cache.req_to_token_pool.mamba_allocator.free(
@@ -418,6 +425,20 @@ class UnifiedCacheLinkerWrapper:
                     req.kv.mamba_pool_idx = transfer.device_indices[0]
                 req.kv.mamba_cow_src_index = None
                 req.kv.mamba_needs_clear = False
+            if not transfers:
+                assert transfer.name == PoolName.KV
+                full_transfer = transfer
+            prepared = component.update_external_linker_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                full_transfer,
+                transfer,
+                prefix_len,
+            )
+            if prepared is not None:
+                transfers.append((component, prepared))
+        # Private restores do not insert a radix node, but PREPARE above is
+        # required for SWA mapping and shared-pool reservation.
         self._queue_load(req.rid, empty.last_device_node, [t for _, t in transfers])
         self.private_loads[req.rid] = (req, transfers[0][1].device_indices)
         audit = getattr(self.cache_linker, "audit", None)

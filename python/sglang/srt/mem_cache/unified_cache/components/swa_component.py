@@ -1141,10 +1141,20 @@ class SWAComponent(TreeComponent):
             shortfall = max(0, num_tokens - allocator.available_size())
             if shortfall:
                 self.cache.evict(EvictParams(swa_num_tokens=shortfall))
-            transfer.device_indices = allocator.alloc(num_tokens)
-            if transfer.device_indices is None:
+            if allocator.available_size() < num_tokens:
                 return None
-            transfer.device_indices = transfer.device_indices.to(torch.int64)
+            if self._unified_allocator() is not None:
+                # The unified SWA suballocator does not own virtual ids. The FULL
+                # component allocates them first; PREPARE binds these same ids to
+                # SWA physical pages once ``full_transfer`` is available.
+                transfer.device_indices = torch.empty(
+                    0, dtype=torch.int64, device=allocator.device
+                )
+            else:
+                transfer.device_indices = allocator.alloc(num_tokens)
+                if transfer.device_indices is None:
+                    return None
+                transfer.device_indices = transfer.device_indices.to(torch.int64)
         return transfer
 
     def update_external_linker_load(
@@ -1159,17 +1169,29 @@ class SWAComponent(TreeComponent):
         canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
-            self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
-                transfer.device_indices
-            )
+            if transfer.device_indices is not None and transfer.device_indices.numel():
+                self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
+                    transfer.device_indices
+                )
             return None
 
         allocator = self.cache.token_to_kv_pool_allocator
         if phase == ExternalLinkerLoadPhase.PREPARE:
-            swa_len = len(transfer.device_indices)
-            allocator.set_full_to_swa_mapping(
-                full_transfer.device_indices[-swa_len:], transfer.device_indices
-            )
+            unified = self._unified_allocator()
+            if unified is not None:
+                num_tokens = len(transfer.keys) * self.cache.page_size
+                virtual_tokens = full_transfer.device_indices[-num_tokens:]
+                virtual_pages = (
+                    virtual_tokens[:: self.cache.page_size] // self.cache.page_size
+                )
+                unified.swa_attn_allocator.alloc_with_virtual(virtual_pages)
+                transfer.device_indices = virtual_tokens
+                transfer.indices_from_pool = PoolName.KV
+            else:
+                swa_len = len(transfer.device_indices)
+                allocator.set_full_to_swa_mapping(
+                    full_transfer.device_indices[-swa_len:], transfer.device_indices
+                )
             page = self.cache.page_size
             window = ((self.sliding_window_size + page - 1) // page) * page
             boundary = max(0, prefix_len - window)
@@ -1187,6 +1209,13 @@ class SWAComponent(TreeComponent):
         assert phase == ExternalLinkerLoadPhase.COMMIT
         assert insert_result is not None and canonical_full is not None
         assert len(canonical_full) == len(transfer.device_indices)
+        if self._unified_allocator() is not None:
+            # Locked-full overlap may rebind the incoming SWA pages to the
+            # canonical kept FULL ids and tombstone the incoming ids. Scatter
+            # through those canonical ids, not the now-dead allocation.
+            transfer.device_indices = canonical_full
+            transfer.indices_from_pool = PoolName.KV
+            return transfer
         allocator.set_full_to_swa_mapping(canonical_full, transfer.device_indices)
         return transfer
 

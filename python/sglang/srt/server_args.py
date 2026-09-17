@@ -2867,7 +2867,7 @@ class ServerArgs:
 
     prefix_compression_config: A[
         Optional[str],
-        "JSON settings for the experimental compression linker: plugin (identity, int8 or .py path), parameters, block_pages (compression/lookup unit in pages, default 16), key_space (auto: follow the plugin's declaration; pre_rope; post_rope), metrics_path, audit.",
+        "JSON settings for the experimental compression linker: plugin (identity, int8, joint_int8, temporal_quant, or .py path), parameters, block_pages (compression/lookup unit in pages, default 16), metrics_path, audit. Keys are always exposed pre-RoPE.",
         NS("memory"),
     ] = None
 

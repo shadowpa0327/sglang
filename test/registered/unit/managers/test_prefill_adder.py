@@ -1051,6 +1051,28 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(req.kv.cache_protected_len, restored)
 
+    def test_private_external_restore_remains_request_owned(self):
+        restored = 4096
+        req = self._boundary_req("private-restored", restored + 1024)
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.host_hit_length = restored
+        req.needs_host_load_back.return_value = True
+        req.best_match_node = MagicMock()
+        req.kv = SimpleNamespace(cache_protected_len=0)
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.arange(restored),
+            MagicMock(),
+        )
+        self.mock_tree_cache.linker.is_request_owned_load.return_value = True
+
+        self._boundary_adder(1024, 2048).add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        # No radix node owns this prefix. Keeping zero lets SWA eviction/free
+        # release the restored trailing window instead of orphaning it.
+        self.assertEqual(req.kv.cache_protected_len, 0)
+
     def test_boundary_splits_extend_that_fits_the_budget(self):
         # A whole extend that fits the chunk budget is still split when it
         # would straddle a boundary; both admission paths agree.
