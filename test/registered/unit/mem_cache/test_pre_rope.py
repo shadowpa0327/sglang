@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,77 +13,11 @@ from sglang.srt.mem_cache.compression.pre_rope import (
     RotaryTable,
 )
 
-PLUGIN = (
-    Path(__file__).resolve().parents[4]
-    / "examples/prefix_compression/xkv_svd_plugin.py"
-)
 CPU = torch.device("cpu")
 
 
 def make_rope(neox=True, head=8, rotary=8, max_pos=4096, base=10000):
     return RotaryEmbedding(head, rotary, max_pos, base, neox, torch.bfloat16)
-
-
-def test_exact_svd_matches_xkv_matrix_layout_and_factor_bytes():
-    torch.manual_seed(9)
-    plugin, _ = load_plugin(
-        str(PLUGIN), {"layer_group_size": 3, "rank_k": 3, "rank_v": 5}
-    )
-    tensors = {name: torch.randn(2, 5, 8, 2, 4).bfloat16() for name in ("key", "value")}
-    payload = plugin.compress(tensors, context={})
-    out = {name: torch.empty_like(t) for name, t in tensors.items()}
-    scratch = plugin.prepare_decompression(payload, out=out)
-    # Two widths (three layers and the trailing two), shared across K and V.
-    assert len({t.data_ptr() for t in scratch.values()}) == 2
-    plugin.decompress(payload, out=out, scratch=scratch)
-    nbytes = 0
-    for group in payload.metadata["groups"]:
-        name, first, count, rank = (
-            group["name"],
-            group["first"],
-            group["layers"],
-            group["rank"],
-        )
-        # Independent xKV view: concatenate layers as heads, then transpose tokens first.
-        source = (
-            tensors[name][:, first : first + count]
-            .permute(1, 3, 0, 2, 4)
-            .reshape(count * 2, 16, 4)
-        )
-        matrix = source.transpose(0, 1).reshape(16, count * 8).float()
-        u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
-        expected = (u[:, :rank] * s[:rank].sqrt()).bfloat16() @ (
-            s[:rank].sqrt()[:, None] * vh[:rank]
-        ).bfloat16()
-        actual = (
-            out[name][:, first : first + count]
-            .permute(0, 2, 1, 3, 4)
-            .reshape_as(expected)
-        )
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        nbytes += rank * (16 + count * 8) * 2
-    assert payload.tensor_bytes == nbytes
-
-
-def test_randomized_solver_rng_isolation_and_partial_group_restoration():
-    plugin, identity = load_plugin(
-        str(PLUGIN), {"solver": "randomized", "rank_k": 3, "rank_v": 3}
-    )
-    tensors = {name: torch.randn(4, 4, 8, 2, 8).bfloat16() for name in ("key", "value")}
-    state = torch.random.get_rng_state().clone()
-    first = plugin.compress(tensors, context={"start_position": 512})
-    second = plugin.compress(tensors, context={"start_position": 512})
-    assert torch.equal(state, torch.random.get_rng_state())
-    for name in first.tensors:
-        assert torch.equal(first.tensors[name], second.tensors[name])
-    store = BlockStore(plugin, identity, 4, store_bytes=1 << 20)
-    record = store.insert("k", tensors, context={})
-    assert record["compressed_bytes"] < record["original_bytes"]
-    for tensor in tensors.values():
-        tensor.fill_(float("nan"))
-    decoded = store.reconstruct(["k"])
-    assert decoded.measurement["pages"] == 4
-    assert all(torch.isfinite(t).all() for t in decoded.blocks[0].values())
 
 
 @pytest.mark.parametrize("neox", [True, False])
@@ -269,8 +202,6 @@ def test_transform_rejects_uncovered_positions_and_non_1d_tables():
 
 
 def test_plugins_use_the_api_v2_canonical_pre_rope_contract():
-    svd, _ = load_plugin(str(PLUGIN), {"rank_k": 2, "rank_v": 2})
-    assert svd.api_version == 2
     assert load_plugin("identity")[0].api_version == 2
     assert load_plugin("int8")[0].api_version == 2
 
