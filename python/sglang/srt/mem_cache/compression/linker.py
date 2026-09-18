@@ -525,12 +525,17 @@ class CompressionLinker(UnifiedCacheLinker):
             else:
                 self.adapter.temporal_kind = "mamba2"
 
+        from sglang.srt.layers.rotary_embedding import factory
         from .pre_rope import NativeRoPEDecodePlugin, PreRoPETransform
 
         # Compression has one canonical key space. Invert the model's own
         # rotary table at the unit boundary; a model with no RoPE uses identity.
         text_config = model_config.hf_text_config
-        allow_no_rope = not any(
+        # An empty rope cache is the stronger witness: Nemotron-H carries a vestigial
+        # rope_theta that no layer reads, so the config test alone sends it to a selector
+        # that finds zero tables and refuses to start. The model is loaded before
+        # init_memory_pools builds this linker, so the cache is populated by now.
+        allow_no_rope = not factory._ROPE_DICT or not any(
             getattr(text_config, name, None)
             for name in ("rope_parameters", "rope_scaling", "rope_theta")
         )
