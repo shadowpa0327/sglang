@@ -155,6 +155,12 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
     )
 
 
+def _summable(name: str, results: List[PrefixCompressionReqOutput]) -> bool:
+    """Whether every rank reported `name` as a number. `bool` is not one."""
+    values = [result.data["store"].get(name) for result in results]
+    return all(type(value) in (int, float) for value in values)
+
+
 def _merge_prefix_compression_results(
     action: str, results: List[PrefixCompressionReqOutput]
 ) -> PrefixCompressionReqOutput:
@@ -168,7 +174,8 @@ def _merge_prefix_compression_results(
     Failures win, so a partially busy engine reports 409 rather than a
     misleading success. Request events concatenate, because exactly one rank
     holds them. Capacity, residency, eviction, and cumulative byte counters sum
-    across ranks; fixed per-entry layout fields retain the first rank's value.
+    across ranks; per-unit `sample_*` figures and layout fields retain the first
+    rank's value.
     """
     failed = [r for r in results if r.status_code != 200]
     if failed:
@@ -184,27 +191,26 @@ def _merge_prefix_compression_results(
         r.data.get("stored_requests", 0) for r in results
     )
     store = dict(data["store"])
-    aggregate_fields = (
-        (
-            "stored_requests",
-            "evictions",
-            "store_bytes",
-            "free_bytes",
-            "used_bytes",
-            "peak_used_bytes",
-            "requests_compressed",
-            "original_bytes_compressed",
-            "payload_bytes_compressed",
-            "state_bytes_compressed",
-            "metadata_bytes_compressed",
-            "global_bytes",
-        )
-        if store.get("storage_unit") == "request"
-        else ("stored_blocks", "evictions", "metadata_bytes_compressed")
-    )
-    for name in aggregate_fields:
-        if all(name in result.data["store"] for result in results):
-            store[name] = sum(result.data["store"][name] for result in results)
+    if store.get("storage_unit") == "request":
+        # Every numeric field of a request store is cumulative or a capacity, so summing
+        # is the default and the exceptions are nameable. An allow-list here kept rank 0's
+        # value for the component counters added later, so a dp-wide payload total was
+        # divided by a one-rank exposed total and the saving came back negative.
+        for name in store:
+            if not name.startswith("sample_") and _summable(name, results):
+                store[name] = sum(result.data["store"][name] for result in results)
+        if all("payload_attribution_complete" in r.data["store"] for r in results):
+            # An AND, like `idle`: one rank that could not attribute its payload makes
+            # the merged attribution incomplete.
+            store["payload_attribution_complete"] = all(
+                r.data["store"]["payload_attribution_complete"] for r in results
+            )
+    else:
+        # Block mode reports per-block figures, which are one layout repeated on every
+        # rank; only the counts and the cumulative metadata total are sums.
+        for name in ("stored_blocks", "evictions", "metadata_bytes_compressed"):
+            if all(name in result.data["store"] for result in results):
+                store[name] = sum(result.data["store"][name] for result in results)
     data["store"] = store
     data["dp_size"] = len(results)
     return PrefixCompressionReqOutput(data=data)

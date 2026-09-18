@@ -20,10 +20,19 @@ def _status(stored, used, peak, compressed):
                 "peak_used_bytes": peak,
                 "requests_compressed": compressed,
                 "original_bytes_compressed": compressed * 100,
+                "exposed_bytes_compressed": compressed * 100,
+                "exposed_kv_bytes_compressed": compressed * 90,
+                "exposed_temporal_bytes_compressed": compressed * 10,
                 "payload_bytes_compressed": compressed * 40,
+                "kv_payload_bytes_compressed": compressed * 35,
+                "temporal_payload_bytes_compressed": compressed * 5,
+                "payload_attribution_complete": True,
                 "state_bytes_compressed": compressed * 10,
                 "metadata_bytes_compressed": compressed * 2,
                 "global_bytes": 20,
+                # One exemplar unit, the same on every rank.
+                "sample_exposed_bytes": 100,
+                "sample_payload_bytes": 40,
             },
         }
     )
@@ -43,6 +52,40 @@ def test_request_store_status_sums_residency_and_cumulative_counts_across_dp():
     assert merged["store"]["store_bytes"] == 2000
     assert merged["store"]["free_bytes"] == 1700
     assert merged["dp_size"] == 2
+
+
+def test_request_store_status_sums_component_byte_counters_across_dp():
+    """Exposed and payload totals must count the same ranks.
+
+    The merge summed `payload_bytes_compressed` while the per-component and exposed
+    counters kept rank 0's value, so a saving computed from the pair came back negative:
+    a codec compressing 3.88x reported 0.97x on four ranks.
+    """
+    merged = _merge_prefix_compression_results(
+        "status", [_status(2, 200, 250, 3), _status(1, 100, 150, 2)]
+    ).data["store"]
+
+    assert merged["exposed_bytes_compressed"] == 500
+    assert merged["exposed_kv_bytes_compressed"] == 450
+    assert merged["exposed_temporal_bytes_compressed"] == 50
+    assert merged["payload_bytes_compressed"] == 200
+    assert merged["kv_payload_bytes_compressed"] == 175
+    assert merged["temporal_payload_bytes_compressed"] == 25
+    # Per-unit exemplars describe one request, so they are not counts to add up.
+    assert merged["sample_exposed_bytes"] == 100
+    assert merged["sample_payload_bytes"] == 40
+    assert merged["payload_attribution_complete"] is True
+
+
+def test_request_store_attribution_is_incomplete_when_any_rank_cannot_attribute():
+    partial = _status(1, 100, 150, 2)
+    partial.data["store"]["payload_attribution_complete"] = False
+
+    merged = _merge_prefix_compression_results(
+        "status", [_status(2, 200, 250, 3), partial]
+    ).data["store"]
+
+    assert merged["payload_attribution_complete"] is False
 
 
 def test_block_store_status_sums_cumulative_metadata_across_dp():
