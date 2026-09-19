@@ -1006,7 +1006,7 @@ class CompressionLinker(UnifiedCacheLinker):
         processed = min(processed_tokens, len(req.origin_input_ids))
         if (
             processed <= 0
-            or processed % self.page_size
+            or processed % self.restoration_boundary_tokens
             or processed > self._request_cacheable_end(req, processed_tokens)
         ):
             return

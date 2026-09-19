@@ -80,6 +80,7 @@ def make_linker(
     linker.page_size = PAGE
     linker.block_pages = BLOCK_PAGES if compression_unit == "block" else None
     linker.block_tokens = BLOCK if compression_unit == "block" else None
+    linker.restoration_boundary_tokens = BLOCK
     linker.compression_unit = compression_unit
     linker.store = (
         BlockStore(
@@ -600,6 +601,19 @@ def test_short_hybrid_request_without_an_earlier_checkpoint_is_not_stored():
             "reason": "no_restorable_recurrent_checkpoint",
         }
     ]
+
+
+def test_hybrid_request_ignores_non_restorable_prefill_checkpoint():
+    adapter = make_adapter(hybrid=True)
+    linker = make_linker(adapter, compression_unit="request")
+    req = make_req(adapter, "unaligned", range(9), row=0, first_slot=0, mamba_slot=2)
+
+    linker.on_request_progress(req, 6, finished=False)
+    req.output_ids = [17]
+    linker.on_request_progress(req, 9, finished=True)
+
+    assert not linker.store.requests
+    assert linker.events[-1]["reason"] == "no_restorable_recurrent_checkpoint"
 
 
 def test_hybrid_chunk_can_store_multiple_blocks_with_one_checkpoint():
