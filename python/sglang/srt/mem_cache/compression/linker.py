@@ -73,9 +73,13 @@ class NativePoolAdapter:
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             MHATokenToKVPool,
+            MLATokenToKVPool,
         )
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            UnifiedMHATokenToKVPool,
+            UnifiedMLATokenToKVPool,
+        )
 
         self.page_size = params.page_size
         self.req_pool = params.req_to_token_pool
@@ -94,22 +98,34 @@ class NativePoolAdapter:
             else pool
         )
         self.swa_kv = pool.swa_kv_pool if self.has_swa else None
+        # MLA stores one joint latent per token instead of a key/value pair, so
+        # it is a different tensor contract rather than a different layout. A
+        # sliding window is never the MLA half of anything, so only the full
+        # pool is allowed to be one.
+        self.is_mla = isinstance(self.kv, MLATokenToKVPool)
         # Alternate page-major / packed / quantized layouts require adapters.
         for name, kv_pool in (("full", self.kv), ("swa", self.swa_kv)):
             if kv_pool is None:
                 continue
-            if (
-                not isinstance(kv_pool, MHATokenToKVPool)
-                or (
-                    type(kv_pool) is not MHATokenToKVPool
-                    and not isinstance(kv_pool, UnifiedMHATokenToKVPool)
+            if name == "full" and self.is_mla:
+                ordinary = type(kv_pool) is MLATokenToKVPool or isinstance(
+                    kv_pool, UnifiedMLATokenToKVPool
                 )
+            else:
+                ordinary = isinstance(kv_pool, MHATokenToKVPool) and (
+                    type(kv_pool) is MHATokenToKVPool
+                    or isinstance(kv_pool, UnifiedMHATokenToKVPool)
+                )
+            if (
+                not ordinary
                 or kv_pool.dtype not in (torch.float16, torch.bfloat16)
-                or kv_pool.is_quantized_kv_cache
+                # MLA pools carry no such flag; FP4/FP8 MLA is a subclass and
+                # is already excluded by the identity check above.
+                or getattr(kv_pool, "is_quantized_kv_cache", False)
             ):
                 raise ValueError(
-                    "Compression currently requires ordinary BF16/FP16 MHA "
-                    f"storage for the {name} pool"
+                    "Compression currently requires ordinary BF16/FP16 MHA or "
+                    f"MLA storage for the {name} pool"
                 )
         if self.has_swa:
             full = sorted(
@@ -142,7 +158,7 @@ class NativePoolAdapter:
             list(self.req_pool.mamba_pool.mamba_layer_ids) if self.hybrid else []
         )
         self.temporal_kind = None
-        self.device = self.kv.k_buffer[0].device
+        self.device = self._kv_components()[0][1][0].device
         if self.hybrid and getattr(self.req_pool, "mamba_ckpt_pool", None) is not None:
             raise ValueError(
                 "External compression requires native recurrent checkpoints; "
@@ -157,23 +173,41 @@ class NativePoolAdapter:
             )
 
     def context(self):
-        specs = {
-            "key": {
-                "component": "full_attention",
-                "layout": "pages,layers,tokens,heads,dim",
-                "layer_ids": self.layer_ids,
-                "extent": "span",
-                "dtype": str(self.kv.k_buffer[0].dtype).removeprefix("torch."),
-                "key_space": "pre_rope",
-            },
-            "value": {
-                "component": "full_attention",
-                "layout": "pages,layers,tokens,heads,dim",
-                "layer_ids": self.layer_ids,
-                "extent": "span",
-                "dtype": str(self.kv.v_buffer[0].dtype).removeprefix("torch."),
-            },
-        }
+        if self.is_mla:
+            # One joint latent per token per layer, heads folded to 1. The
+            # leading kv_lora_rank columns carry no rotation and the trailing
+            # qk_rope_head_dim ones are already rotated, so there is no single
+            # pre-RoPE space to invert into: the latent is published as stored.
+            specs = {
+                "latent": {
+                    "component": "full_attention",
+                    "layout": "pages,layers,tokens,heads,dim",
+                    "layer_ids": self.layer_ids,
+                    "extent": "span",
+                    "dtype": str(self.kv.dtype).removeprefix("torch."),
+                    "key_space": "post_rope",
+                    "kv_lora_rank": int(self.kv.kv_lora_rank),
+                    "qk_rope_head_dim": int(self.kv.qk_rope_head_dim),
+                },
+            }
+        else:
+            specs = {
+                "key": {
+                    "component": "full_attention",
+                    "layout": "pages,layers,tokens,heads,dim",
+                    "layer_ids": self.layer_ids,
+                    "extent": "span",
+                    "dtype": str(self.kv.k_buffer[0].dtype).removeprefix("torch."),
+                    "key_space": "pre_rope",
+                },
+                "value": {
+                    "component": "full_attention",
+                    "layout": "pages,layers,tokens,heads,dim",
+                    "layer_ids": self.layer_ids,
+                    "extent": "span",
+                    "dtype": str(self.kv.v_buffer[0].dtype).removeprefix("torch."),
+                },
+            }
         if self.has_swa:
             specs.update(
                 {
@@ -227,7 +261,7 @@ class NativePoolAdapter:
             "layout": "pages,layers,tokens,heads,dim",
             "layer_ids": self.layer_ids,
             "page_size": self.page_size,
-            "key_space": "pre_rope",
+            "key_space": "post_rope" if self.is_mla else "pre_rope",
             "tensor_specs": specs,
         }
 
@@ -253,8 +287,23 @@ class NativePoolAdapter:
             dim=1,
         )
 
+    def _kv_components(self):
+        """The full-attention tensors this pool exposes, as (name, buffers).
+
+        MHA has two half-width buffers per layer; MLA has one joint latent
+        buffer whose trailing ``qk_rope_head_dim`` columns are the rotated part.
+        Both present as [tokens, heads, dim], so everything downstream of here
+        reads the same five-axis block either way.
+        """
+        if not self.is_mla:
+            return (("key", self.kv.k_buffer), ("value", self.kv.v_buffer))
+        buffers = self.kv.kv_buffer
+        if self.kv.store_dtype != self.kv.dtype:
+            buffers = [buffer.view(self.kv.dtype) for buffer in buffers]
+        return (("latent", buffers),)
+
     def gather_kv(self, slots):
-        """[pages, layers, page_tokens, heads, dim] for key and value."""
+        """[pages, layers, page_tokens, heads, dim] per full-attention tensor."""
         if slots.numel() % self.page_size:
             raise ValueError("Slots are not a sequence of complete pages")
         pages = slots.numel() // self.page_size
@@ -263,15 +312,12 @@ class NativePoolAdapter:
             name: self._gather_buffers(
                 buffers, slots, pages=pages, page_size=self.page_size
             )
-            for name, buffers in (
-                ("key", self.kv.k_buffer),
-                ("value", self.kv.v_buffer),
-            )
+            for name, buffers in self._kv_components()
         }
 
     def scatter_kv(self, slots, block):
         slots = self._full_buffer_slots(slots)
-        for name, buffers in (("key", self.kv.k_buffer), ("value", self.kv.v_buffer)):
+        for name, buffers in self._kv_components():
             for layer, buffer in enumerate(buffers):
                 rows = block[name][:, layer].reshape(-1, *buffer.shape[1:])
                 buffer.index_copy_(0, slots, rows)
@@ -539,16 +585,22 @@ class CompressionLinker(UnifiedCacheLinker):
             getattr(text_config, name, None)
             for name in ("rope_parameters", "rope_scaling", "rope_theta")
         )
-        full_selector = self._rope_selector(
-            model_config, self.adapter.layer_ids, self.adapter.kv.head_dim
-        )
-        self.pre_rope = PreRoPETransform.from_model_ropes(
-            self.adapter,
-            record=self.record,
-            allow_no_rope=allow_no_rope,
-            component="full",
-            selector=full_selector,
-        )
+        # MLA rotates only the trailing qk_rope_head_dim columns of a latent
+        # that is otherwise not a key at all, so there is nothing to invert
+        # here: the contract already says the latent is published post-RoPE.
+        if self.adapter.is_mla:
+            self.pre_rope = None
+        else:
+            full_selector = self._rope_selector(
+                model_config, self.adapter.layer_ids, self.adapter.kv.head_dim
+            )
+            self.pre_rope = PreRoPETransform.from_model_ropes(
+                self.adapter,
+                record=self.record,
+                allow_no_rope=allow_no_rope,
+                component="full",
+                selector=full_selector,
+            )
         self.swa_pre_rope = None
         if self.adapter.has_swa:
             swa_selector = self._rope_selector(
@@ -563,7 +615,7 @@ class CompressionLinker(UnifiedCacheLinker):
                 component="swa",
                 selector=swa_selector,
             )
-        identity["key_space"] = "pre_rope"
+        identity["key_space"] = "post_rope" if self.adapter.is_mla else "pre_rope"
         transforms = {
             name: transform
             for name, transform in (
@@ -648,6 +700,10 @@ class CompressionLinker(UnifiedCacheLinker):
         if config.get("audit"):
             if not server_args.disable_cuda_graph:
                 raise ValueError("Byte-level audit requires disabled CUDA graphs")
+            if self.adapter.is_mla:
+                # The audit hooks set_kv_buffer per k/v buffer pair; MLA writes
+                # one joint latent and would read half the expected tensors.
+                raise ValueError("Byte-level audit does not cover MLA pools yet")
             from .audit import CompressionAudit
 
             self.audit = CompressionAudit(self)
