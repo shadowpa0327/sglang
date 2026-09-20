@@ -1361,12 +1361,20 @@ class CompressionLinker(UnifiedCacheLinker):
         return self.layer_done_counter.producer_index
 
     def _restore_blocks(self, rid, transfers):
+        if self.adapter.device.type == "cuda":
+            torch.cuda.synchronize(self.adapter.device)
+        restore_started = time.perf_counter_ns()
         kv = next(t for t in transfers if t.name == PoolName.KV)
         if len(kv.keys) % self.block_pages:
             raise ValueError("Restore request is not a sequence of whole blocks")
         block_keys = kv.keys[self.block_pages - 1 :: self.block_pages]
         restored = self.store.reconstruct(block_keys)
-        self.record({"event": "decompress", "rid": rid, **restored.measurement})
+        restored_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for block in restored.blocks
+            for name, tensor in block.items()
+            if name in {"key", "value", "latent"}
+        )
         if self.audit_fault != "skip_scatter":
             slots = kv.device_indices.to(device=self.adapter.device, dtype=torch.int64)
             for i, block in enumerate(restored.blocks):
@@ -1375,6 +1383,11 @@ class CompressionLinker(UnifiedCacheLinker):
                 )
             for transfer in transfers:
                 if transfer.name == PoolName.SWA:
+                    restored_bytes += sum(
+                        tensor.numel() * tensor.element_size()
+                        for name, tensor in restored.blocks[-1].items()
+                        if name in {"swa_key", "swa_value"}
+                    )
                     if not self.store.has_swa(block_keys[-1]):
                         raise RuntimeError(
                             "Block has no sliding-window state for an SWA restore"
@@ -1394,14 +1407,26 @@ class CompressionLinker(UnifiedCacheLinker):
                         raise RuntimeError(
                             "Block has no recurrent state for a hybrid restore"
                         )
-                    self.adapter.scatter_state(
-                        transfer.device_indices[0],
-                        {"temporal": temporal, **(conv or {})},
-                    )
+                    state = {"temporal": temporal, **(conv or {})}
+                    restored_bytes += sum(t.numel() * t.element_size() for t in state.values())
+                    self.adapter.scatter_state(transfer.device_indices[0], state)
+        if self.adapter.device.type == "cuda":
+            torch.cuda.synchronize(self.adapter.device)
+        restore_total_ms = (time.perf_counter_ns() - restore_started) / 1e6
+        self.record({
+            "event": "decompress", "rid": rid, **restored.measurement,
+            "restore_total_ms": restore_total_ms,
+            "restored_bytes": restored_bytes,
+            "restore_timer": "synchronized_wall",
+        })
+        # Expensive optional provenance checks are not part of restoration timing.
         if self.audit is not None:
             self.audit.verify_scatter(rid, kv, restored)
 
     def _restore_request(self, rid, transfers):
+        if self.adapter.device.type == "cuda":
+            torch.cuda.synchronize(self.adapter.device)
+        restore_started = time.perf_counter_ns()
         key = self.request_hits.pop(rid)
         try:
             kv = next(t for t in transfers if t.name == PoolName.KV)
@@ -1411,14 +1436,8 @@ class CompressionLinker(UnifiedCacheLinker):
                     "Request restore destination does not cover the stored span"
                 )
             restored = self.store.reconstruct(key)
-            self.record(
-                {
-                    "event": "decompress",
-                    "rid": rid,
-                    "key": key,
-                    "compression_unit": "request",
-                    **restored.measurement,
-                }
+            restored_bytes = sum(
+                t.numel() * t.element_size() for t in restored.tensors.values()
             )
             slots = kv.device_indices.to(device=self.adapter.device, dtype=torch.int64)
             if slots.numel() != restored.measurement["tokens"]:
@@ -1444,10 +1463,23 @@ class CompressionLinker(UnifiedCacheLinker):
                         raise RuntimeError(
                             "Request has no recurrent state for a hybrid restore"
                         )
+                    restored_bytes += sum(
+                        t.numel() * t.element_size() for t in (conv or {}).values()
+                    )
                     self.adapter.scatter_state(
                         transfer.device_indices[0],
                         {"temporal": temporal, **(conv or {})},
                     )
+            if self.adapter.device.type == "cuda":
+                torch.cuda.synchronize(self.adapter.device)
+            restore_total_ms = (time.perf_counter_ns() - restore_started) / 1e6
+            self.record({
+                "event": "decompress", "rid": rid, "key": key,
+                "compression_unit": "request", **restored.measurement,
+                "restore_total_ms": restore_total_ms,
+                "restored_bytes": restored_bytes,
+                "restore_timer": "synchronized_wall",
+            })
         finally:
             self.store.unpin(key)
 
