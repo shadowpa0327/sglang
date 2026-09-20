@@ -16,7 +16,11 @@ against the native key with a bound of two ulps of the largest channel.
 
 import torch
 
-from kvcompress.api import CompressedPayload, KVCompressionPlugin
+from kvcompress.api import (
+    CompressedPayload,
+    KVCompressionPlugin,
+    ensure_workspace_buffer,
+)
 
 
 def _fused_rope_kernel():
@@ -327,6 +331,58 @@ class PreRoPETransform:
             tokens, heads, key_out.device, key_out.dtype, start_position
         )
 
+    def ensure_rerotation_workspace(self, key_out, *, start_position, workspace):
+        """Reuse one grow-only rerotation workspace and refresh its positions."""
+        tokens, heads = self._check(key_out)
+        device, dtype = key_out.device, key_out.dtype
+        workspace = {} if workspace is None else workspace
+        positions = ensure_workspace_buffer(
+            workspace, "positions", (tokens,), dtype=torch.int64, device=device
+        )
+        torch.arange(start_position, start_position + tokens, out=positions)
+        self.table.check_positions(positions)
+        workspace["positions"] = positions
+        head = self.table.head_size
+        shape = (tokens, heads, head)
+        if self.table.fused is not None and device.type == "cuda":
+            workspace["k"] = ensure_workspace_buffer(
+                workspace, "k", shape, dtype=dtype, device=device
+            )
+            workspace["q"] = ensure_workspace_buffer(
+                workspace, "q", (tokens, 1, head), dtype=dtype, device=device
+            )
+            workspace["q"].zero_()
+            for name in ("cos", "sin", "x", "out", "scratch"):
+                workspace.pop(name, None)
+            return workspace
+
+        half = self.table.rotary_dim // 2
+        cos = ensure_workspace_buffer(
+            workspace, "cos", (tokens, half), dtype=torch.float32, device=device
+        )
+        sin = ensure_workspace_buffer(
+            workspace, "sin", (tokens, half), dtype=torch.float32, device=device
+        )
+        torch.index_select(self.table.cos, 0, positions, out=cos)
+        torch.index_select(self.table.sin, 0, positions, out=sin)
+        workspace["cos"], workspace["sin"] = cos.unsqueeze(1), sin.unsqueeze(1)
+        workspace["x"] = ensure_workspace_buffer(
+            workspace, "x", shape, dtype=torch.float32, device=device
+        )
+        workspace["out"] = ensure_workspace_buffer(
+            workspace, "out", shape, dtype=torch.float32, device=device
+        )
+        workspace["scratch"] = ensure_workspace_buffer(
+            workspace,
+            "scratch",
+            (tokens, heads, half),
+            dtype=torch.float32,
+            device=device,
+        )
+        workspace.pop("k", None)
+        workspace.pop("q", None)
+        return workspace
+
     @torch.no_grad()
     def rerotate_(self, key_out, scratch):
         """Pre-RoPE keys -> native post-RoPE keys, in place, without allocation."""
@@ -340,8 +396,8 @@ class NativeRoPEDecodePlugin(KVCompressionPlugin):
 
     RoPE is model-owned infrastructure, not an algorithm's responsibility. The
     wrapper accepts one transform for the full ``key`` tensor, or a mapping for
-    both ``key`` and ``swa_key``. Forward rotations run inside the reconstruction
-    timer; positions and FP32 workspaces are allocated in prepare_decompression.
+    both ``key`` and ``swa_key``. Forward rotations run inside restoration and
+    reuse the store-owned workspace.
     """
 
     def __init__(self, inner, transform):
@@ -392,10 +448,12 @@ class NativeRoPEDecodePlugin(KVCompressionPlugin):
             payload.tensor_roles,
         )
 
-    def prepare_decompression(self, payload, *, out):
+    def ensure_decompression_workspace(self, payload, *, out, workspace):
         inner = CompressedPayload(
             payload.tensors, payload.metadata["inner"], payload.tensor_roles
         )
+        workspace = {} if workspace is None else workspace
+        previous_rope = workspace.get("rope", {})
         rope = {}
         for name, transform in self.transforms.items():
             if name not in out:
@@ -405,19 +463,24 @@ class NativeRoPEDecodePlugin(KVCompressionPlugin):
                 raise ValueError(
                     f"Layer metadata for {name} does not match the reconstruction"
                 )
-            rope[name] = transform.prepare_rerotation(
-                out[name], start_position=position["start_position"]
+            rope[name] = transform.ensure_rerotation_workspace(
+                out[name],
+                start_position=position["start_position"],
+                workspace=previous_rope.get(name),
             )
-        return {
-            "inner_payload": inner,
-            "inner": self.inner.prepare_decompression(inner, out=out),
-            "rope": rope,
-        }
+        workspace["inner"] = self.inner.ensure_decompression_workspace(
+            inner, out=out, workspace=workspace.get("inner")
+        )
+        workspace["rope"] = rope
+        return workspace
 
-    def decompress(self, payload, *, out, scratch):
+    def decompress(self, payload, *, out, workspace):
+        inner = CompressedPayload(
+            payload.tensors, payload.metadata["inner"], payload.tensor_roles
+        )
         self.inner.decompress(
-            scratch["inner_payload"], out=out, scratch=scratch["inner"]
+            inner, out=out, workspace=workspace["inner"]
         )
         for name, transform in self.transforms.items():
             if name in out:
-                transform.rerotate_(out[name], scratch["rope"][name])
+                transform.rerotate_(out[name], workspace["rope"][name])

@@ -201,9 +201,9 @@ def test_transform_rejects_uncovered_positions_and_non_1d_tables():
         RotaryTable(SimpleNamespace(cos_sin_cache=torch.zeros(4, 8)), CPU)
 
 
-def test_plugins_use_the_api_v2_canonical_pre_rope_contract():
-    assert load_plugin("identity")[0].api_version == 2
-    assert load_plugin("int8")[0].api_version == 2
+def test_plugins_use_the_api_v3_canonical_pre_rope_contract():
+    assert load_plugin("identity")[0].api_version == 3
+    assert load_plugin("int8")[0].api_version == 3
 
 
 def test_discovery_requires_exactly_one_live_table_for_the_pool_head_size(monkeypatch):
