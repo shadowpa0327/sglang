@@ -33,6 +33,7 @@ def make_adapter(hybrid=False, swa=False, slots=128):
     adapter.temporal_layer_ids = [0, 1, 2]
     adapter.temporal_kind = "gdn"
     adapter.has_swa = swa
+    adapter.is_mla = False
     adapter.swa_layer_ids = [2, 3, 4] if swa else []
     adapter.sliding_window_size = 6 if swa else None
     adapter.swa_window_pages = 3 if swa else 0
