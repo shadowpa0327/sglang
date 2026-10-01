@@ -52,6 +52,8 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    # True restores every hit into request-owned slots instead of the tree.
+    compressed_only: bool = False
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -160,9 +162,16 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
-        # Private destinations may be allocated before admission is deferred.
-        # Retain ownership until the request's normal KV row takes over.
+        # Request-owned restores, started only for admitted requests. Retain
+        # ownership until the request's normal KV row takes over.
         self.private_loads: dict[str, tuple[Req, torch.Tensor]] = {}
+        # rid -> (request, the mamba slot tensor its restore writes) until the
+        # batch that launches the restore is built.
+        self.private_state_slots: dict[str, tuple[Req, torch.Tensor]] = {}
+        # Always-on counters reported by the compression status.
+        self.private_restores = 0
+        self.restored_states_checked = 0
+        self.restored_states_lost = 0
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -178,6 +187,17 @@ class UnifiedCacheLinkerWrapper:
         """Whether a completed external load lives only in the request's row."""
         return rid in self.private_loads
 
+    def restores_privately(self, rid: str) -> bool:
+        """Whether load_back for rid restores into request-owned slots."""
+        return self.cache_linker.compressed_only and self.has_hit(rid)
+
+    def restore_integrity(self) -> dict[str, int]:
+        return {
+            "private_restores": self.private_restores,
+            "restored_states_checked": self.restored_states_checked,
+            "restored_states_lost": self.restored_states_lost,
+        }
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -190,6 +210,7 @@ class UnifiedCacheLinkerWrapper:
                 host_hit_length=len(indices),
                 mamba_host_hit_length=int(req.kv.holds_mamba),
             )
+        self.hit_markers.pop(req.rid, None)
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
@@ -399,7 +420,12 @@ class UnifiedCacheLinkerWrapper:
         assert cache.disable
         empty = cache.tree_core.empty_match_result
         if req.rid in self.private_loads:
-            return self.private_loads[req.rid][1], empty.last_device_node
+            # Restores start only for admitted requests, so a second load-back
+            # means the restore's slots may already be freed or reused.
+            self.restored_states_lost += 1
+            raise RuntimeError(
+                f"rid={req.rid!r} re-entered load-back after its private restore"
+            )
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return empty.device_indices, empty.last_device_node
@@ -441,6 +467,9 @@ class UnifiedCacheLinkerWrapper:
         # required for SWA mapping and shared-pool reservation.
         self._queue_load(req.rid, empty.last_device_node, [t for _, t in transfers])
         self.private_loads[req.rid] = (req, transfers[0][1].device_indices)
+        self.private_restores += 1
+        if any(t.name == PoolName.MAMBA for _, t in transfers):
+            self.private_state_slots[req.rid] = (req, req.kv.mamba_pool_idx)
         audit = getattr(self.cache_linker, "audit", None)
         if audit is not None:
             audit.bind(req, transfers[0][1].device_indices)
@@ -453,6 +482,26 @@ class UnifiedCacheLinkerWrapper:
             }
         )
         return transfers[0][1].device_indices, empty.last_device_node
+
+    def _check_restored_states(self) -> None:
+        """Count every restore whose state will not reach its first forward."""
+        for rid, (req, slot) in self.private_state_slots.items():
+            self.restored_states_checked += 1
+            if not self._holds_state(req, slot):
+                self.restored_states_lost += 1
+                self.cache_linker.record({"event": "restored_state_lost", "rid": rid})
+        self.private_state_slots.clear()
+
+    @staticmethod
+    def _holds_state(req: Req, slot: torch.Tensor) -> bool:
+        # Identity, not the index: any re-allocation, even a FIFO hand-back of
+        # the same index, binds a new tensor. Pending clear or COW overwrites it.
+        kv = req.kv
+        return (
+            kv.mamba_pool_idx is slot
+            and not kv.mamba_needs_clear
+            and kv.mamba_cow_src_index is None
+        )
 
     def _queue_load(
         self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
@@ -649,6 +698,9 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
+        # Runs when the prefill batch is built, before prepare_for_extend
+        # allocates or clears recurrent state.
+        self._check_restored_states()
         return self.cache_linker.start_layer_wise_loading()
 
     # ---- lifecycle ----
@@ -657,6 +709,10 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self.hit_markers.clear()
         self.private_loads.clear()
+        self.private_state_slots.clear()
+        self.private_restores = 0
+        self.restored_states_checked = 0
+        self.restored_states_lost = 0
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -679,6 +735,7 @@ class UnifiedCacheLinkerWrapper:
         if self.cache_linker.cancel_queued_load(rid):
             node_id, lock_params = self.pending_loads.pop(rid)
             self.cache.dec_lock_ref(node_id, lock_params)
+        self.private_state_slots.pop(rid, None)
         private = self.private_loads.pop(rid, None)
         if private is not None and not private[0].kv.holds_kv:
             # No request row exists yet; the normal abort path cannot free it.

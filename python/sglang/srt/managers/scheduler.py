@@ -4914,6 +4914,7 @@ class Scheduler(
             "stored_requests": store.get("stored_requests", 0),
             "store": store,
             "identity": linker.store.identity,
+            "restore_integrity": wrapper.restore_integrity(),
         })
 
     def prefix_compression_control(self, action: str):

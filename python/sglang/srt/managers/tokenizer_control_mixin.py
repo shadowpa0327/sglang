@@ -212,6 +212,12 @@ def _merge_prefix_compression_results(
             if all(name in result.data["store"] for result in results):
                 store[name] = sum(result.data["store"][name] for result in results)
     data["store"] = store
+    if all("restore_integrity" in r.data for r in results):
+        # Each rank restores only the requests it serves, so every counter sums.
+        data["restore_integrity"] = {
+            name: sum(r.data["restore_integrity"][name] for r in results)
+            for name in data["restore_integrity"]
+        }
     data["dp_size"] = len(results)
     return PrefixCompressionReqOutput(data=data)
 

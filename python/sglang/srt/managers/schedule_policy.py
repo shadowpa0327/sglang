@@ -34,7 +34,7 @@ import random
 from collections import Counter
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Union
 
 import torch
 
@@ -476,6 +476,12 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+
+
+class _ExtendPlan(NamedTuple):
+    rejection: Optional[AddReqResult]  # None admits the request
+    input_tokens: int  # paged tokens left after the prefix
+    trunc_len: Optional[int]  # this round's chunk; None runs the whole remainder
 
 
 class PrefillAdder:
@@ -1346,6 +1352,26 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
+            linker = getattr(self.tree_cache, "linker", None)
+            private_restore = (
+                req.needs_host_load_back()
+                and linker is not None
+                and linker.restores_privately(req.rid) is True
+            )
+            if private_restore:
+                # A request-owned restore binds KV and recurrent state to this
+                # request and runs with this round's batch even if the request is
+                # rejected, so every gate runs on the projected prefix first.
+                projected = self._plan_extend(
+                    req,
+                    prefix_len=prefix_len + req.host_hit_length,
+                    chunk_tokens_limit=chunk_tokens_limit,
+                    has_chunked_req=has_chunked_req,
+                    truncation_align_size=truncation_align_size,
+                )
+                if projected.rejection is not None:
+                    return projected.rejection
+
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -1357,58 +1383,42 @@ class PrefillAdder:
                 req.host_loaded_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                linker = getattr(self.tree_cache, "linker", None)
                 request_owned = (
                     linker is not None
                     and linker.is_request_owned_load(req.rid) is True
                 )
+                if private_restore and len(new_indices) != req.host_hit_length:
+                    raise RuntimeError(
+                        f"Private restore of rid={req.rid!r} loaded "
+                        f"{len(new_indices)} tokens, admitted for {req.host_hit_length}"
+                    )
                 # Compression-only loads bypass the radix tree. Their FULL and
                 # SWA slots belong to the request and must remain releasable;
                 # marking the restored prefix tree-protected would advance the
                 # SWA eviction cursor without freeing its restored window.
                 req.kv.cache_protected_len = 0 if request_owned else prefix_len
 
-            input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+            plan = self._plan_extend(
+                req,
+                prefix_len=prefix_len,
+                chunk_tokens_limit=chunk_tokens_limit,
+                has_chunked_req=has_chunked_req,
+                truncation_align_size=truncation_align_size,
             )
-            if chunk_tokens_limit is not None:
-                # Chunks never straddle an absolute prefill boundary; the cap
-                # follows the prefix init_load_back may just have restored.
-                chunk_tokens_limit = self._cap_extend_at_boundary(
-                    len(req.prefix_indices), chunk_tokens_limit
+            if private_restore and plan != projected:
+                # The restore already runs with this round's batch; a different
+                # verdict now would strand it on a request that does not run.
+                raise RuntimeError(
+                    f"Private restore of rid={req.rid!r} changed its admission "
+                    f"plan from {projected} to {plan}"
                 )
-
-            if (
-                self.rem_chunk_tokens is None
-                and len(self.can_run_list) != 0
-                and input_tokens >= self.rem_input_tokens
-            ):
-                # If without chunked prefill:
-                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
-                # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
+            if plan.rejection is not None:
+                return plan.rejection
 
             if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
-
-                assert truncation_align_size is None, (
-                    "truncation_align_size is not supported for dllm prefill"
-                )
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
+            elif plan.trunc_len is None:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1418,7 +1428,7 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
-                    input_tokens,
+                    plan.input_tokens,
                     min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
@@ -1428,44 +1438,9 @@ class PrefillAdder:
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
-                if has_chunked_req:
-                    # The scheduler tracks one chunked request; a chunk that
-                    # stopped at a prefill boundary leaves budget but must not
-                    # start another.
-                    return AddReqResult.OTHER
-
-                # Make sure at least one page is available
-                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
-                        )
-
-                now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(trunc_len)
-                ) is not None:
-                    return tile_stop
-
                 # Chunked prefill
                 req.set_extend_range(
-                    len(req.prefix_indices), len(req.prefix_indices) + trunc_len
+                    len(req.prefix_indices), len(req.prefix_indices) + plan.trunc_len
                 )
 
                 self.can_run_list.append(req)
@@ -1474,7 +1449,7 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
-                    trunc_len,
+                    plan.trunc_len,
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=mamba_gap_reserve,
@@ -1482,6 +1457,85 @@ class PrefillAdder:
                 self._account_prefill_cache_admission(req, prefix_len)
 
         return self.budget_state()
+
+    def _plan_extend(
+        self,
+        req: Req,
+        *,
+        prefix_len: int,
+        chunk_tokens_limit: Optional[int],
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+    ) -> _ExtendPlan:
+        """Admission gates that depend on the prefix length. Reads only budgets,
+        so a projected prefix gives the verdict before load-back runs."""
+        input_tokens = self.ceil_paged_tokens(
+            len(req.full_untruncated_fill_ids) - prefix_len
+        )
+        whole = _ExtendPlan(None, input_tokens, None)
+        other = _ExtendPlan(AddReqResult.OTHER, input_tokens, None)
+        if chunk_tokens_limit is not None:
+            # Chunks never straddle an absolute prefill boundary; the cap
+            # follows the prefix init_load_back restores.
+            chunk_tokens_limit = self._cap_extend_at_boundary(
+                prefix_len, chunk_tokens_limit
+            )
+
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and input_tokens >= self.rem_input_tokens
+        ):
+            # If without chunked prefill:
+            # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+            # - if the can_run_list is empty, always accept the first prefill request
+            return other
+
+        if self.dllm_config is not None:
+            if self.rem_dllm_tokens <= 0:
+                return other
+
+            assert truncation_align_size is None, (
+                "truncation_align_size is not supported for dllm prefill"
+            )
+            return whole._replace(
+                rejection=self._check_prefill_tile_budget(input_tokens)
+            )
+
+        if chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+            return whole._replace(
+                rejection=self._check_prefill_tile_budget(input_tokens)
+            )
+
+        if has_chunked_req:
+            # The scheduler tracks one chunked request; a chunk that stopped at
+            # a prefill boundary leaves budget but must not start another.
+            return other
+
+        # Make sure at least one page is available
+        trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+
+        if trunc_len <= 0:
+            return other
+
+        # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+        # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+        # we need the prefill prefix length to be multiple of attention split size
+        if truncation_align_size is not None:
+            if trunc_len < truncation_align_size:
+                return other
+            trunc_len = truncation_align_size * (trunc_len // truncation_align_size)
+
+        now_input_len = trunc_len + prefix_len
+        now_input_len = now_input_len // self.page_size * self.page_size
+        trunc_len = now_input_len - prefix_len
+
+        if trunc_len <= 0:
+            return other
+
+        return _ExtendPlan(
+            self._check_prefill_tile_budget(trunc_len), input_tokens, trunc_len
+        )
 
     def preempt_to_schedule(self, req: Req) -> bool:
         """

@@ -112,3 +112,23 @@ def test_block_store_status_sums_cumulative_metadata_across_dp():
     assert merged["store"]["stored_blocks"] == 2
     assert merged["store"]["evictions"] == 4
     assert merged["store"]["metadata_bytes_compressed"] == 28
+
+
+def test_restore_integrity_counters_sum_across_dp():
+    """Each rank restores only its own requests; keeping rank 0's counters would
+    hide a lost recurrent state on the other ranks of a dp run."""
+    ranks = [_status(1, 100, 150, 1), _status(1, 100, 150, 1)]
+    for lost, result in enumerate(ranks):
+        result.data["restore_integrity"] = {
+            "private_restores": 4,
+            "restored_states_checked": 4,
+            "restored_states_lost": lost,
+        }
+
+    merged = _merge_prefix_compression_results("status", ranks).data
+
+    assert merged["restore_integrity"] == {
+        "private_restores": 8,
+        "restored_states_checked": 8,
+        "restored_states_lost": 1,
+    }

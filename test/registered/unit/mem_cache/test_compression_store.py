@@ -910,6 +910,7 @@ def test_compression_swa_restore_disables_the_legacy_reprefill_window():
 
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_private_load_allocates_each_duplicate_separately_without_tree_insert(hybrid):
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
         ExternalCacheHitMarker,
@@ -967,15 +968,15 @@ def test_private_load_allocates_each_duplicate_separately_without_tree_insert(hy
     )
     wrapper.hit_markers = {"a": hit, "b": hit}
     wrapper.private_loads = {}
+    wrapper.private_state_slots = {}
+    wrapper.private_restores = 0
     queued = []
     wrapper._queue_load = lambda rid, node, transfers: queued.append((rid, transfers))
     indices = []
     for rid in ("a", "b"):
-        req = SimpleNamespace(rid=rid, kv=SimpleNamespace(holds_mamba=False))
+        req = SimpleNamespace(rid=rid, kv=ReqKvInfo())
         slots, node = wrapper.load_back(req)
         indices.append(set(slots.tolist()))
-        again, _ = wrapper.load_back(req)
-        assert again is slots
         assert node == 0
         if hybrid:
             assert req.kv.mamba_cow_src_index is None
@@ -1038,6 +1039,8 @@ def test_private_swa_load_runs_prepare_to_install_the_mapping():
         )
     }
     wrapper.private_loads = {}
+    wrapper.private_state_slots = {}
+    wrapper.private_restores = 0
     wrapper._queue_load = lambda *args: None
     req = SimpleNamespace(rid="r", kv=SimpleNamespace())
 
@@ -1120,6 +1123,8 @@ def test_private_tri_pool_prepares_swa_before_allocating_mamba():
         )
     }
     wrapper.private_loads = {}
+    wrapper.private_state_slots = {}
+    wrapper.private_restores = 0
     wrapper._queue_load = lambda *args: None
     req = SimpleNamespace(
         rid="r",
@@ -1259,6 +1264,7 @@ def test_private_abort_cancels_load_and_frees_only_unadmitted_slots(has_row):
         "r": (SimpleNamespace(kv=SimpleNamespace(holds_kv=has_row)), slots)
     }
     wrapper.pending_loads = {"r": (0, None)}
+    wrapper.private_state_slots = {}
     freed = []
     wrapper.cache = SimpleNamespace(
         dec_lock_ref=lambda *args: None,
