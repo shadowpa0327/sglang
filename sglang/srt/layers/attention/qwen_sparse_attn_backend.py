@@ -235,13 +235,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+        max_window = self.token_to_kv_pool.qsa_ring_len - self.compress_ratio + 1
+        if draft_tokens > max_window:
+            # Rows write the pending ring before groups are compressed; a
+            # window wider than ring_len - ratio + 1 overwrites a member of a
+            # group it completes (see qsa_ring_len).
             raise NotImplementedError(
-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                f"Qwen QSA with a {self.token_to_kv_pool.qsa_ring_len}-slot "
+                f"pending ring verifies at most {max_window} draft tokens, got "
+                f"{draft_tokens}; raise SGLANG_QSA_RING_GROUPS"
             )
 
     @staticmethod
@@ -676,6 +678,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
                 is_extend=group_member_rows is not None,
+                ring_len=self.token_to_kv_pool.qsa_ring_len,
             )
             if write_locs.numel():
                 if group_member_rows is not None:
@@ -693,6 +696,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        ring_len=self.token_to_kv_pool.qsa_ring_len,
                     )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -1092,6 +1096,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=current_positions,
                 compress_ratio=ratio,
                 is_extend=False,
+                ring_len=pool.qsa_ring_len,
             )
         )
         metadata.graph_ring_group_locs.copy_(
@@ -1100,6 +1105,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_len=pool.qsa_ring_len,
             ).to(torch.int32)
         )
 

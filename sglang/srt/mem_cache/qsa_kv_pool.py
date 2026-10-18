@@ -131,7 +131,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        from sglang.srt.layers.attention.qsa.config import qsa_ring_len
+
+        self.qsa_ring_len = qsa_ring_len(self.qsa_compress_ratio)
+        ring_slots = self.qsa_num_request_slots * self.qsa_ring_len
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -242,7 +245,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
         return self._get_paged_state_buf_infos(
             tensors,
-            self.qsa_compress_ratio,
+            self.qsa_ring_len,
         )
 
     def get_qsa_pending_state_layer_ids(self):

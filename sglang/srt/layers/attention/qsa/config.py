@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import msgspec
@@ -99,3 +100,15 @@ __all__ = [
     "is_qwen_qsa",
     "parse_qsa_profile",
 ]
+
+
+def qsa_ring_len(compress_ratio: int) -> int:
+    """Per-request pending index-key ring length, in tokens.
+
+    A paged forward writes every row's key before compressing the groups it
+    completes. A window of W rows can complete a group whose oldest member sits
+    ratio - 1 positions before the window, and a later row in the same window
+    must not land on that member's slot, so the ring needs W + ratio - 1 slots.
+    SGLANG_QSA_RING_GROUPS sizes it in whole groups (default 1: decode only).
+    """
+    return int(compress_ratio) * int(os.environ.get("SGLANG_QSA_RING_GROUPS", "1"))
