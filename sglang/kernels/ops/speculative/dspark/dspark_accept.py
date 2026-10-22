@@ -94,6 +94,7 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    relaxed_out: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -131,6 +132,14 @@ def _accept_sampling_core(
         (bs, uniform_width), dtype=torch.float32, device=device
     )
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+    if relaxed_out is not None and not _is_npu:
+        # Research patch (dflash_relaxed): a plausible draft (target top-k within
+        # margin of the filtered law) is accepted by forcing its coin to 0.
+        from sglang.srt.speculative import dflash_relaxed
+
+        dflash_relaxed.force_plausible_coins(
+            relaxed_out, candidates, target_probs, draft_probs, uniform_samples, gamma
+        )
     chain_speculative_sampling_triton(
         predicts=predicts,
         accept_index=accept_index,
@@ -167,10 +176,12 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    relaxed_out: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
+        relaxed_out=relaxed_out,
         candidates=candidates,
         target_logits=target_logits,
         draft_probs=draft_probs,

@@ -1473,6 +1473,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
+        relaxed_out=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
@@ -1498,6 +1499,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
+                relaxed_out=relaxed_out,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
@@ -2140,6 +2142,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         relaxed_info = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
+            # Research patch: relaxed acceptance for sampled requests.
+            rules = (
+                dflash_relaxed.request_rules(reqs)
+                if reqs is not None and len(reqs) == bs
+                else None
+            )
+            relaxed_out = {"rules": rules} if rules is not None else None
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
@@ -2147,7 +2156,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                relaxed_out=relaxed_out,
             )
+            if relaxed_out is not None and "exact" in relaxed_out:
+                relaxed_info = (
+                    rules,
+                    relaxed_out["exact"],
+                    relaxed_out["relaxed"],
+                    relaxed_out["argmax"],
+                )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)

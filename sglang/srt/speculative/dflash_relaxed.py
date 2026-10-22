@@ -72,6 +72,36 @@ def apply_relaxed(target_predict: torch.Tensor, candidates: torch.Tensor,
     return exact, relaxed
 
 
+def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, uniform_samples, gamma: int):
+    """Sampled rows: accept a plausible draft by zeroing its coin (sharar verify_rows).
+
+    target_probs [b, block, V] is the filtered target law, draft_probs [b, gamma, V]
+    the draft's q, uniform_samples [b, gamma] the chain kernel's coins (slot j for
+    draft j+1, accepted when coin * q < p). Plausible: p_y > 0, rank of y under p
+    below the row's top-k, and log p_max - log p_y <= margin; rows with top-k <= 1
+    keep exact rejection sampling. Fills out["exact"/"relaxed"/"argmax"] [b, gamma]:
+    the original test's outcome, plausible-only acceptances, and the target argmax.
+    """
+    ks_l, ms_l = out["rules"]
+    dev = candidates.device
+    ks = torch.tensor(ks_l, device=dev, dtype=torch.int64)
+    ms = torch.tensor(ms_l, device=dev, dtype=torch.float32)
+    p = target_probs[:, :gamma].float()
+    y = candidates[:, 1 : gamma + 1].long()
+    p_y = p.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+    q_y = draft_probs[:, :gamma].float().gather(-1, y.unsqueeze(-1)).squeeze(-1)
+    p_max, argmax = p.max(-1)
+    rank = (p > p_y.unsqueeze(-1)).sum(-1)
+    gap = torch.log(p_max.clamp_min(1e-30)) - torch.log(p_y.clamp_min(1e-30))
+    plausible = (p_y > 0) & (rank < ks.unsqueeze(1)) & (gap <= ms.unsqueeze(1)) & (ks.unsqueeze(1) > 1)
+    coins = uniform_samples[:, :gamma]
+    exact = (q_y > 0) & (coins * q_y < p_y)
+    uniform_samples[:, :gamma] = torch.where(plausible, torch.zeros_like(coins), coins)
+    out["exact"] = exact
+    out["relaxed"] = plausible & ~exact
+    out["argmax"] = argmax
+
+
 class RelaxedStats:
     """Cumulative counters per rule and the per-step relaxed-accept log (rank 0)."""
 
