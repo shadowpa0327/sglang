@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import dflash_relaxed
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -511,6 +512,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
+        self._relaxed_stats = dflash_relaxed.RelaxedStats(
+            enabled=self.model_runner.tp_rank == 0
+        )
         if self.model_runner.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -2129,9 +2133,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        reqs=None,
     ):
         new_seq_lens = None
         target_predict = None
+        relaxed_info = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2162,6 +2168,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict = torch.argmax(next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
+            # Research patch: relaxed (top-k within margin) greedy verification.
+            rules = (
+                dflash_relaxed.request_rules(reqs)
+                if reqs is not None and len(reqs) == bs
+                else None
+            )
+            if rules is not None:
+                argmax_before = target_predict[:, :-1].clone()
+                exact, relaxed = dflash_relaxed.apply_relaxed(
+                    target_predict, candidates, next_token_logits, rules
+                )
+                relaxed_info = (rules, exact, relaxed, argmax_before)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
                 try:
@@ -2201,6 +2219,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        if relaxed_info is not None:
+            rules, exact, relaxed, argmax_before = relaxed_info
+            self._relaxed_stats.record(
+                reqs, rules, exact, relaxed, accept_len, argmax_before, candidates[:, 1:]
+            )
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
@@ -2806,6 +2829,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
+            reqs=batch.reqs,
         )
 
         if SIMULATE_ACC_LEN > 0:
