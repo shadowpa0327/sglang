@@ -11,7 +11,9 @@ Per request: `custom_params: {"accept_top_k": K, "accept_margin": M}`, plus two 
 that refuse a relaxed accept (the slot then verifies exactly): `"relax_code": false` inside a
 fenced code block (an odd number of ``` tokens in the request's output so far), and
 `"repeat_veto_ngram": n` when the drafted token would complete an n-gram the output already
-contains (the start of a loop).
+contains (the start of a loop). Sampled rows only: `"relax_top": false` keeps the target's own
+top token on the ordinary rejection test (only near misses get the plausible pass), which removes
+the mode-sharpening an over-confident draft otherwise passes into the output.
 Server default: SGLANG_DFLASH_RELAXED_TOP_K / SGLANG_DFLASH_RELAXED_MARGIN
 (top-k <= 1 is exact). SGLANG_DFLASH_RELAXED_LOG=<path> appends one JSON line
 per verify step that relaxed-accepted a token (rank 0 only), and
@@ -35,16 +37,17 @@ _STATS_PATH = os.environ.get("SGLANG_DFLASH_RELAXED_STATS") or None
 
 def request_rules(reqs) -> Optional[tuple]:
     """Per-row (top-k, margin, relax_code, repeat_veto_ngram), or None when all rows are exact."""
-    ks, ms, code_ok, rep_n = [], [], [], []
+    ks, ms, code_ok, rep_n, top_ok = [], [], [], [], []
     for r in reqs:
         cp = getattr(r.sampling_params, "custom_params", None) or {}
         ks.append(int(cp.get("accept_top_k", _DEFAULT_K)))
         ms.append(float(cp.get("accept_margin", _DEFAULT_M)))
         code_ok.append(bool(cp.get("relax_code", True)))
         rep_n.append(int(cp.get("repeat_veto_ngram", 0)))
+        top_ok.append(bool(cp.get("relax_top", True)))
     if all(k <= 1 for k in ks):
         return None
-    return ks, ms, code_ok, rep_n
+    return ks, ms, code_ok, rep_n, top_ok
 
 
 def gates_active(rules) -> bool:
@@ -186,6 +189,12 @@ def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, unif
     rank = (p > p_y.unsqueeze(-1)).sum(-1)
     gap = torch.log(p_max.clamp_min(1e-30)) - torch.log(p_y.clamp_min(1e-30))
     plausible = (p_y > 0) & (rank < ks.unsqueeze(1)) & (gap <= ms.unsqueeze(1)) & (ks.unsqueeze(1) > 1)
+    reqs = out.get("reqs")
+    if reqs is not None:
+        top_ok = [bool((getattr(r.sampling_params, "custom_params", None) or {}).get("relax_top", True)) for r in reqs]
+        if not all(top_ok):
+            keep_top = torch.tensor(top_ok, device=dev).unsqueeze(1)
+            plausible = plausible & (keep_top | (rank > 0))
     if out.get("gate") is not None and gates_active(out["rules"]):
         plausible = out["gate"].filter(out["reqs"], out["rules"], candidates, plausible)
     coins = uniform_samples[:, :gamma]
@@ -198,6 +207,8 @@ def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, unif
 
 def rule_key(rules, i: int) -> str:
     key = f"{rules[0][i]}:{rules[1][i]:g}"
+    if len(rules) > 4 and not rules[4][i]:
+        key += "|no-top"
     if len(rules) > 2:
         if not rules[2][i]:
             key += "|code-exact"
