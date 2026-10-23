@@ -515,6 +515,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._relaxed_stats = dflash_relaxed.RelaxedStats(
             enabled=self.model_runner.tp_rank == 0
         )
+        self._relaxed_gate = dflash_relaxed.HarmGate(
+            getattr(self.model_runner.server_args, "tokenizer_path", None)
+            or self.model_runner.server_args.model_path
+        )
         if self.model_runner.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -2148,7 +2152,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if reqs is not None and len(reqs) == bs
                 else None
             )
-            relaxed_out = {"rules": rules} if rules is not None else None
+            relaxed_out = (
+                {"rules": rules, "gate": self._relaxed_gate, "reqs": reqs}
+                if rules is not None
+                else None
+            )
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
@@ -2194,7 +2202,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             if rules is not None:
                 argmax_before = target_predict[:, :-1].clone()
                 exact, relaxed = dflash_relaxed.apply_relaxed(
-                    target_predict, candidates, next_token_logits, rules
+                    target_predict, candidates, next_token_logits, rules,
+                    gate=self._relaxed_gate, reqs=reqs,
                 )
                 relaxed_info = (rules, exact, relaxed, argmax_before)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
@@ -2238,6 +2247,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         if relaxed_info is not None:
             rules, exact, relaxed, argmax_before = relaxed_info
+            if dflash_relaxed.gates_active(rules):
+                self._relaxed_gate.commit(reqs, rules, candidates, accept_len)
             self._relaxed_stats.record(
                 reqs, rules, exact, relaxed, accept_len, argmax_before, candidates[:, 1:]
             )

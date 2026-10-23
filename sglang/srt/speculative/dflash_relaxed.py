@@ -7,7 +7,11 @@ cumulative prefix and the bonus stays the target argmax at the first rejected
 slot, so the rule is applied by rewriting the greedy `target_predict` rows
 before the existing accept kernels run.
 
-Per request: `custom_params: {"accept_top_k": K, "accept_margin": M}`.
+Per request: `custom_params: {"accept_top_k": K, "accept_margin": M}`, plus two harm gates
+that refuse a relaxed accept (the slot then verifies exactly): `"relax_code": false` inside a
+fenced code block (an odd number of ``` tokens in the request's output so far), and
+`"repeat_veto_ngram": n` when the drafted token would complete an n-gram the output already
+contains (the start of a loop).
 Server default: SGLANG_DFLASH_RELAXED_TOP_K / SGLANG_DFLASH_RELAXED_MARGIN
 (top-k <= 1 is exact). SGLANG_DFLASH_RELAXED_LOG=<path> appends one JSON line
 per verify step that relaxed-accepted a token (rank 0 only), and
@@ -29,16 +33,101 @@ _LOG_PATH = os.environ.get("SGLANG_DFLASH_RELAXED_LOG") or None
 _STATS_PATH = os.environ.get("SGLANG_DFLASH_RELAXED_STATS") or None
 
 
-def request_rules(reqs) -> Optional[tuple[list[int], list[float]]]:
-    """Per-row (top-k, margin), or None when every row verifies exactly."""
-    ks, ms = [], []
+def request_rules(reqs) -> Optional[tuple]:
+    """Per-row (top-k, margin, relax_code, repeat_veto_ngram), or None when all rows are exact."""
+    ks, ms, code_ok, rep_n = [], [], [], []
     for r in reqs:
         cp = getattr(r.sampling_params, "custom_params", None) or {}
         ks.append(int(cp.get("accept_top_k", _DEFAULT_K)))
         ms.append(float(cp.get("accept_margin", _DEFAULT_M)))
+        code_ok.append(bool(cp.get("relax_code", True)))
+        rep_n.append(int(cp.get("repeat_veto_ngram", 0)))
     if all(k <= 1 for k in ks):
         return None
-    return ks, ms
+    return ks, ms, code_ok, rep_n
+
+
+def gates_active(rules) -> bool:
+    return rules is not None and (not all(rules[2]) or any(n > 0 for n in rules[3]))
+
+
+class HarmGate:
+    """Host-side per-request state for the code-block and repetition gates (every TP rank)."""
+
+    def __init__(self, tokenizer_path: Optional[str]):
+        self.tokenizer_path = tokenizer_path
+        self._fence = None
+        self.state: dict = {}
+        self.step = 0
+
+    def fence(self) -> set:
+        if self._fence is None:
+            from transformers import AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(self.tokenizer_path)
+            toks = tok.convert_ids_to_tokens(list(range(len(tok))))
+            self._fence = {i for i, t in enumerate(toks) if t is not None and "```" in t}
+        return self._fence
+
+    def _st(self, rid, n):
+        st = self.state.get(rid)
+        if st is None or st["n"] != n:
+            st = {"n": n, "tail": [], "grams": set(), "fences": 0, "seen": self.step}
+            self.state[rid] = st
+        st["seen"] = self.step
+        return st
+
+    def filter(self, reqs, rules, candidates: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """mask [b, n] (relaxed-eligible drafts) with the gated slots cleared."""
+        fence = self.fence()
+        anchors = candidates[:, 0].tolist()
+        drafts = candidates[:, 1:].tolist()
+        m = mask.tolist()
+        for i, r in enumerate(reqs):
+            code_ok, n = rules[2][i], rules[3][i]
+            if code_ok and n <= 0:
+                continue
+            st = self._st(r.rid, n)
+            fences = st["fences"] + (anchors[i] in fence)
+            seq = st["tail"] + [anchors[i]]
+            local = set()
+            for j, y in enumerate(drafts[i]):
+                if m[i][j]:
+                    veto = (not code_ok) and fences % 2 == 1
+                    if not veto and n > 0 and len(seq) >= n - 1:
+                        g = hash(tuple(seq[len(seq) - (n - 1):] + [y]))
+                        veto = g in st["grams"] or g in local
+                    if veto:
+                        m[i][j] = False
+                if n > 0 and len(seq) >= n:
+                    local.add(hash(tuple(seq[len(seq) - n:])))
+                seq.append(y)
+                fences += y in fence
+        return torch.tensor(m, dtype=torch.bool, device=mask.device)
+
+    def commit(self, reqs, rules, candidates: torch.Tensor, accept_len: torch.Tensor) -> None:
+        """Append each gated row's anchor and accepted drafts to its history."""
+        fence = self.fence()
+        self.step += 1
+        anchors = candidates[:, 0].tolist()
+        drafts = candidates[:, 1:].tolist()
+        acc = accept_len.tolist()
+        for i, r in enumerate(reqs):
+            code_ok, n = rules[2][i], rules[3][i]
+            if code_ok and n <= 0:
+                continue
+            st = self._st(r.rid, n)
+            for t in [anchors[i]] + drafts[i][: int(acc[i])]:
+                st["tail"].append(t)
+                st["fences"] += t in fence
+                if n > 0 and len(st["tail"]) >= n:
+                    st["grams"].add(hash(tuple(st["tail"][-n:])))
+                if len(st["tail"]) > max(n, 1):
+                    del st["tail"][0]
+        if self.step % 200 == 0:
+            stale = [k for k, v in self.state.items() if self.step - v["seen"] > 2000]
+            for k in stale:
+                del self.state[k]
 
 
 def relaxed_mask(logits: torch.Tensor, drafts: torch.Tensor, ks: torch.Tensor,
@@ -54,7 +143,8 @@ def relaxed_mask(logits: torch.Tensor, drafts: torch.Tensor, ks: torch.Tensor,
 
 
 def apply_relaxed(target_predict: torch.Tensor, candidates: torch.Tensor,
-                  next_token_logits: torch.Tensor, rules) -> tuple[torch.Tensor, torch.Tensor]:
+                  next_token_logits: torch.Tensor, rules, gate: Optional["HarmGate"] = None,
+                  reqs=None) -> tuple[torch.Tensor, torch.Tensor]:
     """Rewrite target_predict[:, :-1] in place to the draft where relaxed.
 
     candidates[:, 1:] are the drafts checked against target_predict[:, :-1].
@@ -68,6 +158,8 @@ def apply_relaxed(target_predict: torch.Tensor, candidates: torch.Tensor,
     drafts = candidates[:, 1:]
     exact = drafts == target_predict[:, :-1]
     relaxed = relaxed_mask(logits, drafts, ks, ms) & ~exact
+    if gate is not None and gates_active(rules):
+        relaxed = gate.filter(reqs, rules, candidates, relaxed)
     target_predict[:, :-1] = torch.where(relaxed, drafts, target_predict[:, :-1])
     return exact, relaxed
 
@@ -82,7 +174,7 @@ def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, unif
     keep exact rejection sampling. Fills out["exact"/"relaxed"/"argmax"] [b, gamma]:
     the original test's outcome, plausible-only acceptances, and the target argmax.
     """
-    ks_l, ms_l = out["rules"]
+    ks_l, ms_l = out["rules"][0], out["rules"][1]
     dev = candidates.device
     ks = torch.tensor(ks_l, device=dev, dtype=torch.int64)
     ms = torch.tensor(ms_l, device=dev, dtype=torch.float32)
@@ -94,12 +186,24 @@ def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, unif
     rank = (p > p_y.unsqueeze(-1)).sum(-1)
     gap = torch.log(p_max.clamp_min(1e-30)) - torch.log(p_y.clamp_min(1e-30))
     plausible = (p_y > 0) & (rank < ks.unsqueeze(1)) & (gap <= ms.unsqueeze(1)) & (ks.unsqueeze(1) > 1)
+    if out.get("gate") is not None and gates_active(out["rules"]):
+        plausible = out["gate"].filter(out["reqs"], out["rules"], candidates, plausible)
     coins = uniform_samples[:, :gamma]
     exact = (q_y > 0) & (coins * q_y < p_y)
     uniform_samples[:, :gamma] = torch.where(plausible, torch.zeros_like(coins), coins)
     out["exact"] = exact
     out["relaxed"] = plausible & ~exact
     out["argmax"] = argmax
+
+
+def rule_key(rules, i: int) -> str:
+    key = f"{rules[0][i]}:{rules[1][i]:g}"
+    if len(rules) > 2:
+        if not rules[2][i]:
+            key += "|code-exact"
+        if rules[3][i] > 0:
+            key += f"|rep{rules[3][i]}"
+    return key
 
 
 class RelaxedStats:
@@ -119,7 +223,7 @@ class RelaxedStats:
         acc = accept_len.tolist()
         rx_counts = rx.sum(1).tolist()
         for i in range(len(reqs)):
-            key = f"{rules[0][i]}:{rules[1][i]:g}"
+            key = rule_key(rules, i)
             s = self.stats.setdefault(key, {"verify_steps": 0, "accepted_drafts": 0,
                                             "relaxed_accepts": 0,
                                             "relaxed_by_slot": [0] * block1})
@@ -132,7 +236,7 @@ class RelaxedStats:
             dr = drafts.tolist()
             lines = []
             for i, j in idx:
-                key = f"{rules[0][i]}:{rules[1][i]:g}"
+                key = rule_key(rules, i)
                 self.stats[key]["relaxed_by_slot"][j] += 1
                 if _LOG_PATH is not None:
                     r = reqs[i]
