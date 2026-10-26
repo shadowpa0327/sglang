@@ -28,6 +28,7 @@ from safetensors.torch import load_file
 logger = logging.getLogger(__name__)
 
 _ACTIVE = False
+_COVERAGE = {"seen": set(), "total": 0}
 
 
 def w3_active() -> bool:
@@ -217,6 +218,11 @@ class W3Method:
         if x.dtype == torch.bfloat16 and (_ACTIVE or m <= self.rows) and m > 0:
             if _ACTIVE:
                 _note(f"3-bit path in decode/verify ({'fp8-static' if self.static_scale is not None else 'groups'})")
+                if id(self) not in _COVERAGE["seen"]:
+                    _COVERAGE["seen"].add(id(self))
+                    n, total = len(_COVERAGE["seen"]), _COVERAGE["total"]
+                    if n == total:
+                        logger.info("sharar W3: decode coverage %d/%d (every 3-bit linear served a decode/verify call)", n, total)
             lead = x.shape[:-1]
             x2 = x.reshape(-1, x.shape[-1])
             if m <= w3.MAX_ROWS:
@@ -313,6 +319,8 @@ def attach(model, arch: str, directory: str | None = None, revision: str | None 
             break
     if checks:
         _report("trunk", checks)
+    unfused = _unfuse_gdn_in_proj(model)
+    _COVERAGE["total"] = count
     missing = {n for n in ckpt.weights if ".experts." not in n} - used  # routed experts: `attach_moe`
     if missing:
         raise ValueError(f"{len(missing)} checkpoint matrices not attached, e.g. {sorted(missing)[:4]}")
@@ -320,7 +328,7 @@ def attach(model, arch: str, directory: str | None = None, revision: str | None 
     w3._workspace(device, 16 * w3.MAX_ROWS * 34816, 1 << 16)
     w3._module()
     torch.cuda.synchronize()
-    info = {"matrices": count, "gib": total / 2**30, "kinds": kinds, "dir": str(directory),
+    info = {"matrices": count, "gib": total / 2**30, "kinds": kinds, "unfused_gdn_in_proj": unfused, "dir": str(directory),
             "target_revision": ckpt.manifest.get("target_revision")}
     logger.info("sharar W3: %s", info)
     return info
@@ -465,3 +473,134 @@ def attach_moe(model, directory: str | None, sharing: tuple[int, int, int] | Non
     info = {"moe_blocks": blocks, "w3_experts": ckpt is not None, "sharing": sharing}
     logger.info("sharar MoE: %s", info)
     return info
+
+
+# ------------------------------------------------------------------ calibration capture (re-fitting the 3-bit copies)
+
+class _Capture:
+    """Activations for GPTQ, in sharar's formats: x^T x of every covered trunk linear's full input (row-parallel inputs
+    all-gathered over TP; rank 0 accumulates in FP32) and every MoE block's input rows (rank 0, bf16 `layerNN.bin`, as
+    sharar `flashnext_w3_experts capture` writes them). Saved when `<dir>/SAVE` appears."""
+
+    def __init__(self, directory: str, rank: int):
+        self.dir, self.rank = Path(directory), rank
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.H, self.rows, self.names = {}, {}, {}
+        self.files, self.moe_rows = {}, {}
+        self.saved = False
+
+    def linear(self, key: str, x: torch.Tensor, row_parallel: bool) -> None:
+        from sglang.srt.distributed import tensor_model_parallel_all_gather
+        flat = x.reshape(-1, x.shape[-1])
+        if flat.shape[0] == 0 or self.saved:
+            return
+        if row_parallel:
+            flat = tensor_model_parallel_all_gather(flat.contiguous(), dim=-1)
+        if self.rank != 0:
+            return
+        f = flat.float()
+        if key not in self.H:
+            self.H[key] = torch.zeros((f.shape[1], f.shape[1]), dtype=torch.float32, device=f.device)
+            self.rows[key] = 0
+        self.H[key].addmm_(f.T, f)
+        self.rows[key] += f.shape[0]
+
+    def moe(self, layer: int, x: torch.Tensor) -> None:
+        if self.rank != 0 or x.shape[0] == 0 or self.saved:
+            return
+        if layer not in self.files:
+            self.files[layer] = open(self.dir / f"layer{layer:02d}.bin", "wb")
+            self.moe_rows[layer] = 0
+        flat = x.reshape(-1, x.shape[-1]).to(torch.bfloat16).contiguous()
+        self.files[layer].write(flat.view(torch.int16).cpu().numpy().tobytes())
+        self.moe_rows[layer] += flat.shape[0]
+
+    def poll(self) -> None:
+        if self.saved or not (self.dir / "SAVE").exists():
+            return
+        self.saved = True
+        if self.rank != 0:
+            return
+        for f in self.files.values():
+            f.close()
+        for key, h in self.H.items():
+            torch.save({"H": h.cpu(), "rows": self.rows[key], "names": self.names[key]}, self.dir / f"cov_{key}.pt")
+        rows = set(self.moe_rows.values())
+        meta = {"rows": rows.pop() if len(rows) == 1 else sorted(rows), "hidden": 2560, "dtype": "bfloat16",
+                "layers": sorted(self.moe_rows), "trunk": "bf16 (SGLang exact)", "experts": "nvfp4 (Marlin W4A16)",
+                "linears": {k: self.rows[k] for k in self.H}}
+        (self.dir / "capture.json").write_text(json.dumps(meta, indent=1))
+        (self.dir / "SAVED").write_text("ok\n")
+        logger.info("sharar capture saved: %d covariances, MoE rows %s", len(self.H), meta["rows"])
+
+
+_CAPTURE: "_Capture | None" = None
+
+
+class CaptureMethod:
+    """Records a linear's input for the capture, then runs the original method."""
+
+    def __init__(self, base, key: str, row_parallel: bool):
+        self.base, self.key, self.row_parallel = base, key, row_parallel
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def apply(self, layer, x, bias=None, *args, **kwargs):
+        if _CAPTURE is not None:
+            _CAPTURE.linear(self.key, x, self.row_parallel)
+        return self.base.apply(layer, x, bias, *args, **kwargs)
+
+
+def capture_poll() -> None:
+    if _CAPTURE is not None:
+        _CAPTURE.poll()
+
+
+def attach_capture(model, arch: str, directory: str, rank: int) -> dict:
+    """Wrap every linear the arch's W3 map covers and every sparse MoE block for the capture."""
+    global _CAPTURE
+    _CAPTURE = cap = _Capture(directory, rank)
+    patterns = [(re.compile(r"(?:^|\.)layers\.(\d+)\." + suffix + r"$"), names, column)
+                for suffix, (names, column) in MAPS[arch].items()]
+    n_lin = n_moe = 0
+    for name, module in list(model.named_modules()):
+        if "visual" in name or "mtp" in name:
+            continue
+        if hasattr(module, "topk") and hasattr(module, "experts"):
+            hit = re.search(r"layers\.(\d+)\.", name + ".")
+            if hit is not None:
+                layer = int(hit.group(1))
+                module.register_forward_pre_hook(lambda m, args, kwargs, layer=layer: cap.moe(layer, args[0] if args else kwargs["hidden_states"]),
+                                                 with_kwargs=True)
+                n_moe += 1
+        if not hasattr(module, "quant_method"):
+            continue
+        targets = [(None, [GLOBAL.get(arch, {})[name]], True)] if name in GLOBAL.get(arch, {}) else patterns
+        for pattern, names, column in targets:
+            hit = pattern.search(name) if pattern is not None else None
+            if pattern is not None and hit is None:
+                continue
+            ck_names = [n.format(i=int(hit.group(1))) for n in names] if hit is not None else names
+            key = ck_names[0].replace(".", "_")
+            cap.names[key] = ck_names  # every checkpoint matrix that takes this input
+            module.quant_method = CaptureMethod(module.quant_method, key, row_parallel=not column)
+            n_lin += 1
+            break
+    info = {"capture_linears": n_lin, "capture_moe_blocks": n_moe, "unfused_gdn_in_proj": _unfuse_gdn_in_proj(model), "dir": directory}
+    logger.info("sharar capture: %s", info)
+    return info
+
+
+def _unfuse_gdn_in_proj(model) -> int:
+    """SGLang fuses a BF16 GDN layer's in_proj_qkvz and in_proj_ba into one GEMM for calls of up to 1,024 rows
+    (qwen3_5.py `_fused_in_proj_weight`), which never calls in_proj_qkvz's quant method: drop the fused weight where the
+    port wraps it, so decode, verify and capture go through the wrapper (the two weights stay as they are)."""
+    n = 0
+    for m in model.modules():
+        qkvz = getattr(m, "in_proj_qkvz", None)
+        if getattr(m, "_fused_in_proj_weight", None) is not None and isinstance(getattr(qkvz, "quant_method", None), (W3Method, CaptureMethod)):
+            m._fused_in_proj_weight = None
+            m._fused_in_proj_qkvz_width = 0
+            n += 1
+    return n

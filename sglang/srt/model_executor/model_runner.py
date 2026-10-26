@@ -1240,13 +1240,17 @@ class ModelRunner:
         sharing = tuple(int(v) for v in env("SGLANG_SHARAR_MOE").split(":")) if env("SGLANG_SHARAR_MOE") else None
         if experts or sharing:
             info["moe"] = sharar_w3.attach_moe(self.model, experts, sharing, self.tp_size, self.tp_rank)
+        if env("SGLANG_SHARAR_CAPTURE"):
+            info["capture"] = sharar_w3.attach_capture(self.model, arch, env("SGLANG_SHARAR_CAPTURE"), self.tp_rank)
         forward = self.model.forward
 
         @functools.wraps(forward)  # keeps the signature the runner inspects (pp_proxy_tensors)
         def forward_with_mode(*args, **kwargs):
             batch = kwargs.get("forward_batch", args[2] if len(args) > 2 else None)
             sharar_w3.set_mode(batch)
-            return forward(*args, **kwargs)
+            out = forward(*args, **kwargs)
+            sharar_w3.capture_poll()
+            return out
 
         self.model.forward = forward_with_mode
         if self.tp_rank == 0:
@@ -1318,7 +1322,7 @@ class ModelRunner:
                         w = getattr(m, "weight", None)
                         f.write(f"{n}\t{type(m).__name__}\t{type(getattr(m, 'quant_method', None)).__name__}\t"
                                 f"{tuple(w.shape) if w is not None else ''}\t{w.dtype if w is not None else ''}\n")
-            if any(os.environ.get(k) for k in ("SGLANG_SHARAR_W3", "SGLANG_SHARAR_MOE")):
+            if any(os.environ.get(k) for k in ("SGLANG_SHARAR_W3", "SGLANG_SHARAR_MOE", "SGLANG_SHARAR_CAPTURE")):
                 self._attach_sharar_w3()
 
         self.maybe_precompile_model_kernels_after_loading()

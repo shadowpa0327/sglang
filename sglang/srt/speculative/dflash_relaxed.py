@@ -266,7 +266,10 @@ class RelaxedStats:
     def flush(self) -> None:
         if _STATS_PATH is None:
             return
-        tmp = _STATS_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"time": time.time(), "rules": self.stats}, f)
-        os.replace(tmp, _STATS_PATH)
+        tmp = f"{_STATS_PATH}.{os.getpid()}.tmp"  # per process: a shared path must never crash a server
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"time": time.time(), "rules": self.stats}, f)
+            os.replace(tmp, _STATS_PATH)
+        except OSError:
+            pass
