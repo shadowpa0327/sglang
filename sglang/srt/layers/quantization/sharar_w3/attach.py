@@ -142,6 +142,30 @@ def _note(what: str) -> None:
         logger.info("sharar W3: %s", what)
 
 
+@torch.no_grad()
+def _check_linear(module) -> float:
+    """Relative error of the 3-bit copy against the original weights on random activations (this rank's shard).
+    Quantization noise alone gives about 0.2-0.3; a wrong name, row order or shard gives 1 or more."""
+    method = module.quant_method
+    k = method.w3.in_features
+    x = torch.randn(16, k, device=method.w3.planes.device, dtype=torch.bfloat16)
+    if method.static_scale is not None:  # inside the FP8 input range the layer was calibrated for
+        x = x * float(method.static_scale) * 64
+    ref = method.base.apply(module, x, None).float()
+    got = method._w3(x).float()
+    return ((got - ref).norm() / ref.norm().clamp_min(1e-12)).item()
+
+
+def _report(what: str, checks) -> None:
+    errs = [e for _, e in checks]
+    worst = sorted(checks, key=lambda c: -c[1])[:5]
+    logger.info("sharar W3 check (%s, rank shard): %d linears, rel err mean %.3f max %.3f; worst %s", what, len(errs),
+                sum(errs) / len(errs), max(errs), [(n, round(e, 3)) for n, e in worst])
+    bad = [(n, e) for n, e in checks if not e < 0.6]
+    if bad:
+        raise ValueError(f"sharar W3 check failed for {len(bad)} {what} entries, e.g. {bad[:4]}")
+
+
 class DenseW3:
     """A 3-bit copy kept dequantized (FP32), for shards the kernel cannot serve: sharar's arithmetic (E4M3 activations
     per 32-group, FP32 products) in a torch matmul. The weights are the same bits; only the FP32 summation order differs."""
@@ -261,6 +285,7 @@ def attach(model, arch: str, directory: str | None = None, revision: str | None 
                 for suffix, (names, column) in MAPS[arch].items()]
     device = next(model.parameters()).device
     used, count, total, kinds = set(), 0, 0, {"fp8-static": 0, "groups": 0}
+    checks = []
     for name, module in model.named_modules():
         if getattr(module, "_enable_silu_fp4_quant_fusion", False):
             module._enable_silu_fp4_quant_fusion = False  # down_proj must see BF16 activations (W3 quant_groups)
@@ -280,10 +305,14 @@ def attach(model, arch: str, directory: str | None = None, revision: str | None 
             scale = _static_scale(module)
             kinds["fp8-static" if scale is not None else "groups"] += 1
             module.quant_method = W3Method(module.quant_method, weight, scale, ROWS[arch])
+            if os.environ.get("SGLANG_SHARAR_W3_CHECK") == "1":
+                checks.append((name, _check_linear(module)))
             used.update(ck_names)
             count += 1
             total += weight.planes.numel() * 4 + weight.scales.numel() + weight.row_scale.numel() * 4
             break
+    if checks:
+        _report("trunk", checks)
     missing = {n for n in ckpt.weights if ".experts." not in n} - used  # routed experts: `attach_moe`
     if missing:
         raise ValueError(f"{len(missing)} checkpoint matrices not attached, e.g. {sorted(missing)[:4]}")
@@ -365,6 +394,24 @@ def _swap_child(parent, name: str, value) -> None:
         object.__setattr__(parent, name, value)
 
 
+@torch.no_grad()
+def _check_experts(ckpt, layer, fused, tp, rank, device) -> float:
+    """The 3-bit experts against the NVFP4 FusedMoE on random rows and routing (this rank's partial sum)."""
+    from sglang.srt.distributed import tensor_model_parallel_all_reduce
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.quantization.sharar_w3.w3_moe import w3_moe
+    g = torch.Generator(device=device).manual_seed(1234 + layer)  # the same rows and routing on every rank
+    x = torch.randn(16, 2560, device=device, dtype=torch.bfloat16, generator=g)
+    ids = torch.stack([torch.randperm(512, device=device, generator=g)[:10] for _ in range(16)]).int()
+    w = torch.softmax(torch.randn(16, 10, device=device, generator=g), -1)
+    ref = fused(x, StandardTopKOutput(topk_weights=w, topk_ids=ids, router_logits=torch.zeros(16, 512, device=device)))
+    ref = ref if getattr(fused, "reduce_results", False) else tensor_model_parallel_all_reduce(ref.clone())
+    experts = load_experts(ckpt, layer, getattr(fused, "num_experts", 512), tp, rank, device)
+    got = tensor_model_parallel_all_reduce(w3_moe(experts, x, ids, w))
+    del experts
+    return ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+
+
 def load_experts(ckpt: Checkpoint, layer: int, experts: int, tp: int, rank: int, device):
     """Layer `layer`'s 3-bit experts for this rank: whole experts lo .. hi - 1 (sharar `expert_range`)."""
     from sglang.srt.layers.quantization.sharar_w3 import w3
@@ -387,6 +434,7 @@ def attach_moe(model, directory: str | None, sharing: tuple[int, int, int] | Non
     ckpt = Checkpoint(directory) if directory else None
     device = next(model.parameters()).device
     blocks = 0
+    echecks = []
     for name, block in model.named_modules():
         if "mtp" in name or not (hasattr(block, "topk") and hasattr(block, "experts")):
             continue
@@ -399,6 +447,8 @@ def attach_moe(model, directory: str | None, sharing: tuple[int, int, int] | Non
                 raise ValueError("3-bit experts need the shared expert outside the routed experts "
                                  "(--disable-shared-experts-fusion)")
             fused = block.experts
+            if os.environ.get("SGLANG_SHARAR_W3_CHECK") == "1":
+                echecks.append((name, _check_experts(ckpt, layer, fused, tp, rank, device)))
             for p in fused.parameters(recurse=True):  # the NVFP4 experts are not read again: release them first
                 p.data = torch.empty(0, dtype=p.dtype, device=p.device)
             torch.cuda.empty_cache()
@@ -410,6 +460,8 @@ def attach_moe(model, directory: str | None, sharing: tuple[int, int, int] | Non
             _swap_child(block, "topk", BudgetTopK(block.topk, k, keep, per_request, budget, repeat=ckpt is None))
         blocks += 1
     torch.cuda.empty_cache()
+    if echecks:
+        _report("routed experts", echecks)
     info = {"moe_blocks": blocks, "w3_experts": ckpt is not None, "sharing": sharing}
     logger.info("sharar MoE: %s", info)
     return info
