@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import functools
+import os
 import contextlib
 import inspect
 import logging
@@ -1223,6 +1225,33 @@ class ModelRunner:
         self.moe_ep_size = parallel.moe_ep_size
         self.dp_rank = parallel.dp_rank
 
+    def _attach_sharar_w3(self):
+        from sglang.srt.layers.quantization.sharar_w3 import attach as sharar_w3
+
+        name = type(self.model).__name__
+        arch = "qwen3_5" if name.startswith("Qwen3_5") else "qwen4_exp" if name.startswith("Qwen4Exp") else None
+        if arch is None:
+            raise ValueError(f"SGLANG_SHARAR_W3 / SGLANG_SHARAR_MOE: no mapping for {name}")
+        env = os.environ.get
+        info = {}
+        if env("SGLANG_SHARAR_W3") and env("SGLANG_SHARAR_W3_TRUNK", "1") == "1":
+            info["trunk"] = sharar_w3.attach(self.model, arch, revision=env("SGLANG_SHARAR_W3_REVISION") or None)
+        experts = env("SGLANG_SHARAR_W3") if env("SGLANG_SHARAR_W3_EXPERTS") == "1" else None
+        sharing = tuple(int(v) for v in env("SGLANG_SHARAR_MOE").split(":")) if env("SGLANG_SHARAR_MOE") else None
+        if experts or sharing:
+            info["moe"] = sharar_w3.attach_moe(self.model, experts, sharing, self.tp_size, self.tp_rank)
+        forward = self.model.forward
+
+        @functools.wraps(forward)  # keeps the signature the runner inspects (pp_proxy_tensors)
+        def forward_with_mode(*args, **kwargs):
+            batch = kwargs.get("forward_batch", args[2] if len(args) > 2 else None)
+            sharar_w3.set_mode(batch)
+            return forward(*args, **kwargs)
+
+        self.model.forward = forward_with_mode
+        if self.tp_rank == 0:
+            logger.info(f"sharar W3 attached: {info}")
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1282,6 +1311,15 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             get_offloader().post_init()
+            # Research port: sharar's calibrated 3-bit decode copies (SGLANG_SHARAR_W3), before graph capture.
+            if os.environ.get("SGLANG_SHARAR_DUMP_MODULES") and self.tp_rank == 0:
+                with open(os.environ["SGLANG_SHARAR_DUMP_MODULES"], "w") as f:
+                    for n, m in self.model.named_modules():
+                        w = getattr(m, "weight", None)
+                        f.write(f"{n}\t{type(m).__name__}\t{type(getattr(m, 'quant_method', None)).__name__}\t"
+                                f"{tuple(w.shape) if w is not None else ''}\t{w.dtype if w is not None else ''}\n")
+            if any(os.environ.get(k) for k in ("SGLANG_SHARAR_W3", "SGLANG_SHARAR_MOE")):
+                self._attach_sharar_w3()
 
         self.maybe_precompile_model_kernels_after_loading()
 

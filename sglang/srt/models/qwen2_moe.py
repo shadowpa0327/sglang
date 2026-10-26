@@ -169,6 +169,12 @@ def can_fuse_shared_expert(
     return True
 
 
+def _fp4_is_marlin() -> bool:
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+
+    return get_fp4_gemm_runner_backend().is_marlin()
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -247,7 +253,10 @@ class Qwen2MoeMLP(nn.Module):
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
+        # The fused kernel hands down_proj FP4 activations, which only the W4A4 GEMM takes (not the Marlin W4A16
+        # fallback on Hopper / Ada).
+        if (self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple)
+                and not _fp4_is_marlin()):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
         x = self.act_fn(gate_up)
