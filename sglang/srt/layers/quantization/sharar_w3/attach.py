@@ -97,8 +97,16 @@ def build(ckpt: Checkpoint, names: list[str], linear, column: bool, device) -> "
         raise ValueError(f"{names}: mixed codebooks {codebooks}")
     whole = _cat([t for t, _ in loaded])
     tp, rank = getattr(linear, "tp_size", 1), getattr(linear, "tp_rank", 0)
+    if type(linear).__name__ == "ReplicatedLinear":
+        tp, rank = 1, 0
     n_total = whole["row_scale"].shape[0]
-    if column:
+    indices = getattr(linear, "shard_indices", None)
+    if indices is not None:  # a vocab-parallel lm_head: this rank's vocabulary rows
+        lo, hi = indices.org_vocab_start_index, indices.org_vocab_end_index
+        if indices.num_elements_padded != hi - lo or getattr(indices, "added_vocab_end_index", 0) != getattr(indices, "added_vocab_start_index", 0):
+            raise ValueError(f"{names}: padded or extended vocabulary shards are not supported")
+        shard = _rows(whole, lo, hi)
+    elif column:
         sizes = list(getattr(linear, "output_sizes", None) or [n_total])
         if sum(sizes) != n_total:
             raise ValueError(f"{names}: {n_total} rows, the linear's segments {sizes}")
@@ -111,6 +119,11 @@ def build(ckpt: Checkpoint, names: list[str], linear, column: bool, device) -> "
     else:
         k = whole["planes"].shape[1] * 128
         per = k // tp
+        if per % 128:  # e.g. Flash-Next's shared down (K 640) at TP2: the kernel's 128-k chunks cannot be split
+            levels = codebooks.pop()
+            full = w3.W3Weight(*(whole[key].contiguous().to(device) for key in ("planes", "scales", "row_scale")),
+                               n_total, k, w3._codebook(levels), w3.lut_of(w3._codebook(levels)))
+            return DenseW3(w3.dequantize(full)[:, rank * per:(rank + 1) * per].contiguous())
         shard = _cols(whole, rank * per, (rank + 1) * per)
     levels = codebooks.pop()
     planes, scales, row_scale = (shard[key].contiguous().to(device) for key in ("planes", "scales", "row_scale"))
@@ -129,6 +142,25 @@ def _note(what: str) -> None:
         logger.info("sharar W3: %s", what)
 
 
+class DenseW3:
+    """A 3-bit copy kept dequantized (FP32), for shards the kernel cannot serve: sharar's arithmetic (E4M3 activations
+    per 32-group, FP32 products) in a torch matmul. The weights are the same bits; only the FP32 summation order differs."""
+
+    def __init__(self, weight: torch.Tensor):
+        self.weight = weight  # [N, K] float32, row scale applied
+        self.out_features, self.in_features = weight.shape
+        self.planes, self.scales, self.row_scale = weight, weight.new_empty(0), weight.new_empty(0)  # for byte counts
+
+    def __call__(self, x: torch.Tensor, x_scale: torch.Tensor | None = None) -> torch.Tensor:
+        from sglang.srt.layers.quantization.sharar_w3 import w3
+        if x.dtype == torch.float8_e4m3fn:
+            xd = x.float() * x_scale.float().reshape(-1)[0]
+        else:
+            q, s = w3.quant_groups(x.contiguous())
+            xd = (q.float().reshape(x.shape[0], -1, 32) * s.reshape(x.shape[0], -1, 1)).reshape(x.shape)
+        return (xd @ self.weight.T).to(torch.bfloat16)
+
+
 class W3Method:
     """Wraps a linear's quant method: decode / verify calls read the 3-bit copy."""
 
@@ -143,6 +175,11 @@ class W3Method:
 
     def _w3(self, x: torch.Tensor) -> torch.Tensor:
         from sglang.srt.layers.quantization.sharar_w3 import w3
+        if isinstance(self.w3, DenseW3):
+            if self.static_scale is not None:
+                xq = (x.float() / self.static_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                return self.w3(xq, self.static_scale)
+            return self.w3(x)
         if self.static_scale is not None:
             xq = (x.float() / self.static_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
             return w3.w3_linear(xq, self.w3, x_scale=self.static_scale)
@@ -183,7 +220,21 @@ MAPS = {
         r"mlp\.gate_up_proj": (["layers.{i}.mlp.gate_up"], True),
         r"mlp\.down_proj": (["layers.{i}.mlp.down"], False),
     },
+    # Qwen3.8-Flash-Next (sharar `FlashNext.linears()`, the published checkpoint's trunk entries): GDN and attention as
+    # the 27B, the shared expert, layer 1's PLE projections and the lm_head. The routed experts: `attach_moe`.
+    "qwen4_exp": {
+        r"linear_attn\.in_proj_qkvz": (["layers.{i}.mixer.in_qkv", "layers.{i}.mixer.in_z"], True),
+        r"linear_attn\.out_proj": (["layers.{i}.mixer.out"], False),
+        r"(?:self_attn\.)?qkv_proj": (["layers.{i}.mixer.qkv"], True),
+        r"(?:self_attn\.)?o_proj": (["layers.{i}.mixer.o"], False),
+        r"mlp\.shared_expert\.gate_up_proj": (["layers.{i}.mlp.shared_gate_up"], True),
+        r"mlp\.shared_expert\.down_proj": (["layers.{i}.mlp.shared_down"], False),
+        r"ple\.key_proj": (["layers.{i}.ple.key_proj"], True),
+        r"ple\.value_proj": (["layers.{i}.ple.value_proj"], True),
+    },
 }
+# Unlayered linears: SGLang module name -> checkpoint name.
+GLOBAL = {"qwen4_exp": {"lm_head": "lm_head"}}
 
 
 def _static_scale(linear) -> torch.Tensor | None:
@@ -215,12 +266,12 @@ def attach(model, arch: str, directory: str | None = None, revision: str | None 
             module._enable_silu_fp4_quant_fusion = False  # down_proj must see BF16 activations (W3 quant_groups)
         if "visual" in name or "mtp" in name or not hasattr(module, "quant_method"):
             continue
-        for pattern, names, column in patterns:
-            hit = pattern.search(name)
-            if hit is None:
+        targets = [(None, [GLOBAL.get(arch, {})[name]], True)] if name in GLOBAL.get(arch, {}) else patterns
+        for pattern, names, column in targets:
+            hit = pattern.search(name) if pattern is not None else None
+            if pattern is not None and hit is None:
                 continue
-            layer = int(hit.group(1))
-            ck_names = [n.format(i=layer) for n in names]
+            ck_names = [n.format(i=int(hit.group(1))) for n in names] if hit is not None else names
             weight = build(ckpt, ck_names, module, column, device)
             k_local = getattr(module, "input_size_per_partition", None)
             n_local = sum(getattr(module, "output_partition_sizes", None) or [getattr(module, "output_size_per_partition", weight.out_features)])
@@ -348,9 +399,10 @@ def attach_moe(model, directory: str | None, sharing: tuple[int, int, int] | Non
                 raise ValueError("3-bit experts need the shared expert outside the routed experts "
                                  "(--disable-shared-experts-fusion)")
             fused = block.experts
-            experts = load_experts(ckpt, layer, fused.num_experts if hasattr(fused, "num_experts") else 512, tp, rank, device)
-            for p in fused.parameters(recurse=True):  # the NVFP4 experts are not read again
+            for p in fused.parameters(recurse=True):  # the NVFP4 experts are not read again: release them first
                 p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+            torch.cuda.empty_cache()
+            experts = load_experts(ckpt, layer, getattr(fused, "num_experts", 512), tp, rank, device)
             _swap_child(block, "experts", W3ExpertsForward(fused, experts))
         if sharing is not None:
             keep, per_request, budget = sharing
