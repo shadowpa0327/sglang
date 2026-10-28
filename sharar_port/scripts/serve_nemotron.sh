@@ -4,7 +4,7 @@
 # checkpoint's MTP head, MTP_STEPS chained top-1 drafts), W3 (1: sharar's 3-bit trunk and routed experts,
 # shadowpa0327/NVIDIA-Nemotron-3.5-Super-NVFP4-sharar-w3@2ca8b35; needs the Nemotron wiring, branch sharar-nemotron,
 # PYTHONPATH_FORK=/ddn/scratch/cornell/cchang/sglang-nemotron until merged), MOE (expert sharing keep:per_request:budget),
-# CTX (262144, NVIDIA's max-model-len), MAXRUN, ENV_SH, HF_HUB. Numerics as NVIDIA's published serving (NeMo Gym
+# SSM (Mamba state dtype, float32) and SSM_SR=1 (FP16 with stochastic rounding, sharar fast's), CTX (262144, NVIDIA's max-model-len), MAXRUN, ENV_SH, HF_HUB. Numerics as NVIDIA's published serving (NeMo Gym
 # nemotron_recipes/super-3.5): FP8 KV cache, FP32 Mamba SSM cache, the nemotron_3 reasoning parser (vLLM's nemotron_v3).
 # --trust-remote-code: the checkpoint's own transformers config / processor / model
 # classes (reviewed: no network, exec or subprocess; HF_HUB_OFFLINE keeps them from fetching anything).
@@ -33,4 +33,5 @@ CUDA_VISIBLE_DEVICES=$gpus FLASHINFER_DISABLE_VERSION_CHECK=1 exec python -m sgl
   --attention-backend ${ATTN:-trtllm_mha} --host 127.0.0.1 --port "$port" \
   --context-length ${CTX:-262144} --disable-radix-cache --mem-fraction-static ${MEMFRAC:-0.85} \
   --reasoning-parser ${REASONING:-nemotron_3} --kv-cache-dtype ${KV:-fp8_e4m3} --mamba-ssm-dtype ${SSM:-float32} \
+  $([ "${SSM_SR:-0}" = 1 ] && echo --enable-mamba-cache-stochastic-rounding) \
   --max-running-requests ${MAXRUN:-16} "${SPEC_ARGS[@]}" "$@"

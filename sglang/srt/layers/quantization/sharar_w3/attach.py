@@ -345,6 +345,65 @@ def attach(model, arch: str, directory: str | None = None, revision: str | None 
 
 # ------------------------------------------------------------------ Flash-Next routed experts
 
+SHARE_MIN = 8  # sharar model/nemotron/moe.py: under a binding cap each token keeps at least its top SHARE_MIN
+
+
+def route_budget_sigmoid(logits: torch.Tensor, bias: torch.Tensor | None, k: int, keep: int, budget: int,
+                         slots: torch.Tensor | None = None, steps: int = 1, per_request: int = 0, repeat: bool = True):
+    """sharar's Nemotron budgeted routing (model/nemotron/moe.py `route_budget`) for sigmoid routers: logits [R, E] ->
+    (int32 ids [R, k], fp32 weights [R, k], renormalized, without the routed scaling factor). A row ranks experts by
+    sigmoid + bias (equal scores: the lower expert) and its weights are its plain sigmoid scores. The call's set is every
+    real row's top `keep` (when that union exceeds the cap, each row's top `fallback` only: cap / rows within
+    [SHARE_MIN, keep), from the call's shape), then the experts with the most routing weight over the real rows' top k
+    (each row's top-k sigmoid scores normalized), up to the cap min(budget, per_request x real requests) (or `budget`
+    without `per_request`). Each real row takes those of its top k in the set, in rank order; its other slots and a
+    padded row's (slots[r // steps] == 0) name its top expert at weight 0 with `repeat`, else no expert (id E).
+    Plain tensor ops at static shapes, no host sync: CUDA-graph capturable (speed is not the point; sharar's own is Triton)."""
+    r, e = logits.shape
+    dev = logits.device
+    s = torch.sigmoid(logits.float())
+    choice = s + bias.float() if bias is not None else s
+    cand = torch.sort(-choice, dim=1, stable=True).indices[:, :k]  # rank order, ties to the lower expert
+    p = s.gather(1, cand)
+    if slots is None:
+        real = torch.ones(r, dtype=torch.bool, device=dev)
+    else:
+        real = (slots != 0).repeat_interleave(steps)[:r]
+    reqs = real.view(-1, steps)[:, 0].sum() if r % steps == 0 else real.sum()
+
+    def union(top: int) -> torch.Tensor:  # the real rows' top `top`, as a mask over E (padded rows add nothing)
+        ids = torch.where(real[:, None], cand[:, :top], e)
+        return torch.zeros(e + 1, dtype=torch.bool, device=dev).scatter_(0, ids.reshape(-1), True)[:e]
+
+    core = union(keep)
+    cap = torch.full((), budget, dtype=torch.int64, device=dev)
+    if per_request > 0:
+        cap = torch.minimum(cap, per_request * reqs)
+    cap_shape = min(budget, per_request * (r // steps)) if per_request else budget  # sharar's fallback rule: the call's shape
+    g = max(min(SHARE_MIN, keep), min(keep, cap_shape // r)) if budget else keep
+    if budget and g < keep:
+        core = torch.where(core.sum() > cap, union(g), core)
+    dense = torch.zeros(r, e, dtype=torch.float32, device=dev).scatter_(1, cand, p)
+    dense = torch.where(real[:, None], dense / dense.sum(1, keepdim=True).clamp_min(1e-30), 0.0)
+    score = dense.sum(0)
+    key = torch.where(core | (score <= 0), -1.0, score)
+    order = torch.sort(-key, stable=True).indices  # highest score first, ties to the lower expert
+    rank = torch.empty_like(order).scatter_(0, order, torch.arange(e, device=dev))
+    need = (cap - core.sum()).clamp_min(0) if budget else torch.zeros((), dtype=torch.int64, device=dev)
+    chosen_set = core | ((key > 0) & (rank < need))
+    pull = chosen_set[cand] & real[:, None]
+    slot = torch.cumsum(pull.to(torch.int64), 1) - 1
+    dest = torch.where(pull, slot, k)  # column k collects what is not kept
+    w_kept = torch.where(pull, p, 0.0)
+    w_kept = w_kept / (w_kept.sum(1, keepdim=True) + 1e-20)
+    fill = cand[:, :1].expand(r, k) if repeat else torch.full((r, k), e, dtype=cand.dtype, device=dev)
+    if repeat and slots is not None:  # a padded row: row 0's top expert, weight 0
+        fill = torch.where(real[:, None], fill, cand[:1, :1].expand(r, k))
+    ids = torch.cat([fill, fill[:, :1]], 1).scatter_(1, dest, cand)[:, :k]
+    w = torch.zeros(r, k + 1, dtype=torch.float32, device=dev).scatter_(1, dest, w_kept)[:, :k]
+    return ids.to(torch.int32), w
+
+
 class BudgetTopK:
     """sharar's expert sharing (`SHARAR_MOE_KEEP` / `SHARAR_MOE_BUDGET`, model/flashnext/moe.py `route`): in decode and
     verify forwards a call reads at most a budget of distinct experts chosen for all its rows (`route.route_budget`);
@@ -373,6 +432,15 @@ class BudgetTopK:
             raise ValueError(f"expert sharing: {rows} rows over {reqs} requests")
         steps = rows // reqs
         _note(f"expert sharing in decode/verify (rows {rows}, steps {steps})")
+        cfg = self.base.topk_config
+        if cfg.scoring_func == "sigmoid":  # Nemotron 3.5: sigmoid + bias choice, plain-sigmoid weights (sharar's rule)
+            if cfg.use_grouped_topk and (cfg.num_expert_group or 1) > 1:
+                raise ValueError("expert sharing: grouped sigmoid routing with more than one group is not ported")
+            ids, w = route_budget_sigmoid(router_logits, cfg.correction_bias, self.k, self.keep, self.budget,
+                                          _SLOTS, steps, per_request=self.per_request, repeat=self.repeat)
+            if cfg.apply_routed_scaling_factor_on_output and cfg.routed_scaling_factor:
+                w = w * cfg.routed_scaling_factor  # the runner expects routing to have applied it
+            return StandardTopKOutput(topk_weights=w, topk_ids=ids, router_logits=router_logits)
         ids, w = route_budget(router_logits.to(torch.bfloat16).contiguous(), self.k, self.guarantee(rows, steps), self.budget,
                               _SLOTS.to(torch.int32), steps, repeat=self.repeat, per_request=self.per_request,
                               min_cap=self.MIN_CAP)
