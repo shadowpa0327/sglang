@@ -40,6 +40,10 @@ arm_env() {  # the serve_nemotron.sh environment of an arm
     fastexactacc) echo "W3=1 SPEC=mtp MTP_STEPS=5 SSM=float16 SSM_SR=1 MOE=12:48:128 SGLANG_SHARAR_DRAFT_HEAD=w2" ;;
     fastrelax21) echo "W3=1 SPEC=mtp MTP_STEPS=5 SGLANG_DFLASH_RELAXED_TOP_K=2 SGLANG_DFLASH_RELAXED_MARGIN=1.0 SSM=float16 SSM_SR=1 MOE=12:48:128 SGLANG_SHARAR_DRAFT_HEAD=w2" ;;
     fastnoshare) echo "W3=1 SPEC=mtp MTP_STEPS=5 SGLANG_DFLASH_RELAXED_TOP_K=3 SGLANG_DFLASH_RELAXED_MARGIN=2.0 SSM=float16 SSM_SR=1 SGLANG_SHARAR_DRAFT_HEAD=w2" ;;
+    # fast with NVIDIA's LiLiCorr drafter (DFLASH, block 8) in place of MTP, relaxed 2:1.0 through the DFlash relaxed
+    # path; no 2-bit draft head (that is the MTP head's; LiLiCorr carries its own NVFP4 lm_head copy)
+    fastlili21) echo "W3=1 SPEC=lilicorr SGLANG_DFLASH_RELAXED_TOP_K=2 SGLANG_DFLASH_RELAXED_MARGIN=1.0 SSM=float16 SSM_SR=1 MOE=12:48:128" ;;
+    lili) echo "SPEC=lilicorr" ;;  # the NVFP4 checkpoint with the LiLiCorr drafter, exact verification
     fastshare16) echo "W3=1 SPEC=mtp MTP_STEPS=5 SGLANG_DFLASH_RELAXED_TOP_K=3 SGLANG_DFLASH_RELAXED_MARGIN=2.0 SSM=float16 SSM_SR=1 MOE=16:64:256 SGLANG_SHARAR_DRAFT_HEAD=w2" ;;
     *) echo "unknown arm $1" >&2; return 1 ;;
   esac

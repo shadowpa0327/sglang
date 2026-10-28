@@ -22,7 +22,10 @@ if [ "${W3:-0}" = 1 ]; then
 fi
 [ -n "${MOE:-}" ] && export SGLANG_SHARAR_MOE=$MOE
 TP=$(( $(echo $gpus | tr -cd , | wc -c) + 1 ))
-if [ "${SPEC:-none}" = mtp ]; then
+LILICORR=$H/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr/snapshots/292bf1efc06ba39567da7351f2ad7a522afa3959
+if [ "${SPEC:-none}" = lilicorr ]; then  # NVIDIA's LiLiCorr drafter (block 8: up to 7 drafts), served through SGLang's DFLASH path
+  SPEC_ARGS=(--speculative-algorithm DFLASH --speculative-draft-model-path "$LILICORR" --speculative-dflash-block-size ${BLOCK:-8})
+elif [ "${SPEC:-none}" = mtp ]; then
   SPEC_ARGS=(--speculative-algorithm NEXTN --speculative-draft-model-path "$TGT" --speculative-num-steps ${MTP_STEPS:-3}
              --speculative-eagle-topk 1 --speculative-num-draft-tokens $(( ${MTP_STEPS:-3} + 1 )))
 else
