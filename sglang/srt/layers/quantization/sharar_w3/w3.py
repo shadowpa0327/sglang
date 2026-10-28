@@ -309,18 +309,20 @@ def wide_for(n: int, k: int, m: int) -> tuple[int, int] | None:
     return 8144, splits
 
 
-# H100 (SM90) choices per (N, K) and row bucket, measured by the port's sweep (weights cycled through more than L2):
-# ["narrow", splits] or ["wide", config, splits]; a bucket covers the rows above the previous bucket up to itself.
-_H100: dict[str, dict[int, list]] = {
-    nk: {int(m): c for m, c in d.items()}
-    for nk, d in __import__("json").loads((Path(__file__).resolve().parent / "h100_tuning.json").read_text()).items()
+# Per-arch choices per (N, K) and row bucket, measured by the port's sweep (sharar_port/scripts/w3_tune_table.py,
+# weights cycled through more than L2): H100 (SM90) and B200/GB200 (SM100). ["narrow", splits] or
+# ["wide", config, splits]; a bucket covers the rows above the previous bucket up to itself. Other archs (GB10's
+# SM120/121) use SPLITS / WIDE.
+_TUNING_FILES = {9: "h100_tuning.json", 10: "sm100_tuning.json"}
+_TUNED: dict[int, dict[str, dict[int, list]]] = {
+    major: {nk: {int(m): c for m, c in d.items()} for nk, d in __import__("json").loads(path.read_text()).items()}
+    for major, name in _TUNING_FILES.items() if (path := Path(__file__).resolve().parent / name).exists()
 }
+_TUNED_SHAPES = list(_TUNED.get(9, {}))  # the shapes the port serves (27B and Flash-Next TP2), for re-sweeping
 
 
-def _h100_choice(n: int, k: int, m: int, device) -> list | None:
-    if torch.cuda.get_device_capability(device)[0] != 9:
-        return None
-    d = _H100.get(f"{n}x{k}")
+def _tuned_choice(n: int, k: int, m: int, device) -> list | None:
+    d = _TUNED.get(torch.cuda.get_device_capability(device)[0], {}).get(f"{n}x{k}")
     if d is None:
         return None
     for bucket in sorted(d):
@@ -365,7 +367,7 @@ def w3_linear(x: torch.Tensor, w3: W3Weight, x_scale: torch.Tensor | None = None
         x_q, scale = x, x_scale
     else:
         x_q, scale = quant_groups(x)
-    tuned = _h100_choice(n, k, m, x.device) if w3.bits == 3 and splits is None else None
+    tuned = _tuned_choice(n, k, m, x.device) if w3.bits == 3 and splits is None else None
     if tuned is not None:
         if tuned[0] == "narrow":
             splits = tuned[1]

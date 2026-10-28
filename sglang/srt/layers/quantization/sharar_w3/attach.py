@@ -381,7 +381,10 @@ class W3ExpertsForward(torch.nn.Module):
         self.w3 = experts
 
     def forward(self, hidden_states, topk_output, *args, **kwargs):
+        from sglang.srt.layers.moe.topk import TopKOutputFormat
         from sglang.srt.layers.quantization.sharar_w3.w3_moe import w3_moe
+        if topk_output.format == TopKOutputFormat.BYPASSED:  # SM100's flashinfer_trtllm runner routes in its kernel
+            topk_output = topk_output.to_standard()
         ids, w = topk_output.topk_ids, topk_output.topk_weights
         if hidden_states.shape[0] == 0:
             return hidden_states.clone()

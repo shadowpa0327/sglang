@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pyarrow.parquet as pq
 url, n, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 extra = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
-rows = pq.read_table(glob.glob("/data/ccchang/hf_home/hub/datasets--openai--gsm8k/snapshots/*/main/test-*.parquet")[0]).to_pylist()[:n]
+rows = pq.read_table(glob.glob(__import__("os").environ.get("HF_HUB", "/data/ccchang/hf_home/hub") + "/datasets--openai--gsm8k/snapshots/*/main/test-*.parquet")[0]).to_pylist()[:n]
 def num(s):
     m = re.findall(r"-?\d[\d,]*\.?\d*", s.replace("$", ""))
     return m[-1].replace(",", "").rstrip(".") if m else None

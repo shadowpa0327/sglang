@@ -1,4 +1,4 @@
-"""Relaxed greedy verification for DFLASH (research patch, not lossless).
+"""Relaxed greedy verification for DFLASH, and EAGLE / MTP chains (research patch, not lossless).
 
 A drafted token y at chain slot j is accepted when it equals the target argmax,
 or when the target ranks it within its top `k` and within `margin` logits of
@@ -203,6 +203,39 @@ def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, unif
     out["exact"] = exact
     out["relaxed"] = plausible & ~exact
     out["argmax"] = argmax
+
+
+_CHAIN_COUNTS = {"steps": 0, "relaxed": 0}
+
+
+def relax_chain_coins(rules, candidates: torch.Tensor, target_probs: torch.Tensor, coins: torch.Tensor,
+                      reqs=None) -> None:
+    """The sampled rule for an EAGLE / MTP chain (top-1 drafts) verified by the tree kernel with zero draft probs:
+    zero the coin of every plausible draft (coin j decides draft j+1, as in force_plausible_coins). Plausible: p_y > 0,
+    rank of y under the filtered target law below the row's top-k, log p_max - log p_y <= margin. No harm gates."""
+    gamma = candidates.shape[1] - 1
+    dev = candidates.device
+    ks = torch.tensor(rules[0], device=dev, dtype=torch.int64).unsqueeze(1)
+    ms = torch.tensor(rules[1], device=dev, dtype=torch.float32).unsqueeze(1)
+    p = target_probs[:, :gamma].float()
+    y = candidates[:, 1 : gamma + 1].long()
+    p_y = p.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+    p_max = p.max(-1).values
+    rank = (p > p_y.unsqueeze(-1)).sum(-1)
+    gap = torch.log(p_max.clamp_min(1e-30)) - torch.log(p_y.clamp_min(1e-30))
+    plausible = (p_y > 0) & (rank < ks) & (gap <= ms) & (ks > 1)
+    if reqs is not None:
+        top_ok = [bool((getattr(r.sampling_params, "custom_params", None) or {}).get("relax_top", True)) for r in reqs]
+        if not all(top_ok):
+            plausible = plausible & (torch.tensor(top_ok, device=dev).unsqueeze(1) | (rank > 0))
+    # the plausible drafts the ordinary test (coin < p_y) would have rejected: what relaxing adds
+    _CHAIN_COUNTS["relaxed"] += int((plausible & ~(coins[:, :gamma] < p_y)).sum())
+    _CHAIN_COUNTS["steps"] += candidates.shape[0]
+    coins[:, :gamma] = torch.where(plausible, torch.zeros_like(coins[:, :gamma]), coins[:, :gamma])
+
+
+def chain_counts() -> dict:
+    return dict(_CHAIN_COUNTS)
 
 
 def rule_key(rules, i: int) -> str:

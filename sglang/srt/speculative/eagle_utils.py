@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.speculative import dflash_relaxed  # research patch: relaxed MTP chains
+
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -816,6 +818,10 @@ def eagle_sample(
     ):
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        # Research patch: relaxed acceptance (DFlash's K:M rule) on MTP / EAGLE chains, greedy rows.
+        relax_rules = dflash_relaxed.request_rules(batch.reqs) if verify_input.tree_topk == 1 else None
+        if relax_rules is not None:
+            dflash_relaxed.apply_relaxed(target_predict, candidates, next_token_logits, relax_rules)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -967,6 +973,17 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
+        # Research patch: relaxed acceptance (DFlash's K:M rule) on MTP / EAGLE chains, sampled rows.
+        relax_rules = (
+            dflash_relaxed.request_rules(batch.reqs)
+            if verify_input.tree_topk == 1 and not use_rejection_sampling
+            else None
+        )
+        if relax_rules is not None:
+            dflash_relaxed.relax_chain_coins(relax_rules, candidates, target_probs, coins, batch.reqs)
+            counts = dflash_relaxed.chain_counts()
+            if counts["steps"] % 20000 < bs:
+                logger.info(f"MTP relaxed acceptance: {counts}")
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
