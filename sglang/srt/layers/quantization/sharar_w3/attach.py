@@ -581,7 +581,12 @@ class _ShortlistMethod:
         from sglang.srt.layers.quantization.sharar_w3 import w3
         weight = head.weight
         scale = getattr(head, "weight_scale", None)
-        n, k = weight.shape
+        n = head.num_embeddings_per_partition  # the head's rows (vocabulary, padded)
+        if weight.shape[0] != n:  # FP8 linear methods may keep the weight transposed, [K, N], after loading
+            if weight.shape[1] != n:
+                raise ValueError(f"draft head: weight {tuple(weight.shape)} does not hold {n} vocabulary rows")
+            weight = weight.T  # a [N, K] view; rows are gathered from it, never copied whole
+        k = weight.shape[1]
         codebook, fit = ("lloyd2", True) if fmt == "w2" else (None, False)
         chunk = 16384
         def read(r0, r1):
@@ -646,13 +651,15 @@ def install_draft_head(model) -> None:
     if fmt not in DRAFT_RESCORE:
         raise ValueError(f"SGLANG_SHARAR_DRAFT_HEAD must be fp8, w3 or w2, not {fmt!r}")
     head = model.lm_head
-    if head.weight.shape[0] < getattr(head, "org_vocab_size", head.weight.shape[0]):
+    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+    if get_tensor_model_parallel_world_size() > 1:
         raise ValueError("SGLANG_SHARAR_DRAFT_HEAD: a vocabulary-parallel head (TP > 1) is not ported")
     rescore = int(os.environ.get("SGLANG_SHARAR_DRAFT_HEAD_RESCORE", DRAFT_RESCORE[fmt]))
     model.lm_head = DraftShortlistHead(head, fmt, rescore)
     torch.cuda.empty_cache()
-    logger.info("sharar draft head: %s copy of the %s head %s, shortlist %d (%.3f GiB)", fmt, head.weight.dtype,
-                tuple(head.weight.shape), rescore, model.lm_head.quant_method.copy.bytes / 2**30)
+    m = model.lm_head.quant_method
+    logger.info("sharar draft head: %s copy of the %s head [%d, %d] (stored %s), shortlist %d (%.3f GiB)", fmt,
+                head.weight.dtype, m.weight.shape[0], m.weight.shape[1], tuple(head.weight.shape), rescore, m.copy.bytes / 2**30)
 
 
 # ------------------------------------------------------------------ calibration capture (re-fitting the 3-bit copies)
