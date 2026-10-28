@@ -3,6 +3,7 @@
 # the W3 kernel needs N and K multiples of 128, and TP2 splits the Mamba in_proj's 128-row dt segment to 64 a rank), smoke
 # prompts + GSM8K 100 greedy, then stopped. A configuration is space-separated env for serve_nemotron.sh, e.g. "PLAIN=1",
 # "W3=1" or "SPEC=mtp W3=1 MOE=4:12:64"; "-" leaves that GPU idle. Code: this worktree (PYTHONPATH_FORK).
+# PROBE=1: run nemotron_probe.py (thinking, 248K cap, top-k) instead of the smoke prompts and GSM8K.
 # Usage: sbatch nemotron_pair.sbatch "<config on GPU 0>" ["<GPU 1>" ["<GPU 2>" ["<GPU 3>"]]]
 #SBATCH -J nemo-pair
 #SBATCH -p beta
@@ -28,6 +29,10 @@ run_cfg() {  # run_cfg "<env>" <gpus> <port>
     kill -0 $pid 2>/dev/null || { echo "[$cfg] server died"; grep -v "Ignore import" $log | tail -40 | sed "s/^/[$cfg] /"; return 1; }
     sleep 15; done
   echo "[$(date -Is)] [$cfg] ready"
+  if [ "${PROBE:-0}" = 1 ]; then  # NVIDIA's eval settings instead of the smoke / GSM8K check
+    python -I $WT/sharar_port/scripts/nemotron_probe.py http://127.0.0.1:$port | sed "s/^/[$cfg] /"
+    kill -TERM -- -$pid 2>/dev/null; wait $pid 2>/dev/null; return
+  fi
   python -I $PORT_ROOT/scripts/smoke.py http://127.0.0.1:$port | cut -c1-300 | sed "s/^/[$cfg] /"
   python -I $PORT_ROOT/scripts/gsm8k_quick.py http://127.0.0.1:$port 100 $PORT_ROOT/results/gsm8k_$name.json | sed "s/^/[$cfg] /"
   grep -oE "accept len: [0-9.]+" $log | tail -2 | sed "s/^/[$cfg] /"
