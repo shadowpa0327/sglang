@@ -25,7 +25,9 @@ regeneration runs on shared servers need:
   tokens of room ends the conversation.
 - --effort-mix gives each conversation one reasoning effort (passed to the chat template
   as --effort-kwarg) drawn from the given shares, seeded by input line so resumes agree;
-  the output row records it as "reasoning_effort".
+  the output row records it as "reasoning_effort". An input row that already has a
+  "reasoning_effort" (prompt files rebuilt from a lock) keeps it. --effort-map renames
+  levels for a target whose template names them differently (e.g. xhigh=high).
 
 Sampling defaults (temperature 1.0, top-p 0.95, top-k 20) are what the Qwen3.8-Flash-Next
 data used. A draft should see the target's real serving distribution, so set them to the
@@ -277,9 +279,9 @@ def effort_for(args, idx):
 
 def work(args, servers, idx, row):
     out = None
-    effort = effort_for(args, idx)
-    if effort:
-        row["reasoning_effort"] = effort
+    effort = row.pop("reasoning_effort", None) or effort_for(args, idx)
+    if effort and args.reasoning == "save":
+        row["reasoning_effort"] = args.effort_map.get(effort, effort)
     for attempt in range(MAX_ATTEMPTS):
         addr = servers.pick()
         try:
@@ -329,6 +331,11 @@ def main():
         default="reasoning_effort",
         help="chat-template kwarg that takes the effort (default: reasoning_effort)",
     )
+    ap.add_argument(
+        "--effort-map",
+        default=None,
+        help="thinking only: rename effort levels for this target, e.g. xhigh=high,low=minimal",
+    )
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=20)
@@ -345,8 +352,8 @@ def main():
         help="only process input lines below this index",
     )
     a = ap.parse_args()
-    if (a.budget or a.effort_mix) and not a.thinking:
-        ap.error("--budget and --effort-mix need --thinking")
+    if (a.budget or a.effort_mix or a.effort_map) and not a.thinking:
+        ap.error("--budget, --effort-mix and --effort-map need --thinking")
     args = argparse.Namespace(
         model=a.model,
         reasoning="save" if a.thinking else "disable",
@@ -362,6 +369,9 @@ def main():
             [(k, float(v)) for k, v in (x.split(":") for x in a.effort_mix.split(","))]
             if a.effort_mix
             else None
+        ),
+        effort_map=(
+            dict(x.split("=") for x in a.effort_map.split(",")) if a.effort_map else {}
         ),
     )
     err_path = a.output.replace(".jsonl", "_error.jsonl")

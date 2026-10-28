@@ -161,6 +161,12 @@ truncated rows.
 Generation took about a day on three TP2 H100 servers (about 19.5K
 conversations, or 45-50M generated tokens, per hour at the tuned settings).
 
+Its exact prompts, in run order and with each conversation's effort, are pinned
+in `draft_data_regen/locks/qwen38-flash-next-think-stage1/` (eval-overlap prompts
+already removed). `download_prompt_sources.py --lock` rebuilds them, and the
+[reproduction recipe](REPRODUCE.md) takes another target through the
+same corpus.
+
 ### Qwen3.8-Flash-Next agent DSpark (32K)
 
 All OpenHands, SWE-agent and mini-SWE-agent sessions written by

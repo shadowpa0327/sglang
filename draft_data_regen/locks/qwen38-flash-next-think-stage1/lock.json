@@ -1,0 +1,74 @@
+{
+ "name": "qwen38-flash-next-think-stage1",
+ "description": "Prompts of the Qwen3.8-Flash-Next thinking stage-1 corpus (8K, 2026-10-20/21), in the order they were regenerated, with each conversation's reasoning effort. Prompts that overlap the eval sets are already removed.",
+ "sources": {
+  "perfectblend": {
+   "repo": "mlabonne/open-perfectblend",
+   "revision": "af60f3c18201652a83a93f46fcfee1b646ba3df7",
+   "order": "SpecForge prepare_data.py --dataset perfectblend --split-eval (95/5 split, seed 42), file order",
+   "prompts": 344928,
+   "effort": {
+    "xhigh": 106141,
+    "low": 135672,
+    "medium": 103115
+   },
+   "lines_covered_by_reference_run": 349575,
+   "removed_eval_overlap": 4647
+  },
+  "opencodeinstruct": {
+   "repo": "nvidia/OpenCodeInstruct",
+   "revision": "8f3ba5bafe4d6e8db46082cf7ae6741bc370604d",
+   "order": "random ~250K sample (seed 20261020), code-eval decontaminated, shuffled; file order",
+   "prompts": 120954,
+   "effort": {
+    "xhigh": 36037,
+    "low": 48081,
+    "medium": 36836
+   },
+   "lines_covered_by_reference_run": 121108,
+   "removed_eval_overlap": 154
+  },
+  "ultrachat": {
+   "repo": "HuggingFaceH4/ultrachat_200k",
+   "revision": "8049631c405ae6576f93f445c6b8166f76f5505a",
+   "order": "train_sft, shuffled, decontaminated; file order",
+   "prompts": 1089,
+   "effort": {
+    "xhigh": 1089
+   },
+   "lines_covered_by_reference_run": 1089,
+   "removed_eval_overlap": 0
+  }
+ },
+ "decontaminated_against": [
+  "deepseek-ai/DeepSpec@005e03b eval_datasets/*.jsonl",
+  "HumanEval, MBPP (full) and LiveCodeBench prompts"
+ ],
+ "regeneration": {
+  "thinking": true,
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "budget_tokens_per_turn": 8192,
+  "max_tokens_per_answer": 16384,
+  "effort": "per conversation from the lock (reasoning_effort); shares low/medium/xhigh = 0.4/0.3/0.3 plus 3,818 PerfectBlend and all 1,089 UltraChat conversations at the template default (xhigh)",
+  "history": "earlier answers sent without their reasoning"
+ },
+ "build": {
+  "rows": "one per assistant turn, history as the server saw it",
+  "budget": 8192,
+  "loop_filter": "zlib ratio of the last 4,000 characters < 0.10",
+  "train": {
+   "is_preformatted": true,
+   "train_only_last_turn": true,
+   "max_length": 8192
+  }
+ },
+ "reference_result_qwen38_flash_next": {
+  "conversations": 470624,
+  "rows": 556511,
+  "tokens": 1287999321,
+  "loss_tokens": 1008216423,
+  "truncated_rows": 57562
+ }
+}

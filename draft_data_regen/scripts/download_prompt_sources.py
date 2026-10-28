@@ -15,6 +15,11 @@ each source contains.
         --decontaminate-against ./eval_datasets \
         --output-dir ./cache/dataset/prompts
 
+    # exactly the prompts (order, reasoning effort) of a reference run, from its lock
+    python draft_data_regen/scripts/download_prompt_sources.py \
+        --lock draft_data_regen/locks/qwen38-flash-next-think-stage1 \
+        --output-dir ./cache/dataset/prompts
+
     # raw Open-SWE-Traces sessions written by one trajectory model (used as is)
     python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next \
         --output-dir ./cache/dataset/prompts
@@ -33,11 +38,17 @@ sequence with any string in the --decontaminate-against files.
 <output-dir>/manifest.json records, per source, the dataset revision that was
 read, the row counts and the drop reasons. Pass it back with --revisions-from to
 download exactly the same revisions again.
+
+--lock DIR rebuilds a reference run's prompt files instead: DIR/lock.json pins each
+source's dataset revision and DIR/prompts.jsonl.gz lists (source, id,
+reasoning_effort) in run order. The rows come out in that order with their
+"reasoning_effort", which regen_driver.py uses as is; nothing is sampled or filtered.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -138,6 +149,7 @@ SOURCES: dict[str, dict[str, Any]] = {
         repo="mlabonne/open-perfectblend",
         load={"split": "train"},
         conv=conv_sharegpt,
+        id_from="index",
         license="Apache-2.0",
         rows="1.42M",
         desc="General chat, math, code and instruction following (PerfectBlend mix); 14% multi-turn",
@@ -146,6 +158,7 @@ SOURCES: dict[str, dict[str, Any]] = {
         repo="HuggingFaceH4/ultrachat_200k",
         load={"split": "train_sft"},
         conv=conv_messages,
+        id_from="prompt_id",
         license="MIT",
         rows="208K",
         desc="Multi-turn assistant chat (3-4 user turns typical)",
@@ -154,6 +167,7 @@ SOURCES: dict[str, dict[str, Any]] = {
         repo="nvidia/OpenCodeInstruct",
         load={"split": "train"},
         conv=conv_opencodeinstruct,
+        id_from="id",
         license="CC-BY-4.0",
         rows="5.0M",
         desc="Single-turn coding tasks (mostly Python), synthetic",
@@ -496,6 +510,86 @@ def build_source(
     return stats
 
 
+def row_positions(key: str, rows) -> dict[str, int]:
+    """Row index of every id the source's converter writes (without the source prefix)."""
+    spec = SOURCES[key]
+    col = spec.get("id_from")
+    if col == "index":
+        return {str(i): i for i in range(len(rows))}
+    if col and hasattr(rows, "select"):
+        return {str(v): i for i, v in enumerate(rows[col])}
+    return {
+        str(spec["conv"](raw, i)[0]): i
+        for i, raw in iterate(rows, list(range(len(rows))))
+    }
+
+
+def build_from_lock(lock_dir: Path, out_dir: Path, overwrite: bool) -> dict[str, Any]:
+    """Rebuild the exact prompt files of a reference run: the lock lists (source, id,
+    reasoning_effort) in run order and pins each source's dataset revision."""
+    lock = json.load(open(lock_dir / "lock.json"))
+    items: dict[str, list[tuple[str, str | None]]] = {}
+    with gzip.open(lock_dir / "prompts.jsonl.gz", "rt", encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            items.setdefault(r["source"], []).append(
+                (r["id"], r.get("reasoning_effort"))
+            )
+    manifest = {"lock": lock["name"]}
+    for key, wanted in items.items():
+        out_path = out_dir / f"{key}_prompts.jsonl"
+        src = lock["sources"][key]
+        if out_path.exists() and not overwrite:
+            print(f"{key}: {out_path} exists; skipping (use --overwrite to rebuild)")
+            continue
+        t0 = time.time()
+        rows = load_rows(SOURCES[key], src["revision"])
+        pos = row_positions(key, rows)
+        missing = [rid for rid, _ in wanted if rid not in pos]
+        if missing:
+            raise SystemExit(
+                f"{key}: {len(missing)} locked ids not in {src['repo']}@{src['revision']}, "
+                f"e.g. {missing[:3]}"
+            )
+        order = [pos[rid] for rid, _ in wanted]
+        kept, drops = 0, Counter()
+        tmp = out_path.with_suffix(".jsonl.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for (rid, effort), (i, raw) in zip(wanted, iterate(rows, order)):
+                _, msgs, extra = SOURCES[key]["conv"](raw, i)
+                msgs = normalize(msgs) if msgs is not None else None
+                bad = (
+                    validate_conversation(msgs, error_style="regeneration")
+                    if msgs
+                    else "missing prompt text"
+                )
+                if bad:
+                    drops[bad] += 1
+                    continue
+                row = {"id": f"{key}-{rid}", "source": key, "conversations": msgs}
+                if effort:
+                    row["reasoning_effort"] = effort
+                if extra.get("language"):
+                    row["language"] = extra["language"]
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                kept += 1
+        os.replace(tmp, out_path)
+        manifest[key] = {
+            "repo": src["repo"],
+            "revision": src["revision"],
+            "locked": len(wanted),
+            "kept": kept,
+            "dropped": dict(drops),
+            "output": str(out_path),
+            "seconds": round(time.time() - t0),
+        }
+        print(
+            f"{key}: {kept} of {len(wanted)} locked prompts ({dict(drops)}) -> {out_path}",
+            flush=True,
+        )
+    return manifest
+
+
 def download_swe_traces(
     models: list[str], out_dir: Path, pinned: dict[str, str]
 ) -> dict[str, Any]:
@@ -565,13 +659,25 @@ def main(argv=None):
         help="manifest.json of an earlier download to pin revisions",
     )
     ap.add_argument(
+        "--lock",
+        type=Path,
+        help="rebuild a reference run's exact prompt files from a lock directory "
+        "(lock.json + prompts.jsonl.gz); --sources, --sample and decontamination are ignored",
+    )
+    ap.add_argument(
         "--overwrite",
         action="store_true",
         help="rebuild sources whose output already exists",
     )
     a = ap.parse_args(argv)
 
-    if a.list or not (a.sources or a.swe_traces):
+    if a.lock:
+        a.output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = build_from_lock(a.lock, a.output_dir, a.overwrite)
+        json.dump(manifest, open(a.output_dir / "manifest.json", "w"), indent=1)
+        if not a.swe_traces:
+            return
+    if a.list or not (a.sources or a.swe_traces or a.lock):
         print(f"{'source':<20} {'rows':<30} {'license':<22} repo / contents")
         for k, s in SOURCES.items():
             print(

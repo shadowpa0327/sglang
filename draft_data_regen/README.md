@@ -9,6 +9,11 @@ tokens of agent sessions); every rule below comes from something that went
 wrong or mattered there. [PROMPT_SOURCES.md](PROMPT_SOURCES.md) describes the
 complete corpus and the commands that rebuild it.
 
+**To build exactly the Qwen3.8-Flash-Next corpus for another target** (the same
+prompts, efforts and settings), follow the shorter
+[reproduction recipe](REPRODUCE.md). It starts from a prompt lock, so
+steps 2 and 4 below need no sampling choices.
+
 Pipeline and tools:
 
 | Step | Tool | Output |
@@ -28,6 +33,8 @@ The prompt sources themselves are described in
 
 | File | What it does |
 | --- | --- |
+| `draft_data_regen/REPRODUCE.md` | the one-page recipe: the Qwen3.8-Flash-Next corpus for another target, from the lock |
+| `draft_data_regen/locks/qwen38-flash-next-think-stage1/` | that corpus's prompts in run order with their reasoning effort, and the pinned dataset revisions |
 | `draft_data_regen/scripts/download_prompt_sources.py` | downloads chat prompt sources from Hugging Face as regeneration input (sampling, dedup, decontamination, pinned revisions) and raw Open-SWE-Traces agent sessions |
 | `draft_data_regen/scripts/regen_driver.py` | resumable multi-server regeneration with thinking budgets and reasoning-effort mixes |
 | `draft_data_regen/scripts/build_regen_training_rows.py` | one preformatted last-turn-loss training row per regenerated answer, rendered with the target's template |
@@ -121,7 +128,7 @@ add replicas (more servers) for throughput; the driver balances across them.
 CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
     --model-path $TARGET --tp-size 2 --host 127.0.0.1 --port 31000 \
     --context-length 32768 --mem-fraction-static 0.88 \
-    --max-running-requests 256 --cuda-graph-max-bs 256 \
+    --max-running-requests 256 --cuda-graph-max-bs-decode 256 \
     --reasoning-parser <parser> \
     > logs/regen_server_31000.log 2>&1 &
 curl --fail http://127.0.0.1:31000/health
@@ -129,7 +136,8 @@ curl --fail http://127.0.0.1:31000/health
 
 Tune before the long run. Generation throughput is bound by how many requests
 decode at once, so the main lever is concurrency: raise `--max-running-requests`
-(and the CUDA-graph batch size with it) until memory or the KV cache stops you.
+(and the CUDA-graph batch size with it; `--cuda-graph-max-bs` on older SGLang)
+until memory or the KV cache stops you.
 Measure each candidate for about 5 minutes under the real driver load, reading
 the server log's `gen throughput (token/s)` and `#running-req` lines. Keep the
 prefix cache on (the default) for multi-turn data.

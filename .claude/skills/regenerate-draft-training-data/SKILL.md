@@ -5,6 +5,11 @@ description: Produce on-policy training data for a speculative-decoding draft (E
 
 # Regenerate draft training data
 
+**Same corpus for another target** (the Qwen3.8-Flash-Next prompts, efforts
+and settings): follow `draft_data_regen/REPRODUCE.md`
+step by step. It rebuilds the prompts from the lock in
+`draft_data_regen/locks/qwen38-flash-next-think-stage1/`; do not sample new ones.
+
 Full runbook: `draft_data_regen/README.md`. Prompt
 source catalog and reference blends: `draft_data_regen/PROMPT_SOURCES.md`.
 Read the runbook before starting; this file is the checklist. The complete corpus
