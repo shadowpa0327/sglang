@@ -43,6 +43,10 @@ as recorded) and the commands that rebuild it are in the source catalog.
    `draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model>`, then
    `draft_data_regen/scripts/build_swe_trace_rows.py --data-dir <dir>/open_swe_traces --model <model>
    --tokenizer <target> --out-dir <dir> --max-tokens 32768 --verify-chat-template <name>`.
+   Low/medium-effort sessions (`thinking-*/` folders) are rendered at their
+   effort; `--efforts default` keeps xhigh only. For our exact agent rows, add
+   `--revisions-from <lock>/lock.json` to the download and pass
+   `--harnesses openhands sweagent minisweagent` in that order.
 9. **Hand off** the training fields: chat rows `is_preformatted: true`,
    `train_only_last_turn: true`, `chat_template: <verified>`,
    `max_length: <budget>`; agent rows the same with `train_only_last_turn: false`

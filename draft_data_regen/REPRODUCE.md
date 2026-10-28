@@ -7,6 +7,13 @@ conversation's reasoning effort, sampling, the 8K token budget, the filters and
 the training settings. Follow the steps in order, and check each one against
 its expected numbers before moving on.
 
+To regenerate for **Qwen3.8-Flash-Next itself**, use the middle column of the
+table below as is, and the exact server command in step 2. The answers are
+sampled at temperature 1.0, so a rerun matches our corpus in its prompts,
+efforts, settings and statistics, but not token for token. The agent rows in
+step 5 are recorded sessions, so they come out identical to ours. To give
+someone our exact chat answers, share the regenerated files themselves.
+
 Background for each choice is in the [runbook](README.md)
 and the [prompt source catalog](PROMPT_SOURCES.md). You do not need them to run
 this recipe.
@@ -79,9 +86,23 @@ python -m sglang.launch_server --model-path $TARGET --tp-size <N> --port 31000 \
     --max-running-requests 256 --cuda-graph-max-bs-decode 256 --mem-fraction-static 0.88
 ```
 
-On H100, Qwen3.8-Flash-Next also used `--dtype bfloat16 --attention-backend fa3
---mamba-ssm-dtype bfloat16 --disable-radix-cache`. Older SGLang spells the
-graph flag `--cuda-graph-max-bs`. Measure `gen throughput` in the server log
+Qwen3.8-Flash-Next on H100 needs SGLang 0.5.21 or later, the first release
+with its `qwen4_exp` architecture. This is the exact command we ran, one server
+per GPU pair (we ran three):
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1 \
+python -m sglang.launch_server --model-path nvidia/Qwen3.8-Flash-Next-NVFP4 --tp-size 2 \
+    --dtype bfloat16 --attention-backend fa3 --enforce-disable-flashinfer-allreduce-fusion \
+    --mamba-ssm-dtype bfloat16 --disable-radix-cache --context-length 32768 \
+    --mem-fraction-static 0.88 --max-running-requests 256 --cuda-graph-max-bs-decode 256 \
+    --reasoning-parser qwen3 --host 127.0.0.1 --port 31000
+```
+
+On H100 its NVFP4 experts run through the Marlin W4A16 fallback. Keep the PLE
+embedding table in host memory, which is the default; `--no-ple-offload-embedding`
+runs out of memory at TP2. Older SGLang spells the graph flag
+`--cuda-graph-max-bs`. Measure `gen throughput` in the server log
 for about 5 minutes per setting. For Qwen3.8-Flash-Next, raising
 `--max-running-requests` from 96 to 256 lifted it from 3,136 to 4,306 tokens
 per second. Keep the driver's `--concurrency` equal to that setting.
@@ -136,16 +157,29 @@ exactly on them; its counts depend on how long it writes.
 that wrote them. We trained on the same three harnesses as below:
 
 ```bash
-python draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model dir> --output-dir $WORK/prompts
+python draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model dir> --output-dir $WORK/prompts \
+    --revisions-from $LOCK/lock.json
 python draft_data_regen/scripts/build_swe_trace_rows.py --data-dir $WORK/prompts/open_swe_traces \
-    --model <model dir> --harnesses minisweagent openhands sweagent \
+    --model <model dir> --harnesses openhands sweagent minisweagent \
     --tokenizer $TARGET --out-dir $WORK/agent_32k --max-tokens 32768 \
     --verify-chat-template <template>
 ```
 
-For Qwen3.8-Flash-Next this gave 95,596 training rows (2.90B tokens) and 300
-held-out eval sessions. Leave out `--harnesses` to add the Claude Code and
-OpenCode sessions released later.
+- `--revisions-from $LOCK/lock.json` pins Open-SWE-Traces to the version we
+  used (`1db6741`, 10.8 GB). For Qwen3.8-Flash-Next it holds xhigh-effort
+  sessions from these three harnesses only.
+- Keep the harnesses in this order. It decides which held-out sessions become
+  the eval set.
+- For Qwen3.8-Flash-Next this gives our rows exactly: 95,596 training rows
+  (2.90B tokens) and the same 300 eval sessions. We checked this on a
+  1,200-row sample.
+- Without the pin you get the current dataset. Since 2026-10-27 it holds
+  489,109 Qwen3.8-Flash-Next sessions: Claude Code and OpenCode were added, and
+  every harness also has low- and medium-effort sessions in `thinking-low/`
+  and `thinking-medium/`. The builder renders each session at its own effort,
+  and `--efforts default` keeps only the xhigh ones. All of them come to about
+  15B tokens at 32K, or about 55 GB of rows.
+- For another target, drop `--revisions-from` to get its latest sessions.
 
 ## 6. Train
 
@@ -166,8 +200,11 @@ Our stage 1 was a DSpark draft with these settings:
 - LR 6e-4 on a cosine schedule with 4% warmup;
 - `loss_decay_gamma` 7.
 
-The full recipe is SpecForge's
+Our SpecForge config for this stage is
 `examples/configs/online/disaggregated/managed-local/qwen3.8-flash-next-nvfp4-dspark-h100-1server-dp2-think8k-stage1.yaml`.
+It is in our SpecForge working tree and not upstream yet. It also needs the
+draft config `configs/qwen3.8-flash-next-dspark-b15.json` and the SGLang 0.5.21
+capture patch `patches/sglang/v0.5.21/`, both from the same tree.
 
 Agent rows (step 5) are a separate stage with `train_only_last_turn: false`
 and `max_length: 32768`. SpecForge sets that flag once per run, so the two
@@ -191,6 +228,9 @@ kinds of rows cannot share a run.
   the 8K budget on these too, so their long answers are kept as truncated.
 - Eval-overlap prompts were regenerated and then dropped at build time. The
   lock leaves them out up front.
+- The early part of the run, before 2026-10-20 23:08 UTC, kept the SSM state
+  in fp32 and ran 96 to 192 requests per server. The step 2 command, with a
+  bf16 state, is how the model is served.
 
 ## Target without thinking
 

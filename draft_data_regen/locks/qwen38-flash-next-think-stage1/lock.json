@@ -70,5 +70,10 @@
   "tokens": 1287999321,
   "loss_tokens": 1008216423,
   "truncated_rows": 57562
+ },
+ "open-swe-traces": {
+  "repo": "nvidia/Open-SWE-Traces",
+  "revision": "1db674173119d71df45c22007af99e214600711a",
+  "note": "agent sessions of the reference agent run: qwen38_flash_next, xhigh effort, harnesses openhands, sweagent, minisweagent (in that order for build_swe_trace_rows.py --harnesses); 97,292 sessions -> 95,596 training rows at 32K and 300 eval sessions. Later revisions add Claude Code, OpenCode and low/medium-effort sessions."
  }
 }

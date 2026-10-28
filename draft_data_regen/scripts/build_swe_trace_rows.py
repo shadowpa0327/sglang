@@ -19,11 +19,17 @@ kept, so one row trains every assistant turn: train it with
     data.train_only_last_turn: false
     data.max_length: <--max-tokens>
 
+Sessions recorded at a lower reasoning effort sit in thinking-<effort>/ subdirectories (the
+top-level files are the template's default, xhigh). Their system prompts do not carry the
+effort, so each session is rendered with its effort passed as --effort-kwarg, exactly as the
+model saw it; --efforts selects which to keep.
+
 A session longer than --max-tokens is cut at the last end of turn that fits (the end-of-turn
 marker is read off the template). Sessions on repositories whose name hashes into the
 held-out bucket (1 in --heldout-mod, about 2%) go only to eval.jsonl, so agent evals never
 see a training repository. Output: <out-dir>/train.jsonl, eval.jsonl
-({"id", "text", "source", "harness", "repo", "language", "tokens"}, shuffled), stats.json.
+({"id", "text", "source", "harness", "effort", "repo", "language", "tokens"}, shuffled),
+stats.json.
 """
 
 import argparse
@@ -64,8 +70,19 @@ def held_out(repo):
     return int(hashlib.sha1(repo.encode()).hexdigest(), 16) % ARGS.heldout_mod == 0
 
 
+def file_effort(path):
+    """Effort a parquet file was recorded at: thinking-<effort>/ subdirectory, else default."""
+    parent = Path(path).parent.name
+    return (
+        parent.removeprefix("thinking-")
+        if parent.startswith("thinking-")
+        else "default"
+    )
+
+
 def render(row):
     tools = [json.loads(t) if isinstance(t, str) else t for t in (row["tools"] or [])]
+    kw = {} if row["_effort"] == "default" else {ARGS.effort_kwarg: row["_effort"]}
     msgs = []
     for m in row["messages"]:
         m = {k: v for k, v in m.items() if v is not None}
@@ -78,7 +95,7 @@ def render(row):
                     pass
         msgs.append(m)
     try:
-        text = tok.apply_chat_template(msgs, tools=tools or None, tokenize=False)
+        text = tok.apply_chat_template(msgs, tools=tools or None, tokenize=False, **kw)
     except Exception as e:  # noqa: BLE001
         return None, f"render: {type(e).__name__}"
     head = text[: ARGS.max_tokens * 8]
@@ -95,7 +112,11 @@ def render(row):
     if first is None:
         return None, "no assistant turn"
     prompt = tok.apply_chat_template(
-        msgs[:first], tools=tools or None, tokenize=False, add_generation_prompt=True
+        msgs[:first],
+        tools=tools or None,
+        tokenize=False,
+        add_generation_prompt=True,
+        **kw,
     )
     if len(text) <= len(prompt):
         return None, "no assistant turn within limit"
@@ -104,6 +125,7 @@ def render(row):
         "text": text,
         "source": "open-swe-traces",
         "harness": row["_harness"],
+        "effort": row["_effort"],
         "repo": row["repo"],
         "language": row["language"],
         "tokens": n,
@@ -162,6 +184,18 @@ def main():
         default=None,
         help="default: every harness that has sessions of --model",
     )
+    ap.add_argument(
+        "--efforts",
+        nargs="*",
+        default=None,
+        help="keep only these efforts: default (top-level files, xhigh), low, medium "
+        "(default: all)",
+    )
+    ap.add_argument(
+        "--effort-kwarg",
+        default="reasoning_effort",
+        help="chat-template kwarg that takes the effort",
+    )
     ap.add_argument("--tokenizer", required=True, help="target model path or HF id")
     ap.add_argument("--out-dir", required=True, type=Path)
     ap.add_argument("--max-tokens", type=int, default=32768)
@@ -197,12 +231,18 @@ def main():
     )
     for harness in harnesses:
         files = sorted(
-            glob.glob(f"{base}/{harness}/{ARGS.model}/**/*.parquet", recursive=True)
+            f
+            for f in glob.glob(
+                f"{base}/{harness}/{ARGS.model}/**/*.parquet", recursive=True
+            )
+            if ARGS.efforts is None or file_effort(f) in ARGS.efforts
         )
-        rows = []
+        rows, efforts = [], {}
         for f in files:
             for r in pq.read_table(f, columns=COLUMNS).to_pylist():
                 r["_harness"] = harness
+                r["_effort"] = file_effort(f)
+                efforts[r["_effort"]] = efforts.get(r["_effort"], 0) + 1
                 rows.append(r)
         rng.shuffle(rows)
         tr = [r for r in rows if not held_out(r["repo"])]
@@ -211,11 +251,13 @@ def main():
         stats["harnesses"][harness] = {
             "sessions": len(rows),
             "files": len(files),
+            "efforts": efforts,
             "train": len(tr),
             "eval": len(ev),
         }
         print(
-            f"{harness}: {len(rows)} sessions in {len(files)} files; train {len(tr)}, eval {len(ev)}",
+            f"{harness}: {len(rows)} sessions in {len(files)} files {efforts}; "
+            f"train {len(tr)}, eval {len(ev)}",
             flush=True,
         )
         train += tr

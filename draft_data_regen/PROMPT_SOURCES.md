@@ -27,7 +27,7 @@ wrote.
 | General chat | PerfectBlend | 1.42M prompts | 348,841 thinking and 401,379 non-thinking regenerations | 8K rows, last-turn loss |
 | Multi-turn chat | UltraChat | 208K conversations, 3.2 user turns on average | 918 thinking and 78,308 non-thinking regenerations | 8K rows, last-turn loss |
 | Code | OpenCodeInstruct | 5.0M prompts (250K sampled) | 120,865 thinking regenerations | 8K rows, last-turn loss |
-| Coding agent | Open-SWE-Traces v2.0, Qwen3.8-Flash-Next sessions | 168,824 sessions in 5 harnesses | 97,292 sessions in 3 harnesses: 95,596 training rows (2.90B tokens at 32K) and 300 held-out eval sessions | 32K-64K rows, every assistant turn |
+| Coding agent | Open-SWE-Traces v2.0, Qwen3.8-Flash-Next sessions | 489,109 sessions: 5 harnesses at 3 reasoning efforts (168,824 xhigh, 151,689 medium, 168,596 low) | 97,292 xhigh sessions in 3 harnesses: 95,596 training rows (2.90B tokens at 32K) and 300 held-out eval sessions | 32K-64K rows, every assistant turn |
 
 What completing it costs, at the throughput of three TP2 H100 servers (about
 45-50M generated tokens per hour, thinking on, 8K per turn):
@@ -37,7 +37,7 @@ What completing it costs, at the throughput of three TP2 H100 servers (about
 | UltraChat, all 208K conversations (about 4K tokens each) | about 0.85B | about 18 h |
 | OpenCodeInstruct, the other ~126K of the 250K sample | about 0.35B | about 7 h |
 | PerfectBlend, the other ~1M prompts (optional; the blend stopped at 1B tokens by design) | about 2B | about 40 h |
-| Open-SWE-Traces Claude Code and OpenCode sessions (71,532) | none: download 37 GB, convert on CPU | about 1 h |
+| Open-SWE-Traces sessions not used yet: Claude Code and OpenCode at xhigh (71,532), and every low- and medium-effort session (320,285) | none: download 37.1 GB, convert on CPU (about 15B tokens, 55 GB of rows at 32K) | about 5 h |
 
 Coverage gaps worth closing for a general-purpose draft (see the DaoCloud blend
 below): multilingual (`aya`) and instruction following (`nemotron-if`,
@@ -209,20 +209,37 @@ SWE-rebench-V2 tasks.
 
 | Config | Trajectory model (`--swe-traces` name) | Sessions | Size |
 | --- | --- | --- | --- |
-| `v2.0` (default) | Qwen3.8-Flash-Next (`qwen38_flash_next`) | 168,824 | 37.1 GB |
+| `v2.0` (default) | Qwen3.8-Flash-Next (`qwen38_flash_next`) | 489,109 (168,824 xhigh, 151,689 medium, 168,596 low) | 37.1 GB |
 | `v1.2` | Qwen3.8-27B (`qwen38_27b`) | 235,396 | 30.4 GB |
 | `v1.1` | Qwen3.6-27B (`qwen36_27b`), DeepSeek-V4-Flash-0731 (`deepseek_v4_flash_0731`) | 212,931, 50,295 | 13.7 GB, 3.7 GB |
 | `v1.0` | MiniMax-M2.5 (`minimax_m25`), Qwen3.5-122B (`qwen35_122b`) | 90,422, 60,797 | 7.3 GB, 5.7 GB |
 
-Qwen3.8-Flash-Next sessions by harness:
+Qwen3.8-Flash-Next sessions by harness and reasoning effort (2026-10-27
+revision `9b073ef`):
 
-| Harness | Sessions | In our 32K agent run |
-| --- | --- | --- |
-| Claude Code | 34,934 | no (released after the run) |
-| OpenCode | 36,598 | no (released after the run) |
-| OpenHands | 26,027 | yes |
-| SWE-agent | 34,688 | yes |
-| mini-SWE-agent | 36,577 | yes |
+| Harness (directory) | xhigh | medium | low | In our 32K agent run |
+| --- | --- | --- | --- | --- |
+| Claude Code (`claudecode`) | 34,934 | 30,356 | 34,075 | no (released after the run) |
+| OpenCode (`opencode`) | 36,598 | 31,490 | 33,071 | no (released after the run) |
+| OpenHands (`openhands`) | 26,027 | 25,898 | 30,367 | xhigh only |
+| SWE-agent (`sweagent`) | 34,688 | 33,849 | 35,045 | xhigh only |
+| mini-SWE-agent (`minisweagent`) | 36,577 | 30,096 | 36,038 | xhigh only |
+
+The xhigh sessions are the top-level files of each task folder (`scale-swe/`,
+`swe-rebench-v2/`), and the others sit in `thinking-low/` and
+`thinking-medium/` below them. The card's tables count only xhigh. A session's
+system prompt does not record its effort, but the template renders effort into
+it ("Reasoning effort is set to low..."; nothing for medium), so
+`build_swe_trace_rows.py` renders each session at the effort of its folder.
+Rendering a low-effort session without its effort would train the draft on a
+prompt the model never saw. `--efforts default low medium` picks which to keep.
+The low and medium sessions match the effort mix of the chat data.
+
+Our agent run used revision `1db6741` (2026-10-20). For Qwen3.8-Flash-Next it
+holds only the xhigh OpenHands, SWE-agent and mini-SWE-agent sessions. The lock
+in `draft_data_regen/locks/qwen38-flash-next-think-stage1/lock.json` pins it, so
+`--revisions-from` that file reproduces the run (see the
+[reproduction recipe](REPRODUCE.md)).
 
 **Use them as recorded, and only for their own model.** The tool results were
 produced by the original model's actions, so replacing its turns would

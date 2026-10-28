@@ -140,7 +140,9 @@ decode at once, so the main lever is concurrency: raise `--max-running-requests`
 until memory or the KV cache stops you.
 Measure each candidate for about 5 minutes under the real driver load, reading
 the server log's `gen throughput (token/s)` and `#running-req` lines. Keep the
-prefix cache on (the default) for multi-turn data.
+prefix cache on (the default) for multi-turn data. Prefix caching does not
+change the answers. Qwen3.8-Flash-Next ran with `--disable-radix-cache`, a
+setting it inherited from its capture-server setup.
 
 Measured on Qwen3.8-Flash-Next NVFP4, TP2 on H100 (hybrid linear-attention
 model):
@@ -222,10 +224,11 @@ the template choice before training.
 ## 7. Add the target's agent sessions
 
 `nvidia/Open-SWE-Traces` publishes coding-agent sessions (tools, tool results,
-every turn's reasoning) written by several models; for Qwen3.8-Flash-Next,
-168,824 sessions across Claude Code, OpenCode, OpenHands, SWE-agent and
-mini-SWE-agent. They are not regenerated (tool results follow the original
-model's actions), so use them only when the trajectory model is your target:
+every turn's reasoning) written by several models. For Qwen3.8-Flash-Next it
+has 489,109 sessions across Claude Code, OpenCode, OpenHands, SWE-agent and
+mini-SWE-agent, at xhigh, medium and low reasoning effort. They are not
+regenerated, because the tool results follow the original model's actions.
+Use them only when the trajectory model is your target:
 
 ```bash
 python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir /data/prompts
@@ -237,7 +240,12 @@ python draft_data_regen/scripts/build_swe_trace_rows.py --data-dir /data/prompts
 Each session becomes one row cut at the last end of turn within
 `--max-tokens`, trained on every assistant turn; sessions on 1 in 50
 repositories go only to `eval.jsonl`, so agent evals never see a training
-repository. `--verify-chat-template` must report no rows without loss (about a
+repository. Sessions in `thinking-low/` and `thinking-medium/` folders are
+rendered with that effort, because their system prompts do not record it;
+`--efforts` selects which efforts to keep. To rebuild our exact agent rows,
+pin the dataset revision and keep our harness order, as the
+[reproduction recipe](REPRODUCE.md) shows.
+`--verify-chat-template` must report no rows without loss (about a
 third of an agent row is assistant tokens; the rest is tool output). If the
 target has no published sessions, the alternative is fresh rollouts with the
 target in sandboxed harnesses, which is outside these tools.

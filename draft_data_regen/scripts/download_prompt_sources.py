@@ -242,7 +242,7 @@ SOURCES: dict[str, dict[str, Any]] = {
 SWE_TRACES_REPO = "nvidia/Open-SWE-Traces"
 # trajectory model directory -> (dataset config, sessions)
 SWE_TRACE_MODELS = {
-    "qwen38_flash_next": ("v2.0", 168824),
+    "qwen38_flash_next": ("v2.0", 489109),  # xhigh 168,824, medium 151,689, low 168,596
     "qwen38_27b": ("v1.2", 235396),
     "qwen36_27b": ("v1.1", 212931),
     "deepseek_v4_flash_0731": ("v1.1", 50295),
