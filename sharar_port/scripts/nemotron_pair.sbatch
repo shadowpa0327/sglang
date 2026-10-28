@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Two Nemotron-3.5-Super configurations side by side on one beta node (priority QoS, 4 GPUs): each on its own GPU pair
-# (TP2), smoke prompts + GSM8K 100 greedy, then stopped. A configuration is space-separated env for serve_nemotron.sh,
-# e.g. "W3=1" or "SPEC=mtp W3=1 MOE=4:12:64"; "-" leaves that pair idle. Code: this worktree (PYTHONPATH_FORK).
-# Usage: sbatch nemotron_pair.sbatch "<config on GPUs 0,1>" "<config on GPUs 2,3>"
+# Up to four Nemotron-3.5-Super configurations side by side on one beta node (priority QoS, 4 GPUs), one GPU each (TP1:
+# the W3 kernel needs N and K multiples of 128, and TP2 splits the Mamba in_proj's 128-row dt segment to 64 a rank), smoke
+# prompts + GSM8K 100 greedy, then stopped. A configuration is space-separated env for serve_nemotron.sh, e.g. "PLAIN=1",
+# "W3=1" or "SPEC=mtp W3=1 MOE=4:12:64"; "-" leaves that GPU idle. Code: this worktree (PYTHONPATH_FORK).
+# Usage: sbatch nemotron_pair.sbatch "<config on GPU 0>" ["<GPU 1>" ["<GPU 2>" ["<GPU 3>"]]]
 #SBATCH -J nemo-pair
 #SBATCH -p beta
 #SBATCH --qos=priority
@@ -18,7 +19,7 @@ export PYTHONPATH_FORK=$WT SGLANG_SHARAR_W3_CHECK=${SGLANG_SHARAR_W3_CHECK:-1}
 
 run_cfg() {  # run_cfg "<env>" <gpus> <port>
   local cfg=$1 gpus=$2 port=$3 name pid
-  name=nemotron-$(echo "${cfg:-plain}" | tr ' =:' '_-.')-$SLURM_JOB_ID
+  name=nemotron-$(echo "$cfg" | sed 's/ /_/g; s/=/-/g; s/:/./g')-$SLURM_JOB_ID  # one log per configuration
   local log=$PORT_ROOT/logs/$name.log
   echo "[$(date -Is)] [$cfg] gpus $gpus port $port log $log"
   (export $cfg; exec setsid $WT/sharar_port/scripts/serve_nemotron.sh $gpus $port) > $log 2>&1 &
@@ -34,7 +35,9 @@ run_cfg() {  # run_cfg "<env>" <gpus> <port>
   kill -TERM -- -$pid 2>/dev/null; wait $pid 2>/dev/null
 }
 
-[ "${1:--}" = - ] || run_cfg "$1" 0,1 30100 &
-[ "${2:--}" = - ] || run_cfg "$2" 2,3 30200 &
+for g in 0 1 2 3; do
+  cfg=${@:$((g + 1)):1}
+  [ "${cfg:--}" = - ] || run_cfg "$cfg" $g $((30100 + 100 * g)) &
+done
 wait
 echo "[$(date -Is)] done"
