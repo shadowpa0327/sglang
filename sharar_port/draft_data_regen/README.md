@@ -20,11 +20,11 @@ Pipeline and tools:
 | Step | Tool | Output |
 | --- | --- | --- |
 | 1. Learn the target | the snippets below | facts that set every later flag |
-| 2. Download prompts | `draft_data_regen/scripts/download_prompt_sources.py` | `<source>_prompts.jsonl`, `manifest.json` |
+| 2. Download prompts | `sharar_port/draft_data_regen/scripts/download_prompt_sources.py` | `<source>_prompts.jsonl`, `manifest.json` |
 | 3. Serve the target | `python -m sglang.launch_server` | one or more OpenAI-compatible servers |
-| 4. Regenerate | `draft_data_regen/scripts/regen_driver.py` | `<name>_regen.jsonl` (+ `_error`, `_skipped`) |
-| 5. Build training rows | `draft_data_regen/scripts/build_regen_training_rows.py` | `train.jsonl`, `stats.json` |
-| 6. Agent sessions (if the target wrote some) | `draft_data_regen/scripts/build_swe_trace_rows.py` | `train.jsonl`, `eval.jsonl` |
+| 4. Regenerate | `sharar_port/draft_data_regen/scripts/regen_driver.py` | `<name>_regen.jsonl` (+ `_error`, `_skipped`) |
+| 5. Build training rows | `sharar_port/draft_data_regen/scripts/build_regen_training_rows.py` | `train.jsonl`, `stats.json` |
+| 6. Agent sessions (if the target wrote some) | `sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py` | `train.jsonl`, `eval.jsonl` |
 | 7. Train | `specforge train` with the data fields below | draft checkpoints |
 
 The prompt sources themselves are described in
@@ -34,13 +34,13 @@ The prompt sources themselves are described in
 
 | File | What it does |
 | --- | --- |
-| `draft_data_regen/CHECKLIST.md` | the runbook's steps and rules on one page |
-| `draft_data_regen/REPRODUCE.md` | the one-page recipe: the Qwen3.8-Flash-Next corpus for another target, from the lock |
-| `draft_data_regen/locks/qwen38-flash-next-think-stage1/` | that corpus's prompts in run order with their reasoning effort, and the pinned dataset revisions |
-| `draft_data_regen/scripts/download_prompt_sources.py` | downloads chat prompt sources from Hugging Face as regeneration input (sampling, dedup, decontamination, pinned revisions) and raw Open-SWE-Traces agent sessions |
-| `draft_data_regen/scripts/regen_driver.py` | resumable multi-server regeneration with thinking budgets and reasoning-effort mixes |
-| `draft_data_regen/scripts/build_regen_training_rows.py` | one preformatted last-turn-loss training row per regenerated answer, rendered with the target's template |
-| `draft_data_regen/scripts/build_swe_trace_rows.py` | one preformatted all-turn training row per agent session, cut at a turn end, with held-out eval repositories |
+| `sharar_port/draft_data_regen/CHECKLIST.md` | the runbook's steps and rules on one page |
+| `sharar_port/draft_data_regen/REPRODUCE.md` | the one-page recipe: the Qwen3.8-Flash-Next corpus for another target, from the lock |
+| `sharar_port/draft_data_regen/locks/qwen38-flash-next-think-stage1/` | that corpus's prompts in run order with their reasoning effort, and the pinned dataset revisions |
+| `sharar_port/draft_data_regen/scripts/download_prompt_sources.py` | downloads chat prompt sources from Hugging Face as regeneration input (sampling, dedup, decontamination, pinned revisions) and raw Open-SWE-Traces agent sessions |
+| `sharar_port/draft_data_regen/scripts/regen_driver.py` | resumable multi-server regeneration with thinking budgets and reasoning-effort mixes |
+| `sharar_port/draft_data_regen/scripts/build_regen_training_rows.py` | one preformatted last-turn-loss training row per regenerated answer, rendered with the target's template |
+| `sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py` | one preformatted all-turn training row per agent session, cut at a turn end, with held-out eval repositories |
 | `scripts/regen_common.py` | request and validation helpers vendored from SpecForge's regenerator |
 
 Requirements: `openai`, `requests`, `transformers`, `datasets`, `pyarrow` and
@@ -113,7 +113,7 @@ prompt set (`DaoCloud/Qwen3.8-27B-Drafter-SFT`).
 Always decontaminate against the evals you will report:
 
 ```bash
-python draft_data_regen/scripts/download_prompt_sources.py \
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py \
     --sources perfectblend ultrachat opencodeinstruct aya nemotron-if nemotron-structured \
     --sample opencodeinstruct=250000 aya=60000 \
     --decontaminate-against /path/to/eval_datasets \
@@ -168,7 +168,7 @@ retrying.
 ## 4. Regenerate
 
 ```bash
-python draft_data_regen/scripts/regen_driver.py /data/prompts/perfectblend_prompts.jsonl \
+python sharar_port/draft_data_regen/scripts/regen_driver.py /data/prompts/perfectblend_prompts.jsonl \
     /data/regen/perfectblend_regen.jsonl \
     127.0.0.1:31000 127.0.0.1:32000 \
     --model $TARGET --thinking --budget 8192 --max-tokens 16384 \
@@ -210,7 +210,7 @@ Before building rows, sample and look:
 ## 6. Build training rows
 
 ```bash
-python draft_data_regen/scripts/build_regen_training_rows.py \
+python sharar_port/draft_data_regen/scripts/build_regen_training_rows.py \
     --tokenizer $TARGET --out-dir /data/train/stage1_8k --budget 8192 \
     --decontaminate-against /path/to/eval_datasets \
     --verify-chat-template qwen3.5 \
@@ -236,8 +236,8 @@ regenerated, because the tool results follow the original model's actions.
 Use them only when the trajectory model is your target:
 
 ```bash
-python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir /data/prompts
-python draft_data_regen/scripts/build_swe_trace_rows.py --data-dir /data/prompts/open_swe_traces \
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir /data/prompts
+python sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py --data-dir /data/prompts/open_swe_traces \
     --model qwen38_flash_next --tokenizer $TARGET --out-dir /data/train/agent_32k \
     --max-tokens 32768 --verify-chat-template qwen3.5
 ```

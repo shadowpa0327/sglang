@@ -20,7 +20,7 @@ this recipe.
 
 ## What is pinned
 
-The lock `draft_data_regen/locks/qwen38-flash-next-think-stage1/` holds:
+The lock `sharar_port/draft_data_regen/locks/qwen38-flash-next-think-stage1/` holds:
 
 - `lock.json`: the dataset repository and revision of each source, the
   settings, and the reference counts.
@@ -60,13 +60,13 @@ control ignores the setting; in that case leave it as is.
 export TARGET=<hf id or path>
 export WORK=/big/disk/regen_<target>    # ~10 GB for chat; the agent part adds ~50 GB
 export HF_HOME=/big/disk/hf_home         # ~35 GB of dataset downloads and caches
-export LOCK=draft_data_regen/locks/qwen38-flash-next-think-stage1
+export LOCK=sharar_port/draft_data_regen/locks/qwen38-flash-next-think-stage1
 ```
 
 ## 1. Rebuild the prompt files
 
 ```bash
-python draft_data_regen/scripts/download_prompt_sources.py --lock $LOCK --output-dir $WORK/prompts
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --lock $LOCK --output-dir $WORK/prompts
 ```
 
 Expect `perfectblend: 344926 of 344928`, `opencodeinstruct: 120954 of 120954`
@@ -114,7 +114,7 @@ carries its effort, so do not pass `--effort-mix`.
 
 ```bash
 for s in perfectblend opencodeinstruct ultrachat; do
-  python draft_data_regen/scripts/regen_driver.py $WORK/prompts/${s}_prompts.jsonl $WORK/regen/${s}.jsonl \
+  python sharar_port/draft_data_regen/scripts/regen_driver.py $WORK/prompts/${s}_prompts.jsonl $WORK/regen/${s}.jsonl \
       127.0.0.1:31000 [127.0.0.1:32000 ...] --model $TARGET \
       --thinking --budget 8192 --max-tokens 16384 \
       --temperature 1.0 --top-p 0.95 --top-k 20 --concurrency 256 \
@@ -139,7 +139,7 @@ second.
 ## 4. Build training rows
 
 ```bash
-python draft_data_regen/scripts/build_regen_training_rows.py --tokenizer $TARGET --out-dir $WORK/stage1_8k \
+python sharar_port/draft_data_regen/scripts/build_regen_training_rows.py --tokenizer $TARGET --out-dir $WORK/stage1_8k \
     --budget 8192 --verify-chat-template <template> [--effort-kwarg <kwarg>] \
     $WORK/regen/perfectblend.jsonl $WORK/regen/opencodeinstruct.jsonl $WORK/regen/ultrachat.jsonl
 ```
@@ -157,9 +157,9 @@ exactly on them; its counts depend on how long it writes.
 that wrote them. We trained on the same three harnesses as below:
 
 ```bash
-python draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model dir> --output-dir $WORK/prompts \
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model dir> --output-dir $WORK/prompts \
     --revisions-from $LOCK/lock.json
-python draft_data_regen/scripts/build_swe_trace_rows.py --data-dir $WORK/prompts/open_swe_traces \
+python sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py --data-dir $WORK/prompts/open_swe_traces \
     --model <model dir> --harnesses openhands sweagent minisweagent \
     --tokenizer $TARGET --out-dir $WORK/agent_32k --max-tokens 32768 \
     --verify-chat-template <template>

@@ -1,7 +1,7 @@
 """Turn Open-SWE-Traces agent sessions into preformatted training rows.
 
-    python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir ./cache/dataset/prompts
-    python draft_data_regen/scripts/build_swe_trace_rows.py \
+    python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir ./cache/dataset/prompts
+    python sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py \
         --data-dir ./cache/dataset/prompts/open_swe_traces --model qwen38_flash_next \
         --tokenizer <target> --out-dir ./cache/dataset/agent_32k --max-tokens 32768 \
         [--verify-chat-template qwen3.5]

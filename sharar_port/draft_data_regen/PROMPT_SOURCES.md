@@ -13,7 +13,7 @@ regeneration input format (sampling, deduplicating, decontaminating and pinning
 the dataset revision) and fetches raw agent sessions:
 
 ```bash
-python draft_data_regen/scripts/download_prompt_sources.py --list
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --list
 ```
 
 ## The complete corpus
@@ -48,23 +48,23 @@ below): multilingual (`aya`) and instruction following (`nemotron-if`,
 ```bash
 P=./cache/dataset/prompts; R=./cache/dataset/regen; TARGET=nvidia/Qwen3.8-Flash-Next-NVFP4
 # 1. chat prompts, decontaminated against the evals you report
-python draft_data_regen/scripts/download_prompt_sources.py \
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py \
     --sources perfectblend ultrachat opencodeinstruct \
     --sample opencodeinstruct=250000 \
     --decontaminate-against ./eval_datasets --output-dir $P
 # 2. agent sessions written by the target
-python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir $P
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir $P
 # 3. regenerate each chat source (servers on :31000 and :32000; one driver per file)
 for s in perfectblend ultrachat opencodeinstruct; do
-  python draft_data_regen/scripts/regen_driver.py $P/${s}_prompts.jsonl $R/${s}_regen.jsonl \
+  python sharar_port/draft_data_regen/scripts/regen_driver.py $P/${s}_prompts.jsonl $R/${s}_regen.jsonl \
       127.0.0.1:31000 127.0.0.1:32000 --model $TARGET \
       --thinking --budget 8192 --max-tokens 16384 \
       --effort-mix low:0.4,medium:0.3,xhigh:0.3 --concurrency 128 > logs/regen_$s.log 2>&1 &
 done
 # 4. training rows: 8K chat (last-turn loss) and 32K agent sessions (all turns)
-python draft_data_regen/scripts/build_regen_training_rows.py --tokenizer $TARGET --out-dir ./cache/dataset/chat_8k \
+python sharar_port/draft_data_regen/scripts/build_regen_training_rows.py --tokenizer $TARGET --out-dir ./cache/dataset/chat_8k \
     --budget 8192 --decontaminate-against ./eval_datasets --verify-chat-template qwen3.5 $R/*_regen.jsonl
-python draft_data_regen/scripts/build_swe_trace_rows.py --data-dir $P/open_swe_traces --model qwen38_flash_next \
+python sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py --data-dir $P/open_swe_traces --model qwen38_flash_next \
     --tokenizer $TARGET --out-dir ./cache/dataset/agent_32k --max-tokens 32768 --verify-chat-template qwen3.5
 ```
 
@@ -166,7 +166,7 @@ Generation took about a day on three TP2 H100 servers (about 19.5K
 conversations, or 45-50M generated tokens, per hour at the tuned settings).
 
 Its exact prompts, in run order and with each conversation's effort, are pinned
-in `draft_data_regen/locks/qwen38-flash-next-think-stage1/` (eval-overlap prompts
+in `sharar_port/draft_data_regen/locks/qwen38-flash-next-think-stage1/` (eval-overlap prompts
 already removed). `download_prompt_sources.py --lock` rebuilds them, and the
 [reproduction recipe](REPRODUCE.md) takes another target through the
 same corpus.
@@ -242,7 +242,7 @@ The low and medium sessions match the effort mix of the chat data.
 
 Our agent run used revision `1db6741` (2026-10-20). For Qwen3.8-Flash-Next it
 holds only the xhigh OpenHands, SWE-agent and mini-SWE-agent sessions. The lock
-in `draft_data_regen/locks/qwen38-flash-next-think-stage1/lock.json` pins it, so
+in `sharar_port/draft_data_regen/locks/qwen38-flash-next-think-stage1/lock.json` pins it, so
 `--revisions-from` that file reproduces the run (see the
 [reproduction recipe](REPRODUCE.md)).
 
@@ -252,14 +252,14 @@ desynchronize the trajectory; the sessions are on-policy exactly when the
 trajectory model is your target. For another target, skip them or run fresh
 agent rollouts with the target in sandboxed harnesses.
 
-**Converting.** `draft_data_regen/scripts/build_swe_trace_rows.py` renders each session once with
+**Converting.** `sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py` renders each session once with
 the target's template (tools included, every turn's reasoning kept), cuts it at
 the last end of turn within `--max-tokens`, and keeps sessions on 1 in 50
 repositories (by name hash) for evaluation only:
 
 ```bash
-python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir $P
-python draft_data_regen/scripts/build_swe_trace_rows.py --data-dir $P/open_swe_traces --model qwen38_flash_next \
+python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir $P
+python sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py --data-dir $P/open_swe_traces --model qwen38_flash_next \
     --tokenizer $TARGET --out-dir ./cache/dataset/agent_32k --max-tokens 32768 \
     --verify-chat-template qwen3.5
 ```

@@ -1,6 +1,6 @@
 """Turn regenerated conversations into preformatted, last-turn-loss training rows.
 
-    python draft_data_regen/scripts/build_regen_training_rows.py --tokenizer <target> --out-dir <dir> \
+    python sharar_port/draft_data_regen/scripts/build_regen_training_rows.py --tokenizer <target> --out-dir <dir> \
         [--budget 8192] [--decontaminate-against ./eval_datasets] \
         [--verify-chat-template qwen3.5] <regen.jsonl> [<regen.jsonl> ...]
 

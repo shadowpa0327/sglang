@@ -41,6 +41,16 @@ once every attached 3-bit linear has served a decode/verify call.
   3-bit copies on the model's own thinking traces with sharar's GPTQ.
 - `check_w3_mapping.py`, `test_w3_dispatch.py`, `w3_tune.py`, `bench_w3_moe.py`: validation and kernel tuning.
 
+## Draft training data (`sharar_port/draft_data_regen`)
+
+Regenerating speculative-decoding draft training data with the target model itself: the Qwen3.8-Flash-Next thinking
+corpus and its agent sessions, and the same corpus for another target.
+
+- `README.md`: the runbook. `CHECKLIST.md`: its steps and rules on one page.
+- `REPRODUCE.md`: the recipe that rebuilds the corpus from the prompt lock in `locks/`.
+- `PROMPT_SOURCES.md`: the prompt sources, the complete corpus and reference blends.
+- `scripts/`: prompt download, regeneration driver and training-row builders.
+
 ## Results so far (GPQA Diamond, 3 seeds per cap, paired against the same model's exact arm)
 
 | Model, arm | 16K | 32K | 64K |

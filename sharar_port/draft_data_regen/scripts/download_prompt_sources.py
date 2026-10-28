@@ -2,26 +2,26 @@
 
 Draft models train best on answers written by their own target model, so a prompt
 source only supplies the system and user turns; the target regenerates every
-assistant turn (regen_driver.py). See draft_data_regen/PROMPT_SOURCES.md for what
+assistant turn (regen_driver.py). See sharar_port/draft_data_regen/PROMPT_SOURCES.md for what
 each source contains.
 
     # what is available
-    python draft_data_regen/scripts/download_prompt_sources.py --list
+    python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --list
 
     # the Qwen3.8-Flash-Next thinking blend: PerfectBlend + OpenCodeInstruct (+ gaps)
-    python draft_data_regen/scripts/download_prompt_sources.py \
+    python sharar_port/draft_data_regen/scripts/download_prompt_sources.py \
         --sources perfectblend opencodeinstruct aya nemotron-if \
         --sample opencodeinstruct=250000 aya=60000 \
         --decontaminate-against ./eval_datasets \
         --output-dir ./cache/dataset/prompts
 
     # exactly the prompts (order, reasoning effort) of a reference run, from its lock
-    python draft_data_regen/scripts/download_prompt_sources.py \
-        --lock draft_data_regen/locks/qwen38-flash-next-think-stage1 \
+    python sharar_port/draft_data_regen/scripts/download_prompt_sources.py \
+        --lock sharar_port/draft_data_regen/locks/qwen38-flash-next-think-stage1 \
         --output-dir ./cache/dataset/prompts
 
     # raw Open-SWE-Traces sessions written by one trajectory model (used as is)
-    python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next \
+    python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next \
         --output-dir ./cache/dataset/prompts
 
 Each source is written to <output-dir>/<source>_prompts.jsonl in a random order

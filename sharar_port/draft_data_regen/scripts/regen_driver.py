@@ -1,6 +1,6 @@
 """Regenerate the assistant turns of a prompt file with the target model, at scale.
 
-    python draft_data_regen/scripts/regen_driver.py <input.jsonl> <output.jsonl> <host:port> [<host:port> ...] \
+    python sharar_port/draft_data_regen/scripts/regen_driver.py <input.jsonl> <output.jsonl> <host:port> [<host:port> ...] \
         --model <target path or HF id> [--thinking --budget 8192 --effort-mix low:0.4,medium:0.3,xhigh:0.3]
 
 Builds on SpecForge's scripts/regenerate_train_data.py (helpers vendored in regen_common.py; same request format and row schema: one chat

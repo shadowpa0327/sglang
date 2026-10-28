@@ -10,7 +10,7 @@ corpus and the reference blends.
 **The same corpus for another target** (the Qwen3.8-Flash-Next prompts,
 efforts and settings): follow the [reproduction recipe](REPRODUCE.md)
 step by step. It rebuilds the prompts from the lock in
-`draft_data_regen/locks/qwen38-flash-next-think-stage1/`; do not sample new ones.
+`sharar_port/draft_data_regen/locks/qwen38-flash-next-think-stage1/`; do not sample new ones.
 
 ## Checklist
 
@@ -24,26 +24,26 @@ step by step. It rebuilds the prompts from the lock in
    and the matching SpecForge `chat_template`.
 3. **Download prompts**, decontaminated. For chat use `perfectblend ultrachat
    opencodeinstruct`; add `aya nemotron-if nemotron-structured` for coverage.
-   Start with `python draft_data_regen/scripts/download_prompt_sources.py --list`, then run it
+   Start with `python sharar_port/draft_data_regen/scripts/download_prompt_sources.py --list`, then run it
    with `--sources ... --sample ... --decontaminate-against <evals> --output-dir <big disk>`.
    For the same corpus, run `--lock <lock dir>` instead.
 4. **Serve the target** with SGLang. Use one server per smallest TP group that
    fits, and add replicas for throughput. Tune `--max-running-requests` and
    the CUDA-graph batch size first: read `gen throughput` in the server log for
    about 5 minutes per setting.
-5. **Regenerate** with `draft_data_regen/scripts/regen_driver.py <prompts> <out> <servers...> --model <target>`.
+5. **Regenerate** with `sharar_port/draft_data_regen/scripts/regen_driver.py <prompts> <out> <servers...> --model <target>`.
    For a thinking model add `--thinking --budget <stage max_length> --max-tokens <at least the budget>`,
    plus `--effort-mix ...`. Leave out `--effort-mix` for lock-built prompts,
    which already carry their effort. Run it in the background with a log;
    rerun the same command to resume.
 6. **Check** the `_skipped` and `_error` counts, and read some sample rows.
-7. **Build rows** with `draft_data_regen/scripts/build_regen_training_rows.py --tokenizer <target>
+7. **Build rows** with `sharar_port/draft_data_regen/scripts/build_regen_training_rows.py --tokenizer <target>
    --out-dir <dir> --budget <same> --verify-chat-template <name> <regen files>`.
    The verify line must say `(OK)`.
 8. **Add agent sessions**, but only if the target wrote some in
    `nvidia/Open-SWE-Traces`. Download them with
-   `draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model>`, then run
-   `draft_data_regen/scripts/build_swe_trace_rows.py --data-dir <dir>/open_swe_traces --model <model>
+   `sharar_port/draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model>`, then run
+   `sharar_port/draft_data_regen/scripts/build_swe_trace_rows.py --data-dir <dir>/open_swe_traces --model <model>
    --tokenizer <target> --out-dir <dir> --max-tokens 32768 --verify-chat-template <name>`.
    Low- and medium-effort sessions (the `thinking-*/` folders) are rendered at
    their own effort; `--efforts default` keeps only the xhigh ones. To rebuild
