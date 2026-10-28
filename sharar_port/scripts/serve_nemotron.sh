@@ -22,12 +22,14 @@ if [ "${W3:-0}" = 1 ]; then
 fi
 [ -n "${MOE:-}" ] && export SGLANG_SHARAR_MOE=$MOE
 TP=$(( $(echo $gpus | tr -cd , | wc -c) + 1 ))
-LILICORR=$H/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr/snapshots/292bf1efc06ba39567da7351f2ad7a522afa3959
+# NVIDIA's LiLiCorr drafter (nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr @ 292bf1e) is ModelOpt
+# W4A16_NVFP4; this SGLang's LiLiCorr path builds unquantized layers for its LiLiCorrDraftModel config and refuses the
+# packed weights, so it serves a BF16 copy (sharar_port/scripts/lilicorr_bf16.py: SGLang's dequantize_nvfp4 on each of
+# the 26 quantized linears; the drafter's activations were BF16 already)
+LILICORR=${LILICORR:-/ddn/scratch/cornell/cchang/models/nemotron35-super-lilicorr-bf16-292bf1e}
 if [ "${SPEC:-none}" = lilicorr ]; then  # NVIDIA's LiLiCorr drafter (block 8: up to 7 drafts), served through SGLang's DFLASH path
-  # the drafter is ModelOpt W4A16_NVFP4 (fc and the LiLiCorr head packed); without an explicit draft quantization the
-  # draft inherits the target's modelopt_mixed, builds an unquantized fc and refuses the packed weight
   SPEC_ARGS=(--speculative-algorithm DFLASH --speculative-draft-model-path "$LILICORR" --speculative-dflash-block-size ${BLOCK:-8}
-             --speculative-draft-model-quantization modelopt_fp4)
+             --speculative-draft-model-quantization unquant)
 elif [ "${SPEC:-none}" = mtp ]; then
   SPEC_ARGS=(--speculative-algorithm NEXTN --speculative-draft-model-path "$TGT" --speculative-num-steps ${MTP_STEPS:-3}
              --speculative-eagle-topk 1 --speculative-num-draft-tokens $(( ${MTP_STEPS:-3} + 1 )))
