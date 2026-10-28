@@ -47,7 +47,8 @@ run_arm() {  # run_arm <arm:task:seeds[:par]> <gpu> <port>
   local maxrun=$([ "$par" = par ] && echo $((CONC * $(echo $seeds | wc -w))) || echo $CONC)
   local log=$PORT_ROOT/logs/nemotron-${arm}-${task}-$SLURM_JOB_ID.log
   echo "[$(date -Is)] $arm: task $task seeds $seeds par ${par:-no} gpu $gpu port $port maxrun $maxrun log $log"
-  (export $env MAXRUN=$maxrun; exec setsid $WT/sharar_port/scripts/serve_nemotron.sh $gpu $port) > $log 2>&1 &
+  local check=0; case $arm in fast*) check=1 ;; esac  # fast: the W3 load check and the draft head's agreement report
+  (export $env MAXRUN=$maxrun SGLANG_SHARAR_W3_CHECK=$check; exec setsid $WT/sharar_port/scripts/serve_nemotron.sh $gpu $port) > $log 2>&1 &
   pid=$!
   until [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/health)" = 200 ]; do
     kill -0 $pid 2>/dev/null || { echo "[$arm] server died"; grep -v "Ignore import" $log | tail -30; return 1; }; sleep 15; done

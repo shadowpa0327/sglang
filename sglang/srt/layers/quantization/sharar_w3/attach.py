@@ -615,11 +615,13 @@ class _ShortlistMethod:
             exact = exact * self.scale.float().reshape(-1)[0]
         out = torch.full((flat.shape[0], self.weight.shape[0]), float("-inf"), dtype=torch.float32, device=x.device)
         out.scatter_(1, cand, exact)
-        if self.check and self.checked < 4096 and not torch.cuda.is_current_stream_capturing():
-            full = flat.float() @ self.weight.float().T  # the FP8 head's own argmax, for the report
+        # the FP8 head's own argmax on calls run outside a CUDA graph (most draft steps replay one), for the report:
+        # every doubling of the checked rows from 256 up to 65536
+        if self.check and self.checked < 65536 and not torch.cuda.is_current_stream_capturing():
+            full = flat.float() @ self.weight.float().T
             self.agree += int((out.argmax(-1) == full.argmax(-1)).sum())
-            self.checked += flat.shape[0]
-            if self.checked >= 4096:
+            before, self.checked = self.checked, self.checked + flat.shape[0]
+            if self.checked >= 256 and (before < 256 or self.checked.bit_length() > before.bit_length()):
                 logger.info("sharar draft head check: %s shortlist of %d picks the FP8 argmax in %.2f%% of %d draft rows",
                             self.fmt, self.rescore, 100 * self.agree / self.checked, self.checked)
         return out
