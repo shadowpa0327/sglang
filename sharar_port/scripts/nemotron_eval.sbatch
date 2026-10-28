@@ -31,9 +31,10 @@ arm_env() {  # the serve_nemotron.sh environment of an arm
     exact) echo PLAIN=1 ;; w3) echo W3=1 ;; exactmtp) echo SPEC=mtp ;; w3mtp) echo "SPEC=mtp W3=1" ;;
     # sharar's off-the-shelf `fast` (launch/settings.py nemotron_defaults): both 3-bit copies, MTP drafts with relaxed
     # acceptance 3:2.0, FP16-SR Mamba state, expert sharing keep 12 / 48 a request / 128 a call, at most 4 requests (its
-    # MAX_BATCH; CONC defaults to 4 for it), depth 5 (sharar's at three or four requests; its adaptive depth and 2-bit
-    # draft head are not ported: the MTP head stays NVFP4)
-    fast) echo "W3=1 SPEC=mtp MTP_STEPS=5 SGLANG_DFLASH_RELAXED_TOP_K=3 SGLANG_DFLASH_RELAXED_MARGIN=2.0 SSM=float16 SSM_SR=1 MOE=12:48:128" ;;
+    # MAX_BATCH; CONC defaults to 4 for it), depth 5 (sharar's at three or four requests; its adaptive depth is not
+    # ported), the 2-bit draft head (SHARAR_DRAFT_HEAD=w2: the draft steps' lm_head is a 2-bit copy whose top 16 the FP8
+    # rows rescore; the MTP layer itself stays NVFP4, as in sharar)
+    fast) echo "W3=1 SPEC=mtp MTP_STEPS=5 SGLANG_DFLASH_RELAXED_TOP_K=3 SGLANG_DFLASH_RELAXED_MARGIN=2.0 SSM=float16 SSM_SR=1 MOE=12:48:128 SGLANG_SHARAR_DRAFT_HEAD=w2" ;;
     *) echo "unknown arm $1" >&2; return 1 ;;
   esac
 }

@@ -413,7 +413,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
 
     def set_embed_and_head(self, embed, head):
         if not self._owns_lm_head:
-            return super().set_embed_and_head(embed, head)
+            super().set_embed_and_head(embed, head)
+            _install_sharar_draft_head(self)
+            return
         # Standalone MTP checkpoints can supply a differently quantized head.
         # Share only the input embeddings; retain the entire loaded head module.
         self.model.embed_tokens.weight = embed
@@ -424,6 +426,17 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         if self.config.tie_word_embeddings or self._owns_lm_head:
             return
         self.lm_head = target_lm_head
+        _install_sharar_draft_head(self)
+
+
+def _install_sharar_draft_head(model) -> None:
+    """Research port: sharar's low-bit MTP draft head (SGLANG_SHARAR_DRAFT_HEAD=w2|w3) over the shared target head."""
+    import os
+
+    if os.environ.get("SGLANG_SHARAR_DRAFT_HEAD", "fp8") != "fp8":
+        from sglang.srt.layers.quantization.sharar_w3.attach import install_draft_head
+
+        install_draft_head(model)
 
 
 EntryClass = [NemotronHForCausalLMMTP]

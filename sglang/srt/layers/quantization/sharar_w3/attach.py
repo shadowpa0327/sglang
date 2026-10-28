@@ -564,6 +564,97 @@ def attach_moe(model, directory: str | None, sharing: tuple[int, int, int] | Non
     return info
 
 
+# ------------------------------------------------------------------ the MTP draft's own head (SGLANG_SHARAR_DRAFT_HEAD)
+
+DRAFT_RESCORE = {"w3": 8, "w2": 16}  # sharar proposers/draft_head.py RESCORE: the 2-bit top 8 miss the FP8 argmax 0.6% of steps, the top 16 0.2%
+
+
+class _ShortlistMethod:
+    """sharar's `ShortlistHead` (proposers/draft_head.py) as an lm_head quant method for the MTP draft steps: a 2-bit
+    (`w2`: four Lloyd levels, fitted group scales) or 3-bit (`w3`) copy of the target's FP8 head picks `rescore`
+    candidates, the head's own FP8 rows score them, and the logits are -inf off the shortlist, so the draft's argmax is
+    sharar's pick. Draft probabilities are not used (the chain is verified with zero draft probs), and under exact
+    acceptance a draft head changes how many drafts are accepted, never what is emitted; under relaxed acceptance it
+    changes which plausible tokens are drafted. Every row of the head (TP1: the full vocabulary)."""
+
+    def __init__(self, head, fmt: str, rescore: int):
+        from sglang.srt.layers.quantization.sharar_w3 import w3
+        weight = head.weight
+        scale = getattr(head, "weight_scale", None)
+        n, k = weight.shape
+        codebook, fit = ("lloyd2", True) if fmt == "w2" else (None, False)
+        chunk = 16384
+        def read(r0, r1):
+            rows = weight[r0:r1].float()
+            return rows * scale.float().reshape(-1)[0] if scale is not None else rows
+        parts = [w3.pack(read(r0, min(r0 + chunk, n)), codebook, fit_scales=fit) for r0 in range(0, n, chunk)]
+        first = parts[0]
+        self.copy = first if len(parts) == 1 else w3.W3Weight(
+            torch.cat([q.planes for q in parts]), torch.cat([q.scales for q in parts]),
+            torch.cat([q.row_scale for q in parts]), n, k, first.codebook, first.lut)
+        self.weight, self.scale, self.rescore, self.fmt = weight, scale, rescore, fmt
+        self.checked, self.agree = 0, 0
+        self.check = os.environ.get("SGLANG_SHARAR_W3_CHECK") == "1"
+
+    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None, *args, **kwargs):
+        from sglang.srt.layers.quantization.sharar_w3 import w3
+        flat = x.reshape(-1, x.shape[-1]).to(torch.bfloat16).contiguous()
+        if flat.shape[0] == 0:
+            return torch.empty((0, self.weight.shape[0]), dtype=torch.float32, device=x.device)
+        _note(f"MTP draft head: {self.fmt} shortlist of {self.rescore}, rescored by the FP8 rows")
+        low = torch.cat([w3.w3_linear(part.contiguous(), self.copy) for part in flat.split(w3.MAX_ROWS)])
+        cand = low.topk(self.rescore, dim=-1).indices  # [M, r]
+        rows = self.weight[cand].float()  # [M, r, K] of the target's FP8 head
+        exact = torch.bmm(rows, flat.float().unsqueeze(-1)).squeeze(-1)
+        if self.scale is not None:
+            exact = exact * self.scale.float().reshape(-1)[0]
+        out = torch.full((flat.shape[0], self.weight.shape[0]), float("-inf"), dtype=torch.float32, device=x.device)
+        out.scatter_(1, cand, exact)
+        if self.check and self.checked < 4096 and not torch.cuda.is_current_stream_capturing():
+            full = flat.float() @ self.weight.float().T  # the FP8 head's own argmax, for the report
+            self.agree += int((out.argmax(-1) == full.argmax(-1)).sum())
+            self.checked += flat.shape[0]
+            if self.checked >= 4096:
+                logger.info("sharar draft head check: %s shortlist of %d picks the FP8 argmax in %.2f%% of %d draft rows",
+                            self.fmt, self.rescore, 100 * self.agree / self.checked, self.checked)
+        return out
+
+
+class DraftShortlistHead(torch.nn.Module):
+    """The MTP draft's lm_head: the target's head module (shared, unchanged: the target keeps its own copy and modes)
+    with `_ShortlistMethod` as its quant method. Every other attribute is the target head's."""
+
+    def __init__(self, base, fmt: str, rescore: int):
+        super().__init__()
+        object.__setattr__(self, "_base", base)  # not a registered child: no duplicate parameters
+        self.quant_method = _ShortlistMethod(base, fmt, rescore)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(object.__getattribute__(self, "_base"), name)
+
+
+def install_draft_head(model) -> None:
+    """SGLANG_SHARAR_DRAFT_HEAD=w2|w3 (sharar's SHARAR_DRAFT_HEAD; fp8 or unset: the target's head as it is): give the
+    MTP draft model `model` its own shortlist head over the target head it was handed (`model.lm_head`).
+    SGLANG_SHARAR_DRAFT_HEAD_RESCORE overrides the shortlist size (default 16 for w2, 8 for w3)."""
+    fmt = os.environ.get("SGLANG_SHARAR_DRAFT_HEAD", "fp8")
+    if fmt == "fp8" or isinstance(model.lm_head, DraftShortlistHead):
+        return
+    if fmt not in DRAFT_RESCORE:
+        raise ValueError(f"SGLANG_SHARAR_DRAFT_HEAD must be fp8, w3 or w2, not {fmt!r}")
+    head = model.lm_head
+    if head.weight.shape[0] < getattr(head, "org_vocab_size", head.weight.shape[0]):
+        raise ValueError("SGLANG_SHARAR_DRAFT_HEAD: a vocabulary-parallel head (TP > 1) is not ported")
+    rescore = int(os.environ.get("SGLANG_SHARAR_DRAFT_HEAD_RESCORE", DRAFT_RESCORE[fmt]))
+    model.lm_head = DraftShortlistHead(head, fmt, rescore)
+    torch.cuda.empty_cache()
+    logger.info("sharar draft head: %s copy of the %s head %s, shortlist %d (%.3f GiB)", fmt, head.weight.dtype,
+                tuple(head.weight.shape), rescore, model.lm_head.quant_method.copy.bytes / 2**30)
+
+
 # ------------------------------------------------------------------ calibration capture (re-fitting the 3-bit copies)
 
 class _Capture:
