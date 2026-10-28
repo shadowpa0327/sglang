@@ -16,17 +16,32 @@ src, out = Path(sys.argv[1]), Path(sys.argv[2])
 out.mkdir(parents=True, exist_ok=True)
 tensors = load_file(str(src / "model.safetensors"))
 quantized = [k[: -len(".weight_scale_2")] for k in tensors if k.endswith(".weight_scale_2")]
+# NVIDIA's names for the LiLiCorr head's sequential blocks -> this SGLang's nn.Sequential indices (models/lilicorr.py:
+# feature_mlp = LayerNorm(5), Linear, SiLU, Linear; each layer's mlp = Linear, SiLU, Linear); every other name matches
+RENAME = [("lilicorr.feature_norm.", "lilicorr.feature_mlp.0."), ("lilicorr.feature_mlp.up_proj.", "lilicorr.feature_mlp.1."),
+          ("lilicorr.feature_mlp.down_proj.", "lilicorr.feature_mlp.3."), (".mlp.up_proj.", ".mlp.0."), (".mlp.down_proj.", ".mlp.2.")]
+
+
+def rename(name: str) -> str:
+    if not name.startswith("lilicorr."):
+        return name
+    for a, b in RENAME:
+        if a in name:
+            return name.replace(a, b)
+    return name
+
+
 result = {}
 for name, t in tensors.items():
     base = name.rsplit(".", 1)[0]
-    if base in quantized and not name.endswith(".weight"):
-        continue  # weight_scale, weight_scale_2, input_scale of a quantized linear
-    if base in quantized:
+    if base in quantized and name.rsplit(".", 1)[1] in ("weight_scale", "weight_scale_2", "input_scale"):
+        continue  # the quantization scales of a quantized linear (its bias, if any, stays)
+    if base in quantized and name.endswith(".weight"):
         w = dequantize_nvfp4(t, tensors[base + ".weight_scale"], tensors[base + ".weight_scale_2"], out_dtype=torch.bfloat16)
         assert w.shape[1] == t.shape[1] * 2, (name, tuple(t.shape), tuple(w.shape))
-        result[name] = w.contiguous()
+        result[rename(name)] = w.contiguous()
     else:
-        result[name] = t
+        result[rename(name)] = t
 save_file(result, str(out / "model.safetensors"), metadata={"format": "pt"})
 config = json.loads((src / "config.json").read_text())
 config.pop("quantization_config", None)
@@ -35,7 +50,7 @@ for f in src.iterdir():
     if f.name not in ("model.safetensors", "config.json", "hf_quant_config.json") and f.is_file():
         shutil.copy(f, out / f.name)
 print(f"{len(quantized)} linears dequantized to BF16, {len(result)} tensors -> {out}")
-for k in quantized[:3] + ["lm_head"]:
+for k in [rename(q + ".weight")[: -len(".weight")] for q in quantized[:3]] + ["lm_head", "lilicorr.context_proj"]:
     if k + ".weight" in result:
         w = result[k + ".weight"].float()
         print(f"  {k}: {tuple(w.shape)} mean |w| {w.abs().mean():.4g}, max |w| {w.abs().max():.4g}")
