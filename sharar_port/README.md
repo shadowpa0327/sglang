@@ -26,6 +26,8 @@ relaxed DFlash2 verification. Targets: Qwen3.8-27B-NVFP4 (`RadixArk/...@319f741`
 | `SGLANG_SHARAR_W3_EXPERTS=1` | Flash-Next: serve the checkpoint's 3-bit routed experts (the NVFP4 experts are released) |
 | `SGLANG_SHARAR_MOE=keep:per_request:budget` | Flash-Next expert sharing in decode/verify forwards (sharar fast: `4:12:64`) |
 | `SGLANG_DFLASH_RELAXED_TOP_K`, `SGLANG_DFLASH_RELAXED_MARGIN` | server-default relaxed rule (sharar's sampled rule: `2`, `1.0`) |
+| `SGLANG_DFLASH_RELAXED_SOFT=<s>` | sampled requests: a plausible draft keeps its coin, scaled by e^-s, and is accepted when `coin * q < e^s * p` instead of always, so no token comes out more than e^s times as often as the target's law gives it (`0`: exact sampling; unset: the forced accept); per request `accept_soft` in `custom_params` |
+| `SGLANG_DFLASH_RELAXED_TOP=0` | sampled requests: the target's own top token keeps the ordinary test and only near misses get the relaxed pass; per request `relax_top` |
 | `SGLANG_SHARAR_W3_CHECK=1` | at attach, every 3-bit linear and expert block against the original weights on random inputs (fails above 0.6 relative error) |
 | `SGLANG_SHARAR_CAPTURE=<dir>` | record GPTQ inputs in sharar's formats (trunk covariances, MoE input rows); saved when `<dir>/SAVE` appears |
 
@@ -40,6 +42,9 @@ once every attached 3-bit linear has served a decode/verify call.
 - `build_calib.py`, `capture_serve.sh`, `capture_client.py`, `fit_trunk.py`, `recal_pipeline.sh`: re-fit Flash-Next's
   3-bit copies on the model's own thinking traces with sharar's GPTQ.
 - `check_w3_mapping.py`, `test_w3_dispatch.py`, `w3_tune.py`, `bench_w3_moe.py`: validation and kernel tuning.
+- `test_relaxed_soft.py`: the relaxed rule's output law at one verify slot (exact, soft, forced) through the DFlash chain
+  kernel and the MTP target-only kernel: `PYTHONPATH=<checkout> python sharar_port/scripts/test_relaxed_soft.py` (the
+  kernel tests skip without a GPU).
 
 ## Draft training data (`sharar_port/draft_data_regen`)
 

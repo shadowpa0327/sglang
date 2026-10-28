@@ -13,8 +13,12 @@ fenced code block (an odd number of ``` tokens in the request's output so far), 
 `"repeat_veto_ngram": n` when the drafted token would complete an n-gram the output already
 contains (the start of a loop). Sampled rows only: `"relax_top": false` keeps the target's own
 top token on the ordinary rejection test (only near misses get the plausible pass), which removes
-the mode-sharpening an over-confident draft otherwise passes into the output.
-Server default: SGLANG_DFLASH_RELAXED_TOP_K / SGLANG_DFLASH_RELAXED_MARGIN
+the mode-sharpening an over-confident draft otherwise passes into the output. Sampled rows only:
+`"accept_soft": s` keeps the coin of a plausible draft but relaxes it by e^s (accepted when
+coin * q < e^s * p, instead of always): the output law then satisfies P(x) <= e^s * p(x) for
+every token, s = 0 is exact sampling, and the rejection residual (p - q)+ needs no change.
+Unset (s = inf) is the forced accept.
+Server default: SGLANG_DFLASH_RELAXED_TOP_K / SGLANG_DFLASH_RELAXED_MARGIN / SGLANG_DFLASH_RELAXED_TOP
 (top-k <= 1 is exact). SGLANG_DFLASH_RELAXED_LOG=<path> appends one JSON line
 per verify step that relaxed-accepted a token (rank 0 only), and
 SGLANG_DFLASH_RELAXED_STATS=<path> keeps cumulative counters per rule.
@@ -33,21 +37,27 @@ _DEFAULT_K = int(os.environ.get("SGLANG_DFLASH_RELAXED_TOP_K", "0"))
 _DEFAULT_M = float(os.environ.get("SGLANG_DFLASH_RELAXED_MARGIN", "0"))
 _LOG_PATH = os.environ.get("SGLANG_DFLASH_RELAXED_LOG") or None
 _STATS_PATH = os.environ.get("SGLANG_DFLASH_RELAXED_STATS") or None
+# server default for requests that do not set relax_top: SGLANG_DFLASH_RELAXED_TOP=0 keeps the target's top token on the
+# ordinary test
+_DEFAULT_TOP = os.environ.get("SGLANG_DFLASH_RELAXED_TOP", "1") != "0"
+# server default for accept_soft (inf: a plausible draft's coin is zeroed, the forced accept)
+_DEFAULT_SOFT = float(os.environ.get("SGLANG_DFLASH_RELAXED_SOFT", "inf"))
 
 
 def request_rules(reqs) -> Optional[tuple]:
-    """Per-row (top-k, margin, relax_code, repeat_veto_ngram), or None when all rows are exact."""
-    ks, ms, code_ok, rep_n, top_ok = [], [], [], [], []
+    """Per-row (top-k, margin, relax_code, repeat_veto_ngram, relax_top, accept_soft), or None when all rows are exact."""
+    ks, ms, code_ok, rep_n, top_ok, soft = [], [], [], [], [], []
     for r in reqs:
         cp = getattr(r.sampling_params, "custom_params", None) or {}
         ks.append(int(cp.get("accept_top_k", _DEFAULT_K)))
         ms.append(float(cp.get("accept_margin", _DEFAULT_M)))
         code_ok.append(bool(cp.get("relax_code", True)))
         rep_n.append(int(cp.get("repeat_veto_ngram", 0)))
-        top_ok.append(bool(cp.get("relax_top", True)))
+        top_ok.append(bool(cp.get("relax_top", _DEFAULT_TOP)))
+        soft.append(float(cp.get("accept_soft", _DEFAULT_SOFT)))
     if all(k <= 1 for k in ks):
         return None
-    return ks, ms, code_ok, rep_n, top_ok
+    return ks, ms, code_ok, rep_n, top_ok, soft
 
 
 def gates_active(rules) -> bool:
@@ -167,8 +177,15 @@ def apply_relaxed(target_predict: torch.Tensor, candidates: torch.Tensor,
     return exact, relaxed
 
 
+def _coin_scale(rules, dev) -> torch.Tensor:
+    """[b, 1] factor for a plausible draft's coin: e^-s (accept_soft s), 0 for the forced accept (s = inf)."""
+    soft = rules[5] if len(rules) > 5 else [float("inf")] * len(rules[0])
+    return torch.exp(-torch.tensor(soft, device=dev, dtype=torch.float32)).unsqueeze(1)
+
+
 def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, uniform_samples, gamma: int):
-    """Sampled rows: accept a plausible draft by zeroing its coin (sharar verify_rows).
+    """Sampled rows: accept a plausible draft by zeroing its coin (sharar verify_rows), or with accept_soft s by
+    scaling it by e^-s (accepted when coin * q < e^s * p).
 
     target_probs [b, block, V] is the filtered target law, draft_probs [b, gamma, V]
     the draft's q, uniform_samples [b, gamma] the chain kernel's coins (slot j for
@@ -191,7 +208,7 @@ def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, unif
     plausible = (p_y > 0) & (rank < ks.unsqueeze(1)) & (gap <= ms.unsqueeze(1)) & (ks.unsqueeze(1) > 1)
     reqs = out.get("reqs")
     if reqs is not None:
-        top_ok = [bool((getattr(r.sampling_params, "custom_params", None) or {}).get("relax_top", True)) for r in reqs]
+        top_ok = [bool((getattr(r.sampling_params, "custom_params", None) or {}).get("relax_top", _DEFAULT_TOP)) for r in reqs]
         if not all(top_ok):
             keep_top = torch.tensor(top_ok, device=dev).unsqueeze(1)
             plausible = plausible & (keep_top | (rank > 0))
@@ -199,9 +216,10 @@ def force_plausible_coins(out: dict, candidates, target_probs, draft_probs, unif
         plausible = out["gate"].filter(out["reqs"], out["rules"], candidates, plausible)
     coins = uniform_samples[:, :gamma]
     exact = (q_y > 0) & (coins * q_y < p_y)
-    uniform_samples[:, :gamma] = torch.where(plausible, torch.zeros_like(coins), coins)
+    relaxed_coins = coins * _coin_scale(out["rules"], dev)
+    uniform_samples[:, :gamma] = torch.where(plausible, relaxed_coins, coins)
     out["exact"] = exact
-    out["relaxed"] = plausible & ~exact
+    out["relaxed"] = plausible & ~exact & (q_y > 0) & (relaxed_coins * q_y < p_y)
     out["argmax"] = argmax
 
 
@@ -225,13 +243,14 @@ def relax_chain_coins(rules, candidates: torch.Tensor, target_probs: torch.Tenso
     gap = torch.log(p_max.clamp_min(1e-30)) - torch.log(p_y.clamp_min(1e-30))
     plausible = (p_y > 0) & (rank < ks) & (gap <= ms) & (ks > 1)
     if reqs is not None:
-        top_ok = [bool((getattr(r.sampling_params, "custom_params", None) or {}).get("relax_top", True)) for r in reqs]
+        top_ok = [bool((getattr(r.sampling_params, "custom_params", None) or {}).get("relax_top", _DEFAULT_TOP)) for r in reqs]
         if not all(top_ok):
             plausible = plausible & (torch.tensor(top_ok, device=dev).unsqueeze(1) | (rank > 0))
     # the plausible drafts the ordinary test (coin < p_y) would have rejected: what relaxing adds
-    _CHAIN_COUNTS["relaxed"] += int((plausible & ~(coins[:, :gamma] < p_y)).sum())
+    relaxed_coins = coins[:, :gamma] * _coin_scale(rules, dev)
+    _CHAIN_COUNTS["relaxed"] += int((plausible & ~(coins[:, :gamma] < p_y) & (relaxed_coins < p_y)).sum())
     _CHAIN_COUNTS["steps"] += candidates.shape[0]
-    coins[:, :gamma] = torch.where(plausible, torch.zeros_like(coins[:, :gamma]), coins[:, :gamma])
+    coins[:, :gamma] = torch.where(plausible, relaxed_coins, coins[:, :gamma])
 
 
 def chain_counts() -> dict:
@@ -242,6 +261,8 @@ def rule_key(rules, i: int) -> str:
     key = f"{rules[0][i]}:{rules[1][i]:g}"
     if len(rules) > 4 and not rules[4][i]:
         key += "|no-top"
+    if len(rules) > 5 and rules[5][i] != float("inf"):
+        key += f"|soft{rules[5][i]:g}"
     if len(rules) > 2:
         if not rules[2][i]:
             key += "|code-exact"
