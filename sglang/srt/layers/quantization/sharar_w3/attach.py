@@ -651,8 +651,8 @@ def install_draft_head(model) -> None:
     if fmt not in DRAFT_RESCORE:
         raise ValueError(f"SGLANG_SHARAR_DRAFT_HEAD must be fp8, w3 or w2, not {fmt!r}")
     head = model.lm_head
-    from sglang.srt.distributed import get_tensor_model_parallel_world_size
-    if get_tensor_model_parallel_world_size() > 1:
+    from sglang.srt.runtime_context import get_parallel
+    if get_parallel().tp_size > 1:
         raise ValueError("SGLANG_SHARAR_DRAFT_HEAD: a vocabulary-parallel head (TP > 1) is not ported")
     rescore = int(os.environ.get("SGLANG_SHARAR_DRAFT_HEAD_RESCORE", DRAFT_RESCORE[fmt]))
     model.lm_head = DraftShortlistHead(head, fmt, rescore)
