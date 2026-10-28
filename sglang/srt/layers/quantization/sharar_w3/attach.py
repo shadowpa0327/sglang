@@ -236,7 +236,7 @@ class W3Method:
 
 # sharar's W3 call-size limit per target: the 27B's wide kernel serves up to 128 rows, Flash-Next's trunk the narrow
 # kernel's 64 (model/flashnext/linear.py `_uses_w3`).
-ROWS = {"qwen3_5": 128, "qwen4_exp": 64}
+ROWS = {"qwen3_5": 128, "qwen4_exp": 64, "nemotron_h": 128}
 
 # Per architecture: SGLang linear suffix -> (sharar checkpoint names for layer N, column-parallel?)
 MAPS = {
@@ -262,9 +262,18 @@ MAPS = {
         r"ple\.key_proj": (["layers.{i}.ple.key_proj"], True),
         r"ple\.value_proj": (["layers.{i}.ple.value_proj"], True),
     },
+    # NVIDIA-Nemotron-3.5-Super (sharar `nemotron` trunk, 97 matrices): Mamba-2 in_proj (SGLang's merged z | x | B | C | dt,
+    # split per segment) and out_proj, attention qkv and o, the lm_head. The latent projections, shared expert and dense
+    # MLPs keep their served weights; the routed experts: `attach_moe`.
+    "nemotron_h": {
+        r"mixer\.in_proj": (["layers.{i}.mixer.in_proj"], True),
+        r"mixer\.out_proj": (["layers.{i}.mixer.out_proj"], False),
+        r"mixer\.qkv_proj": (["layers.{i}.mixer.qkv"], True),
+        r"mixer\.o_proj": (["layers.{i}.mixer.o"], False),
+    },
 }
 # Unlayered linears: SGLang module name -> checkpoint name.
-GLOBAL = {"qwen4_exp": {"lm_head": "lm_head"}}
+GLOBAL = {"qwen4_exp": {"lm_head": "lm_head"}, "nemotron_h": {"language_model.lm_head": "lm_head"}}
 
 
 def _static_scale(linear) -> torch.Tensor | None:
@@ -375,10 +384,11 @@ class W3ExpertsForward(torch.nn.Module):
     serves them (the NVFP4 experts are then released). This rank holds a contiguous range of whole experts (sharar's
     expert-parallel split) and returns their partial sum, which the block's all-reduce adds like FusedMoE's TP partials."""
 
-    def __init__(self, base, experts):
+    def __init__(self, base, experts, scale: float | None = None):
         super().__init__()
         self.base = base
         self.w3 = experts
+        self.scale = scale  # the routed scaling factor when routing left it to the experts (Nemotron: 5.0), else None
 
     def forward(self, hidden_states, topk_output, *args, **kwargs):
         from sglang.srt.layers.moe.topk import TopKOutputFormat
@@ -390,6 +400,8 @@ class W3ExpertsForward(torch.nn.Module):
             return hidden_states.clone()
         _note("3-bit routed experts")
         out = w3_moe(self.w3, hidden_states, ids, w)
+        if self.scale is not None:
+            out = out * self.scale
         if getattr(self.base, "reduce_results", False):
             from sglang.srt.distributed import tensor_model_parallel_all_reduce
             out = tensor_model_parallel_all_reduce(out)
@@ -406,19 +418,21 @@ def _swap_child(parent, name: str, value) -> None:
 
 
 @torch.no_grad()
-def _check_experts(ckpt, layer, fused, tp, rank, device) -> float:
+def _check_experts(ckpt, layer, fused, tp, rank, device, top_k: int = 10, scale: float | None = None) -> float:
     """The 3-bit experts against the NVFP4 FusedMoE on random rows and routing (this rank's partial sum)."""
     from sglang.srt.distributed import tensor_model_parallel_all_reduce
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.layers.quantization.sharar_w3.w3_moe import w3_moe
     g = torch.Generator(device=device).manual_seed(1234 + layer)  # the same rows and routing on every rank
-    x = torch.randn(16, 2560, device=device, dtype=torch.bfloat16, generator=g)
-    ids = torch.stack([torch.randperm(512, device=device, generator=g)[:10] for _ in range(16)]).int()
-    w = torch.softmax(torch.randn(16, 10, device=device, generator=g), -1)
-    ref = fused(x, StandardTopKOutput(topk_weights=w, topk_ids=ids, router_logits=torch.zeros(16, 512, device=device)))
+    hidden, n_exp = getattr(fused, "hidden_size", 2560), getattr(fused, "num_experts", 512)
+    x = torch.randn(16, hidden, device=device, dtype=torch.bfloat16, generator=g)
+    ids = torch.stack([torch.randperm(n_exp, device=device, generator=g)[:top_k] for _ in range(16)]).int()
+    w = torch.softmax(torch.randn(16, top_k, device=device, generator=g), -1)
+    ref = fused(x, StandardTopKOutput(topk_weights=w, topk_ids=ids, router_logits=torch.zeros(16, n_exp, device=device)))
     ref = ref if getattr(fused, "reduce_results", False) else tensor_model_parallel_all_reduce(ref.clone())
-    experts = load_experts(ckpt, layer, getattr(fused, "num_experts", 512), tp, rank, device)
-    got = tensor_model_parallel_all_reduce(w3_moe(experts, x, ids, w))
+    experts = load_experts(ckpt, layer, n_exp, tp, rank, device)
+    got = w3_moe(experts, x, ids, w)
+    got = tensor_model_parallel_all_reduce(got * scale if scale is not None else got)
     del experts
     return ((got.float() - ref.float()).norm() / ref.float().norm()).item()
 
@@ -429,7 +443,8 @@ def load_experts(ckpt: Checkpoint, layer: int, experts: int, tp: int, rank: int,
     from sglang.srt.layers.quantization.sharar_w3.w3_moe import W3Experts
     lo, hi = experts * rank // tp, experts * (rank + 1) // tp
     mats = []
-    for name in (f"layers.{layer}.experts.w13", f"layers.{layer}.experts.w2"):
+    fc1 = f"layers.{layer}.experts.w13" if f"layers.{layer}.experts.w13" in ckpt.weights else f"layers.{layer}.experts.w1"
+    for name in (fc1, f"layers.{layer}.experts.w2"):  # fc1: Flash-Next's gated [up; gate] or Nemotron's up
         t, cb = ckpt.load(name)
         per = t["row_scale"].shape[0] // experts
         part = _rows(t, lo * per, hi * per)
@@ -458,13 +473,16 @@ def attach_moe(model, directory: str | None, sharing: tuple[int, int, int] | Non
                 raise ValueError("3-bit experts need the shared expert outside the routed experts "
                                  "(--disable-shared-experts-fusion)")
             fused = block.experts
+            cfg = block.topk.topk_config
+            factor = getattr(cfg, "routed_scaling_factor", None)
+            scale = factor if factor not in (None, 1.0) and not getattr(cfg, "apply_routed_scaling_factor_on_output", False) else None
             if os.environ.get("SGLANG_SHARAR_W3_CHECK") == "1":
-                echecks.append((name, _check_experts(ckpt, layer, fused, tp, rank, device)))
+                echecks.append((name, _check_experts(ckpt, layer, fused, tp, rank, device, cfg.top_k, scale)))
             for p in fused.parameters(recurse=True):  # the NVFP4 experts are not read again: release them first
                 p.data = torch.empty(0, dtype=p.dtype, device=p.device)
             torch.cuda.empty_cache()
             experts = load_experts(ckpt, layer, getattr(fused, "num_experts", 512), tp, rank, device)
-            _swap_child(block, "experts", W3ExpertsForward(fused, experts))
+            _swap_child(block, "experts", W3ExpertsForward(fused, experts, scale))
         if sharing is not None:
             keep, per_request, budget = sharing
             k = block.topk.topk_config.top_k

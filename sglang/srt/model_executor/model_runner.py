@@ -1229,7 +1229,8 @@ class ModelRunner:
         from sglang.srt.layers.quantization.sharar_w3 import attach as sharar_w3
 
         name = type(self.model).__name__
-        arch = "qwen3_5" if name.startswith("Qwen3_5") else "qwen4_exp" if name.startswith("Qwen4Exp") else None
+        arch = ("qwen3_5" if name.startswith("Qwen3_5") else "qwen4_exp" if name.startswith("Qwen4Exp")
+                else "nemotron_h" if name.startswith("NemotronH") else None)
         if arch is None:
             raise ValueError(f"SGLANG_SHARAR_W3 / SGLANG_SHARAR_MOE: no mapping for {name}")
         env = os.environ.get
