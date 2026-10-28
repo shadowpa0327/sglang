@@ -21,6 +21,7 @@ export PYTHONPATH_FORK=$WT
 EVAL=/ddn/scratch/cornell/cchang/sharar-eval
 export SHARAR_RESULTS=/ddn/scratch/cornell/cchang/sharar_results
 RUNS=${RUNS:-/ddn/scratch/cornell/cchang/sharar_port/runs_nemotron}
+TEXTS=${TEXTS:-/ddn/scratch/cornell/cchang/sharar_port/texts_nemotron}  # full generations (SHARAR_SAVE_TEXT_DIR), outside the runs
 CAP=${CAP:-248}; CONC=${CONC:-16}
 export CTX=262144  # NVIDIA's max-model-len
 COMMIT=$(git -C $WT rev-parse --short HEAD)$(git -C $WT diff --quiet || echo -dirty)
@@ -66,7 +67,7 @@ run_arm() {  # run_arm <arm:task:seeds[:par]> <gpu> <port>
   for seed in $seeds; do
     tag=nt-$arm$([ $task = gpqa ] || echo -$task)-g${CAP}k-s$seed
     { echo "[$(date -Is)] $tag: start"
-      (cd $EVAL && VIRTUAL_ENV= ~/.local/bin/uv run --frozen sharar-eval run --url http://127.0.0.1:$port --plain \
+      (cd $EVAL && VIRTUAL_ENV= SHARAR_SAVE_TEXT_DIR=$TEXTS/$tag ~/.local/bin/uv run --frozen sharar-eval run --url http://127.0.0.1:$port --plain \
         --model nemotron35-super --label $tag --tasks $task --thinking --temperature 1.0 --top-k 0 --seed $seed \
         --max-tokens $((CAP * 1024)) --concurrency $CONC --engine "sglang sharar-nemotron@$COMMIT gb200 $arm" \
         --out $RUNS/$tag) > $PORT_ROOT/logs/eval_${tag}.log 2>&1
