@@ -226,14 +226,15 @@ SOURCES: dict[str, dict[str, Any]] = {
 }
 
 SWE_TRACES_REPO = "nvidia/Open-SWE-Traces"
-SWE_TRACE_MODELS = (
-    "qwen38_flash_next",
-    "qwen38_27b",
-    "qwen36_27b",
-    "deepseek_v4_flash_0731",
-    "minimax_m25",
-    "qwen35_122b",
-)
+# trajectory model directory -> (dataset config, sessions)
+SWE_TRACE_MODELS = {
+    "qwen38_flash_next": ("v2.0", 168824),
+    "qwen38_27b": ("v1.2", 235396),
+    "qwen36_27b": ("v1.1", 212931),
+    "deepseek_v4_flash_0731": ("v1.1", 50295),
+    "minimax_m25": ("v1.0", 90422),
+    "qwen35_122b": ("v1.0", 60797),
+}
 
 
 # --------------------------------------------------------------------------- loading
@@ -503,7 +504,7 @@ def download_swe_traces(
     unknown = [m for m in models if m not in SWE_TRACE_MODELS]
     if unknown:
         raise SystemExit(
-            f"unknown Open-SWE-Traces models {unknown}; choose from {SWE_TRACE_MODELS}"
+            f"unknown Open-SWE-Traces models {unknown}; choose from {list(SWE_TRACE_MODELS)}"
         )
     revision = resolve_revision(SWE_TRACES_REPO, pinned)
     target = out_dir / "open_swe_traces"
@@ -556,7 +557,7 @@ def main(argv=None):
         nargs="*",
         default=[],
         metavar="MODEL",
-        help=f"also download raw Open-SWE-Traces sessions of these trajectory models: {SWE_TRACE_MODELS}",
+        help=f"also download raw Open-SWE-Traces sessions of these trajectory models: {list(SWE_TRACE_MODELS)}",
     )
     ap.add_argument(
         "--revisions-from",
@@ -577,8 +578,10 @@ def main(argv=None):
                 f"{k:<20} {s['rows']:<30} {s['license'][:22]:<22} {s['repo']}\n{'':<74}{s['desc']}"
             )
         print(
-            f"\n--swe-traces MODEL: raw agent sessions from {SWE_TRACES_REPO}, models {', '.join(SWE_TRACE_MODELS)}"
+            f"\n--swe-traces MODEL: raw agent sessions from {SWE_TRACES_REPO} (used as recorded, see build_swe_trace_rows.py)"
         )
+        for m, (cfg, n) in SWE_TRACE_MODELS.items():
+            print(f"  {m:<24} config {cfg}, {n:,} sessions")
         return
 
     samples = {}

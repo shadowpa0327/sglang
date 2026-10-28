@@ -1,13 +1,15 @@
 ---
 name: regenerate-draft-training-data
-description: Produce on-policy training data for a speculative-decoding draft (EAGLE3, DFlash, DFlash2, DSpark) by having the target model regenerate answers to public prompts. Use when asked to regenerate, re-generate or replay training data for a target model, download prompt sources (PerfectBlend, UltraChat, OpenCodeInstruct, aya, Nemotron instruction following), run thinking-mode regeneration with an effort mix or token budget, or turn regenerated conversations into SpecForge training rows.
+description: Produce on-policy training data for a speculative-decoding draft (EAGLE3, DFlash, DFlash2, DSpark) by having the target model regenerate answers to public prompts and adding agent sessions the target wrote. Use when asked to regenerate, re-generate or replay training data for a target model, build the complete training corpus, download prompt sources (PerfectBlend, UltraChat, OpenCodeInstruct, aya, Nemotron instruction following) or Open-SWE-Traces agent sessions, run thinking-mode regeneration with an effort mix or token budget, or turn regenerated conversations or agent sessions into SpecForge training rows.
 ---
 
 # Regenerate draft training data
 
 Full runbook: `draft_data_regen/README.md`. Prompt
 source catalog and reference blends: `draft_data_regen/PROMPT_SOURCES.md`.
-Read the runbook before starting; this file is the checklist.
+Read the runbook before starting; this file is the checklist. The complete corpus
+(PerfectBlend, UltraChat and OpenCodeInstruct regenerated; Open-SWE-Traces sessions
+as recorded) and the commands that rebuild it are in the source catalog.
 
 ## Checklist
 
@@ -17,7 +19,8 @@ Read the runbook before starting; this file is the checklist.
 2. **Learn the target** (runbook step 1): thinking toggle, effort kwarg and
    values, how history reasoning renders, SGLang `--reasoning-parser`,
    context length, recommended sampling, matching SpecForge `chat_template`.
-3. **Download prompts** with decontamination:
+3. **Download prompts** (chat: `perfectblend ultrachat opencodeinstruct`, plus
+   `aya nemotron-if nemotron-structured` for coverage) with decontamination:
    `python draft_data_regen/scripts/download_prompt_sources.py --list`, then
    `--sources ... --sample ... --decontaminate-against <evals> --output-dir <big disk>`.
 4. **Serve the target** with SGLang (one server per smallest TP group that
@@ -31,9 +34,14 @@ Read the runbook before starting; this file is the checklist.
 7. **Build rows**: `draft_data_regen/scripts/build_regen_training_rows.py --tokenizer <target>
    --out-dir <dir> --budget <same> --verify-chat-template <name> <regen files>`.
    The verify line must say `(OK)`.
-8. **Hand off** the training fields: `is_preformatted: true`,
+8. **Agent sessions**, only if the target wrote some in `nvidia/Open-SWE-Traces`:
+   `draft_data_regen/scripts/download_prompt_sources.py --swe-traces <model>`, then
+   `draft_data_regen/scripts/build_swe_trace_rows.py --data-dir <dir>/open_swe_traces --model <model>
+   --tokenizer <target> --out-dir <dir> --max-tokens 32768 --verify-chat-template <name>`.
+9. **Hand off** the training fields: chat rows `is_preformatted: true`,
    `train_only_last_turn: true`, `chat_template: <verified>`,
-   `max_length: <budget>`.
+   `max_length: <budget>`; agent rows the same with `train_only_last_turn: false`
+   and `max_length: <--max-tokens>`, as a separate stage.
 
 ## Rules
 

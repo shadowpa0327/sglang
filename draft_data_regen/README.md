@@ -2,10 +2,12 @@
 
 This runbook is written for a coding agent (or a person) asked to produce
 on-policy training data for a speculative-decoding draft of a **new target
-model**: download prompts, have the target answer them at scale, and turn the
-answers into training rows. It distills a run that produced 1.01B generated
-tokens for Qwen3.8-Flash-Next; every rule below comes from something that went
-wrong or mattered there.
+model**: download prompts, have the target answer them at scale, turn the
+answers into training rows, and add the target's own agent sessions. It
+distills the Qwen3.8-Flash-Next corpus (1.01B regenerated chat tokens plus 2.90B
+tokens of agent sessions); every rule below comes from something that went
+wrong or mattered there. [PROMPT_SOURCES.md](PROMPT_SOURCES.md) describes the
+complete corpus and the commands that rebuild it.
 
 Pipeline and tools:
 
@@ -16,7 +18,8 @@ Pipeline and tools:
 | 3. Serve the target | `python -m sglang.launch_server` | one or more OpenAI-compatible servers |
 | 4. Regenerate | `draft_data_regen/scripts/regen_driver.py` | `<name>_regen.jsonl` (+ `_error`, `_skipped`) |
 | 5. Build training rows | `draft_data_regen/scripts/build_regen_training_rows.py` | `train.jsonl`, `stats.json` |
-| 6. Train | `specforge train` with the data fields below | draft checkpoints |
+| 6. Agent sessions (if the target wrote some) | `draft_data_regen/scripts/build_swe_trace_rows.py` | `train.jsonl`, `eval.jsonl` |
+| 7. Train | `specforge train` with the data fields below | draft checkpoints |
 
 The prompt sources themselves are described in
 [PROMPT_SOURCES.md](PROMPT_SOURCES.md).
@@ -25,16 +28,17 @@ The prompt sources themselves are described in
 
 | File | What it does |
 | --- | --- |
-| `scripts/download_prompt_sources.py` | downloads prompt sources from Hugging Face as regeneration input; samples, deduplicates, decontaminates, pins revisions |
-| `scripts/regen_driver.py` | resumable multi-server regeneration with thinking budgets and reasoning-effort mixes |
-| `scripts/build_regen_training_rows.py` | one preformatted last-turn-loss training row per answer, rendered with the target's template |
+| `draft_data_regen/scripts/download_prompt_sources.py` | downloads chat prompt sources from Hugging Face as regeneration input (sampling, dedup, decontamination, pinned revisions) and raw Open-SWE-Traces agent sessions |
+| `draft_data_regen/scripts/regen_driver.py` | resumable multi-server regeneration with thinking budgets and reasoning-effort mixes |
+| `draft_data_regen/scripts/build_regen_training_rows.py` | one preformatted last-turn-loss training row per regenerated answer, rendered with the target's template |
+| `draft_data_regen/scripts/build_swe_trace_rows.py` | one preformatted all-turn training row per agent session, cut at a turn end, with held-out eval repositories |
 | `scripts/regen_common.py` | request and validation helpers vendored from SpecForge's regenerator |
 
-Requirements: `openai`, `requests`, `transformers`, `datasets` and
+Requirements: `openai`, `requests`, `transformers`, `datasets`, `pyarrow` and
 `huggingface_hub`. SpecForge is needed only for training and for
 `--verify-chat-template`. Any SGLang build serves the target; this branch's
 build includes the speculative-capture patch used for training. The same tools
-live in SpecForge as `scripts/{download_prompt_sources,regen_driver,build_regen_training_rows}.py`
+live in SpecForge as `scripts/{download_prompt_sources,regen_driver,build_regen_training_rows,build_swe_trace_rows}.py`
 with these documents under `docs/sections/basic_usage/`.
 
 ## Ground rules
@@ -87,7 +91,8 @@ about 470K conversations. A first-stage blend that has worked:
 
 | Share | Source | Notes |
 | --- | --- | --- |
-| 55-75% | `perfectblend` | backbone; multi-turn rows yield several training rows |
+| 50-70% | `perfectblend` | backbone; multi-turn rows yield several training rows |
+| 10-20% | `ultrachat` | multi-turn chat (3.2 user turns on average, about 4K generated tokens and 2-3 training rows per conversation at 8K) |
 | 15-25% | `opencodeinstruct` | sample 250K; code answers are long and truncate more |
 | 5-15% | `aya` | multilingual; add if the target serves non-English users |
 | 5-10% | `nemotron-if`, `nemotron-structured` | instruction following, structured output |
@@ -97,7 +102,7 @@ Always decontaminate against the evals you will report:
 
 ```bash
 python draft_data_regen/scripts/download_prompt_sources.py \
-    --sources perfectblend opencodeinstruct aya nemotron-if nemotron-structured \
+    --sources perfectblend ultrachat opencodeinstruct aya nemotron-if nemotron-structured \
     --sample opencodeinstruct=250000 aya=60000 \
     --decontaminate-against /path/to/eval_datasets \
     --output-dir /data/prompts
@@ -206,7 +211,30 @@ checks the loss covers exactly the last answer. If it fails, the SpecForge
 template's assistant header does not match the target's generation prompt; fix
 the template choice before training.
 
-## 7. Train
+## 7. Add the target's agent sessions
+
+`nvidia/Open-SWE-Traces` publishes coding-agent sessions (tools, tool results,
+every turn's reasoning) written by several models; for Qwen3.8-Flash-Next,
+168,824 sessions across Claude Code, OpenCode, OpenHands, SWE-agent and
+mini-SWE-agent. They are not regenerated (tool results follow the original
+model's actions), so use them only when the trajectory model is your target:
+
+```bash
+python draft_data_regen/scripts/download_prompt_sources.py --swe-traces qwen38_flash_next --output-dir /data/prompts
+python draft_data_regen/scripts/build_swe_trace_rows.py --data-dir /data/prompts/open_swe_traces \
+    --model qwen38_flash_next --tokenizer $TARGET --out-dir /data/train/agent_32k \
+    --max-tokens 32768 --verify-chat-template qwen3.5
+```
+
+Each session becomes one row cut at the last end of turn within
+`--max-tokens`, trained on every assistant turn; sessions on 1 in 50
+repositories go only to `eval.jsonl`, so agent evals never see a training
+repository. `--verify-chat-template` must report no rows without loss (about a
+third of an agent row is assistant tokens; the rest is tool output). If the
+target has no published sessions, the alternative is fresh rollouts with the
+target in sandboxed harnesses, which is outside these tools.
+
+## 8. Train
 
 ```yaml
 data:
@@ -216,6 +244,11 @@ data:
   chat_template: qwen3.5        # the template --verify-chat-template accepted
   max_length: 8192              # = --budget
 ```
+
+Agent rows use `train_only_last_turn: false` and `max_length` equal to
+their `--max-tokens`. The flag applies to a whole run, so train chat and agent
+rows as separate stages (chat at 8K first, then a long-context stage with the
+agent rows), as Inkling-Small-DSpark does.
 
 The trainer tokenizes on first launch and caches by `data.cache_key`; the
 cache key does not record `train_only_last_turn`, so use a new key when that
@@ -244,4 +277,7 @@ H100 servers at about 4.2K tok/s each: 470,624 conversations (PerfectBlend
 348,841, OpenCodeInstruct 120,865, UltraChat 918) and 1.01B generated tokens in
 about a day; 556,511 training rows after building. Truncated at 8K: 10.4% of
 PerfectBlend and 18.2% of OpenCodeInstruct conversations. Drops: 1.3% of
-PerfectBlend to decontamination, under 0.01% to repetition loops.
+PerfectBlend to decontamination, under 0.01% to repetition loops. Agent part:
+the 97,292 OpenHands, SWE-agent and mini-SWE-agent sessions available then gave
+95,596 training rows (2.90B tokens at 32K, 81% cut at the cap) and 300
+held-out eval sessions.
