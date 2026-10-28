@@ -55,6 +55,8 @@ as recorded) and the commands that rebuild it are in the source catalog.
 ## Rules
 
 - Never upload datasets or checkpoints without explicit approval.
+- Never download the DaoCloud prompts (`DaoCloud/Qwen3.8-27B-Drafter-SFT`);
+  build mixes from the original sources.
 - Never edit a running script; never `pkill -f` (it matches your own shell);
   stop jobs by PID or process group.
 - Keep caches and outputs on a large volume (`HF_HOME` too).

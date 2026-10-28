@@ -133,16 +133,6 @@ def conv_codealpaca(row, idx):
     return idx, [{"role": "user", "content": text}], {}
 
 
-def conv_daocloud(row, idx):
-    if (row.get("tools") or "").strip():
-        return row["primary_id"], None, {"drop": "has tools"}
-    return (
-        row["primary_id"],
-        _messages(row["messages"]),
-        {"language": row.get("language")},
-    )
-
-
 # key -> (HF repo, how to load, converter, license, one-line description)
 SOURCES: dict[str, dict[str, Any]] = {
     "perfectblend": dict(
@@ -229,15 +219,9 @@ SOURCES: dict[str, dict[str, Any]] = {
         rows="20K",
         desc="Short coding instructions",
     ),
-    "daocloud-prompts": dict(
-        repo="DaoCloud/Qwen3.8-27B-Drafter-SFT",
-        load={"name": "prompts", "split": "train"},
-        conv=conv_daocloud,
-        license="upstream terms (PerfectBlend, OpenCodeInstruct, aya, Nemotron IF)",
-        rows="368K",
-        desc="DaoCloud's filtered, decontaminated drafter prompt mix (system + user turns only)",
-    ),
 }
+# The DaoCloud/Qwen3.8-27B-Drafter-SFT prompt set is deliberately not offered: do not
+# download it. Build mixes from the original sources above.
 
 SWE_TRACES_REPO = "nvidia/Open-SWE-Traces"
 # trajectory model directory -> (dataset config, sessions)

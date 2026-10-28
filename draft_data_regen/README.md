@@ -56,6 +56,8 @@ with these documents under `docs/sections/basic_usage/`.
   to tens of GB. Set `HF_HOME` to a large volume and write outputs there.
 - **Do not upload or publish** datasets or checkpoints without the user's
   explicit approval.
+- **Do not download the DaoCloud prompts** (`DaoCloud/Qwen3.8-27B-Drafter-SFT`).
+  Build mixes from the original sources.
 - **Never edit a running script.** Bash reads scripts incrementally; copy it,
   or stop it first.
 - **Kill by PID or process group, not `pkill -f <pattern>`.** The pattern
@@ -104,7 +106,8 @@ about 470K conversations. A first-stage blend that has worked:
 | 5-15% | `aya` | multilingual; add if the target serves non-English users |
 | 5-10% | `nemotron-if`, `nemotron-structured` | instruction following, structured output |
 
-Or start from `daocloud-prompts`, which is already filtered and decontaminated.
+Build the mix from these original sources. Do not download the DaoCloud
+prompt set (`DaoCloud/Qwen3.8-27B-Drafter-SFT`).
 Always decontaminate against the evals you will report:
 
 ```bash

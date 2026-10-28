@@ -86,18 +86,22 @@ Inkling-Small-DSpark does.
 | `nemotron-structured` | [`nvidia/Nemotron-RL-Instruction-Following-Structured-Outputs-v2`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Instruction-Following-Structured-Outputs-v2) | 54K | CC-BY-4.0 | JSON/XML/YAML/TOML output to a schema; the tool-calling subset is skipped |
 | `magicoder` | [`ise-uiuc/Magicoder-Evol-Instruct-110K`](https://huggingface.co/datasets/ise-uiuc/Magicoder-Evol-Instruct-110K) | 111K | Apache-2.0 | Evol-Instruct coding prompts; about 1.3% overlap HumanEval at 13 words |
 | `codealpaca` | [`sahil2801/CodeAlpaca-20k`](https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k) | 20K | CC-BY-4.0 | Short coding instructions |
-| `daocloud-prompts` | [`DaoCloud/Qwen3.8-27B-Drafter-SFT`](https://huggingface.co/datasets/DaoCloud/Qwen3.8-27B-Drafter-SFT) (`prompts` config) | 368K | Upstream terms | A ready-made, filtered and decontaminated drafter mix of PerfectBlend, OpenCodeInstruct, aya and two Nemotron instruction-following sets |
-| `--swe-traces MODEL` | [`nvidia/Open-SWE-Traces`](https://huggingface.co/datasets/nvidia/Open-SWE-Traces) | 169K sessions per recent model | CC-BY-4.0 | Coding-agent sessions with tools, used as recorded; see [Open-SWE-Traces](#open-swe-traces) |
+| `--swe-traces MODEL` | [`nvidia/Open-SWE-Traces`](https://huggingface.co/datasets/nvidia/Open-SWE-Traces) | 50K-489K sessions per model | CC-BY-4.0 | Coding-agent sessions with tools, used as recorded; see [Open-SWE-Traces](#open-swe-traces) |
 
 Prompts remain subject to their upstream licenses; regenerated answers are
 subject to the target model's license.
+
+**Do not download the DaoCloud prompts** (`DaoCloud/Qwen3.8-27B-Drafter-SFT`).
+The script does not offer them. To get a similar mix, build it from the
+original sources above; the DaoCloud blend under
+[Reference blends](#reference-blends) is there only to describe how it was made.
 
 ## What the download script does to each source
 
 - **Prompt turns only matter.** Rows keep the source's system and user turns.
   Assistant turns of multi-turn sources are kept only so the regenerator's
   input check passes; the regenerator replaces every one of them. Sources that
-  ship user turns only (`daocloud-prompts`) get a placeholder between them.
+  ship consecutive user turns get a placeholder between them.
 - **Normalization.** Consecutive same-role turns are merged, empty system
   prompts removed, trailing assistant turns dropped.
 - **Drops.** Rows that are invalid after normalization, rows with tool
@@ -184,8 +188,9 @@ replaced them.
 
 ### Reference blends
 
-- **DaoCloud Qwen3.8-27B drafter**: 367,535 conversations, 450,401 rows, 1.95B
-  tokens; thinking on with effort low / medium / xhigh at 40 / 30 / 30%.
+- **DaoCloud Qwen3.8-27B drafter** (described for reference only; do not
+  download its prompts): 367,535 conversations, 450,401 rows, 1.95B tokens;
+  thinking on with effort low / medium / xhigh at 40 / 30 / 30%.
 
   | Source | Conversations |
   | --- | --- |
