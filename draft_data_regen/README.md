@@ -12,7 +12,8 @@ complete corpus and the commands that rebuild it.
 **To build exactly the Qwen3.8-Flash-Next corpus for another target** (the same
 prompts, efforts and settings), follow the shorter
 [reproduction recipe](REPRODUCE.md). It starts from a prompt lock, so
-steps 2 and 4 below need no sampling choices.
+steps 2 and 4 below need no sampling choices. The steps and rules below are
+also condensed into a one-page [checklist](CHECKLIST.md).
 
 Pipeline and tools:
 
@@ -33,6 +34,7 @@ The prompt sources themselves are described in
 
 | File | What it does |
 | --- | --- |
+| `draft_data_regen/CHECKLIST.md` | the runbook's steps and rules on one page |
 | `draft_data_regen/REPRODUCE.md` | the one-page recipe: the Qwen3.8-Flash-Next corpus for another target, from the lock |
 | `draft_data_regen/locks/qwen38-flash-next-think-stage1/` | that corpus's prompts in run order with their reasoning effort, and the pinned dataset revisions |
 | `draft_data_regen/scripts/download_prompt_sources.py` | downloads chat prompt sources from Hugging Face as regeneration input (sampling, dedup, decontamination, pinned revisions) and raw Open-SWE-Traces agent sessions |
