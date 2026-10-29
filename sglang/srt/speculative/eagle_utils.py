@@ -973,14 +973,23 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        # Research patch: relaxed acceptance (DFlash's K:M rule) on MTP / EAGLE chains, sampled rows.
+        # Research patch: relaxed acceptance (DFlash's K:M rule) on MTP / EAGLE chains, sampled rows. Argmax drafts
+        # (target-only kernel, q a point mass): relax_chain_coins. Sampled drafts (--speculative-use-rejection-sampling,
+        # the chain kernel with the draft's q): force_plausible_coins, the DFlash chain's rule.
         relax_rules = (
             dflash_relaxed.request_rules(batch.reqs)
-            if verify_input.tree_topk == 1 and not use_rejection_sampling
+            if verify_input.tree_topk == 1
             else None
         )
-        if relax_rules is not None:
+        if relax_rules is not None and use_rejection_sampling:
+            relax_out = {"rules": relax_rules, "reqs": batch.reqs, "gate": None}
+            dflash_relaxed.force_plausible_coins(
+                relax_out, candidates, target_probs, draft_probs, coins, verify_input.draft_token_num - 1
+            )
+            dflash_relaxed.count_chain(relax_out["relaxed"], bs)
+        elif relax_rules is not None:
             dflash_relaxed.relax_chain_coins(relax_rules, candidates, target_probs, coins, batch.reqs)
+        if relax_rules is not None:
             counts = dflash_relaxed.chain_counts()
             if counts["steps"] % 20000 < bs:
                 logger.info(f"MTP relaxed acceptance: {counts}")

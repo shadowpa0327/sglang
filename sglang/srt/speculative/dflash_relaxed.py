@@ -228,8 +228,8 @@ _CHAIN_COUNTS = {"steps": 0, "relaxed": 0}
 
 def relax_chain_coins(rules, candidates: torch.Tensor, target_probs: torch.Tensor, coins: torch.Tensor,
                       reqs=None) -> None:
-    """The sampled rule for an EAGLE / MTP chain (top-1 drafts) verified by the tree kernel with zero draft probs:
-    zero the coin of every plausible draft (coin j decides draft j+1, as in force_plausible_coins). Plausible: p_y > 0,
+    """The sampled rule for an EAGLE / MTP chain (argmax drafts) verified by the tree kernel with zero draft probs:
+    zero the coin of every plausible draft, or scale it by e^-s with accept_soft s (coin j decides draft j+1, as in force_plausible_coins). Plausible: p_y > 0,
     rank of y under the filtered target law below the row's top-k, log p_max - log p_y <= margin. No harm gates."""
     gamma = candidates.shape[1] - 1
     dev = candidates.device
@@ -251,6 +251,12 @@ def relax_chain_coins(rules, candidates: torch.Tensor, target_probs: torch.Tenso
     _CHAIN_COUNTS["relaxed"] += int((plausible & ~(coins[:, :gamma] < p_y) & (relaxed_coins < p_y)).sum())
     _CHAIN_COUNTS["steps"] += candidates.shape[0]
     coins[:, :gamma] = torch.where(plausible, relaxed_coins, coins[:, :gamma])
+
+
+def count_chain(relaxed: torch.Tensor, bs: int) -> None:
+    """Chain counters for sampled MTP / EAGLE drafts (force_plausible_coins' relaxed mask)."""
+    _CHAIN_COUNTS["relaxed"] += int(relaxed.sum())
+    _CHAIN_COUNTS["steps"] += bs
 
 
 def chain_counts() -> dict:

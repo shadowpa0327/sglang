@@ -28,6 +28,8 @@ relaxed DFlash2 verification. Targets: Qwen3.8-27B-NVFP4 (`RadixArk/...@319f741`
 | `SGLANG_DFLASH_RELAXED_TOP_K`, `SGLANG_DFLASH_RELAXED_MARGIN` | server-default relaxed rule (sharar's sampled rule: `2`, `1.0`) |
 | `SGLANG_DFLASH_RELAXED_SOFT=<s>` | sampled requests: a plausible draft keeps its coin, scaled by e^-s, and is accepted when `coin * q < e^s * p` instead of always, so no token comes out more than e^s times as often as the target's law gives it (`0`: exact sampling; unset: the forced accept); per request `accept_soft` in `custom_params` |
 | `SGLANG_DFLASH_RELAXED_TOP=0` | sampled requests: the target's own top token keeps the ordinary test and only near misses get the relaxed pass; per request `relax_top` |
+| `--speculative-use-rejection-sampling` (MTP) | sampled MTP drafts: each draft is drawn from the head's q = softmax(logits / T) and verified exactly against it (Leviathan); the relaxed rule and `accept_soft` then act on q (the DFlash chain's rule) |
+| `SGLANG_DRAFT_TEMP_SCALE=<tau>`, `SGLANG_DRAFT_TOPK=<n>` | sampled drafts: draw at tau * T, and keep the head's top min(n, request top-k) tokens (n = 16 emulates sharar's 16 rescored MTP candidates); exact for any setting, they move only acceptance |
 | `SGLANG_SHARAR_W3_CHECK=1` | at attach, every 3-bit linear and expert block against the original weights on random inputs (fails above 0.6 relative error) |
 | `SGLANG_SHARAR_CAPTURE=<dir>` | record GPTQ inputs in sharar's formats (trunk covariances, MoE input rows); saved when `<dir>/SAVE` appears |
 
@@ -42,6 +44,9 @@ once every attached 3-bit linear has served a decode/verify call.
 - `build_calib.py`, `capture_serve.sh`, `capture_client.py`, `fit_trunk.py`, `recal_pipeline.sh`: re-fit Flash-Next's
   3-bit copies on the model's own thinking traces with sharar's GPTQ.
 - `check_w3_mapping.py`, `test_w3_dispatch.py`, `w3_tune.py`, `bench_w3_moe.py`: validation and kernel tuning.
+- `test_sampled_mtp.py`: the sampled draft proposal (`SGLANG_DRAFT_*`) and the relaxed rule's output law on sampled, truncated
+  drafts through the chain kernel; `mtp_accept_arms.py`: tokens per verify round for exact / `accept_soft` / forced arms
+  on one running server, picked per request.
 - `test_relaxed_soft.py`: the relaxed rule's output law at one verify slot (exact, soft, forced) through the DFlash chain
   kernel and the MTP target-only kernel: `PYTHONPATH=<checkout> python sharar_port/scripts/test_relaxed_soft.py` (the
   kernel tests skip without a GPU).
