@@ -157,7 +157,34 @@ def renorm_draft_probs(
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
-    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+    return draft_proposal_probs(next_token_logits, sampling_info.temperatures, sampling_info.top_ks)
+
+
+# Research patch (sampled MTP drafts): the shape of the draft proposal q under rejection sampling. The verify is exact
+# for any q the draft is drawn from, so these move only acceptance. SGLANG_DRAFT_TEMP_SCALE=tau draws the draft at
+# tau * T (tau > 1 softens a head sharper than its target); SGLANG_DRAFT_TOPK=N keeps the head's top min(N, request
+# top_k) tokens (N = the request's top-k keeps q off tokens the target filtered out; N = 16 emulates sharar's 16
+# rescored MTP candidates). Unset: q = softmax(logits / T), as before.
+_DRAFT_TEMP_SCALE = float(os.environ.get("SGLANG_DRAFT_TEMP_SCALE", "1.0"))
+_DRAFT_TOPK = int(os.environ.get("SGLANG_DRAFT_TOPK", "0"))
+
+
+def draft_proposal_probs(
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """q = softmax(logits / (tau * T)) on the head's top min(N, top_k) tokens (see SGLANG_DRAFT_*). Graph-safe."""
+    logits = next_token_logits / (temperatures * _DRAFT_TEMP_SCALE)
+    if _DRAFT_TOPK > 0:
+        n = min(_DRAFT_TOPK, logits.shape[-1])
+        vals = logits.topk(n, dim=-1).values
+        if top_ks is None:
+            kth = vals[:, n - 1 :]
+        else:
+            kth = vals.gather(-1, top_ks.view(-1, 1).long().clamp(1, n) - 1)
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    return torch.softmax(logits, dim=-1)
 
 
 def sample_draft_proposal(
@@ -185,7 +212,7 @@ def sample_draft_proposal(
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
     """
-    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    probs = draft_proposal_probs(next_token_logits, temperatures, top_ks)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
     if top_ks is not None:
         # Assert rather than skip on a device mismatch: a host-side top_ks would
